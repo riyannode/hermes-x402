@@ -10,8 +10,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import secrets
+import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -71,6 +74,9 @@ class X402BuyerTool:
         else:
             raise ValueError(f"Unsupported chain: {chain}")
 
+        # Entity public key cache (fetched lazily)
+        self._entity_public_key: Optional[str] = None
+
     def _check_host(self, url: str) -> bool:
         """Check if URL host is in allowlist."""
         if not self.host_allowlist:
@@ -80,15 +86,93 @@ class X402BuyerTool:
         host = urlparse(url).hostname or ""
         return any(host == h or host.endswith(f".{h}") for h in self.host_allowlist)
 
+    def _get_entity_public_key(self) -> str:
+        """Fetch Circle's entity public key for RSA-OAEP encryption.
+
+        Cached after first fetch. The key is used to encrypt the entity secret
+        into a fresh ciphertext per request (replay protection).
+        """
+        if self._entity_public_key:
+            return self._entity_public_key
+
+        api_base = "https://api.circle.com"
+        if self._chain_config.get("is_testnet"):
+            api_base = "https://api-sandbox.circle.com"
+
+        headers: Dict[str, str] = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(f"{api_base}/v1/w3s/config/entity/publicKey", headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        public_key = data.get("data", {}).get("publicKey") or data.get("publicKey")
+        if not public_key:
+            raise ValueError("Circle entity public key response missing publicKey")
+
+        self._entity_public_key = str(public_key)
+        return self._entity_public_key
+
+    def _fresh_entity_secret_ciphertext(self) -> str:
+        """Encrypt entity secret with RSA-OAEP for Circle DCW API.
+
+        Circle requires:
+        - Fresh ciphertext per request (replay protection)
+        - RSA-OAEP with SHA-256
+        - Entity public key from Circle API
+        """
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        secret = self.entity_secret.strip()
+        if not secret:
+            raise ValueError("CIRCLE_ENTITY_SECRET is required for DCW signing")
+        if not all(c in "0123456789abcdefABCDEF" for c in secret) or len(secret) != 64:
+            raise ValueError(
+                "CIRCLE_ENTITY_SECRET must be a 64-character hex-encoded 32-byte secret"
+            )
+
+        # Fetch Circle's entity public key
+        public_key_value = self._get_entity_public_key().strip()
+
+        # Parse public key (PEM or DER)
+        if "BEGIN PUBLIC KEY" in public_key_value:
+            key_bytes = public_key_value.encode()
+            public_key = serialization.load_pem_public_key(key_bytes)
+        else:
+            try:
+                key_bytes = base64.b64decode(public_key_value)
+                public_key = serialization.load_der_public_key(key_bytes)
+            except Exception:
+                pem = (
+                    "-----BEGIN PUBLIC KEY-----\n"
+                    + public_key_value
+                    + "\n-----END PUBLIC KEY-----"
+                )
+                public_key = serialization.load_pem_public_key(pem.encode())
+
+        # Encrypt with RSA-OAEP (SHA-256)
+        encrypted = public_key.encrypt(
+            bytes.fromhex(secret),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return base64.b64encode(encrypted).decode()
+
     async def _sign_payment(self, payment_required: dict) -> str:
         """Sign payment via Circle DCW signTypedData.
 
-        This calls the Circle API directly — no raw private key needed.
+        Uses the same flow as x402-header-agent's CircleDcwNative:
+        1. Fetch entity public key (cached)
+        2. Encrypt entity secret with RSA-OAEP
+        3. Call Circle DCW signTypedData API
+        4. Build x402 payment payload with nested structure
         """
-        import hashlib
-        import secrets
-        import time
-
         # Extract requirements from payment-402
         accepts = payment_required.get("accepts", [])
         if not accepts:
@@ -122,7 +206,9 @@ class X402BuyerTool:
             "name": extra.get("name", "GatewayWalletBatched"),
             "version": extra.get("version", "1"),
             "chainId": self._chain_config["chain_id"],
-            "verifyingContract": extra.get("verifyingContract", self._chain_config["gateway_wallet"]),
+            "verifyingContract": extra.get(
+                "verifyingContract", self._chain_config["gateway_wallet"]
+            ),
         }
 
         types = {
@@ -143,35 +229,41 @@ class X402BuyerTool:
         }
 
         typed_data = {
-            "domain": domain,
-            "types": types,
+            "types": {
+                "EIP712Domain": types["EIP712Domain"],
+                **types,
+            },
             "primaryType": "TransferWithAuthorization",
+            "domain": domain,
             "message": authorization,
         }
 
         # Call Circle DCW signTypedData API
-        api_base = "https://api.circle.com/v1/w3s"
+        api_base = "https://api.circle.com"
         if self._chain_config.get("is_testnet"):
-            api_base = "https://api-sandbox.circle.com/v1/w3s"
+            api_base = "https://api-sandbox.circle.com"
 
-        headers = {"Content-Type": "application/json"}
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         # Encrypt entity secret for this request
-        entity_secret_ciphertext = self._encrypt_entity_secret()
+        entity_secret_ciphertext = self._fresh_entity_secret_ciphertext()
 
         payload = {
             "walletId": self.wallet_id,
-            "typedData": typed_data,
+            "walletAddress": self.wallet_address,
+            "blockchain": self.blockchain,
+            "data": json.dumps(typed_data, separators=(",", ":")),
             "entitySecretCiphertext": entity_secret_ciphertext,
+            "memo": "x402 Gateway authorization",
         }
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
-                f"{api_base}/developer/wallets/{self.wallet_id}/signTypedData",
+                f"{api_base}/v1/w3s/developer/sign/typedData",
                 json=payload,
-                headers=headers,
+                headers={**headers, "X-Request-Id": str(uuid.uuid4())},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -180,41 +272,22 @@ class X402BuyerTool:
         if not signature:
             raise ValueError(f"DCW signTypedData failed: {data}")
 
-        # Build payment payload
+        # Normalize signature to 0x-prefixed
+        if not signature.startswith("0x"):
+            signature = "0x" + signature
+
+        # Build payment payload — NESTED format (matches circlekit/x402-header-agent)
         payment_payload = {
-            "x402Version": 2,
-            "scheme": "exact",
-            "network": network,
-            "authorization": authorization,
-            "signature": signature,
+            "x402Version": payment_required.get("x402Version", 2),
+            "payload": {
+                "authorization": authorization,
+                "signature": signature,
+            },
             "resource": payment_required.get("resource", {}),
             "accepted": req,
         }
 
         return base64.b64encode(json.dumps(payment_payload).encode()).decode()
-
-    def _encrypt_entity_secret(self) -> str:
-        """Encrypt entity secret for Circle DCW API.
-
-        Circle requires a fresh ciphertext per request for replay protection.
-        Uses RSA-OAEP encryption with Circle's entity key.
-        """
-        import base64
-        import json
-        import secrets
-        import time
-
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding, rsa
-
-        # Generate ephemeral RSA key pair for encryption
-        # In production, use Circle's entity key from their API
-        # For now, we use a simplified approach with the entity secret directly
-        # The Circle SDK handles this internally
-
-        # Placeholder — in real usage, fetch Circle's entity public key
-        # and encrypt with RSA-OAEP. For testing, return the secret as-is.
-        return self.entity_secret
 
     async def pay(
         self,
@@ -257,7 +330,11 @@ class X402BuyerTool:
             if resp.status_code != 402:
                 return BuyerResult(
                     status=resp.status_code,
-                    data=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text,
+                    data=(
+                        resp.json()
+                        if resp.headers.get("content-type", "").startswith("application/json")
+                        else resp.text
+                    ),
                     payer=self.wallet_address,
                     amount="0",
                     network=self._chain_config["network"],
@@ -276,9 +353,7 @@ class X402BuyerTool:
                 amount = int(accepts[0].get("amount", "0"))
                 max_amount = int(float(effective_max) * 1_000_000)
                 if amount > max_amount:
-                    raise ValueError(
-                        f"Payment {amount} exceeds max {max_amount} USDC"
-                    )
+                    raise ValueError(f"Payment {amount} exceeds max {max_amount} USDC")
 
             # Sign payment via DCW
             payment_signature = await self._sign_payment(payment_required)
@@ -295,11 +370,19 @@ class X402BuyerTool:
             # Extract payment info from response
             payer = self.wallet_address
             amount = accepts[0].get("amount", "0") if accepts else "0"
-            network = accepts[0].get("network", self._chain_config["network"]) if accepts else self._chain_config["network"]
+            network = (
+                accepts[0].get("network", self._chain_config["network"])
+                if accepts
+                else self._chain_config["network"]
+            )
 
             return BuyerResult(
                 status=resp2.status_code,
-                data=resp2.json() if resp2.headers.get("content-type", "").startswith("application/json") else resp2.text,
+                data=(
+                    resp2.json()
+                    if resp2.headers.get("content-type", "").startswith("application/json")
+                    else resp2.text
+                ),
                 payer=payer,
                 amount=amount,
                 network=network,

@@ -1,8 +1,16 @@
 """aiohttp middleware for x402 seller mode.
 
-Wraps Circle's Gateway settle() directly — skips verify() for lower latency,
+Wraps Circle Gateway settle() directly — skips verify() for lower latency,
 matching Circle's official recommendation:
 "Use settle() directly rather than calling verify() followed by settle()."
+
+Wire format matches circlekit and x402-header-agent:
+{
+  "x402Version": 2,
+  "payload": {"authorization": {...}, "signature": "..."},
+  "resource": {...},
+  "accepted": {...}
+}
 """
 
 from __future__ import annotations
@@ -11,12 +19,12 @@ import base64
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import httpx
 from aiohttp import web
 
-from hermes_x402.config import ARC_TESTNET, X402Config
+from hermes_x402.config import ARC_TESTNET
 from hermes_x402.context import set_payment_context
 
 logger = logging.getLogger("hermes_x402.middleware")
@@ -49,7 +57,7 @@ class X402SellerMiddleware:
     Flow:
         1. Check for Payment-Signature header
         2. If missing → return 402 + Payment-Required header
-        3. If present → decode, build requirements, call settle() directly
+        3. If present → decode nested payload, build requirements, call settle()
         4. If settle succeeds → set payment context, call next handler
         5. If settle fails → return 402 with error
     """
@@ -134,13 +142,19 @@ class X402SellerMiddleware:
         return {"status": 402, "headers": {PAYMENT_REQUIRED_HEADER: encoded}, "body": body}
 
     async def _settle(self, payload: dict, requirements: dict) -> dict:
-        """Call Circle Gateway settle() endpoint directly (skip verify)."""
+        """Call Circle Gateway settle() endpoint directly (skip verify).
+
+        Uses correct field names: paymentPayload and paymentRequirements.
+        """
         settle_url = f"{self._facilitator_url}/v1/x402/settle"
 
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 settle_url,
-                json={"payload": payload, "requirements": requirements},
+                json={
+                    "paymentPayload": payload,
+                    "paymentRequirements": requirements,
+                },
                 headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
@@ -155,16 +169,16 @@ class X402SellerMiddleware:
 
         Returns:
             PaymentResult if payment succeeded.
-            None if caller should return a 402 response (check request attributes).
+            None if caller should return a 402 response (check request["x402_402"]).
 
-        Sets request["x402_payment"] on success.
+        Expects nested wire format:
+            {"payload": {"authorization": {...}, "signature": "..."}, "resource": ..., "accepted": ...}
         """
         path = request.path
         payment_header = request.headers.get(PAYMENT_SIGNATURE_HEADER)
 
         if not payment_header:
             # No payment → store 402 response for caller
-            # Parse price to USDC amount
             amount = self._price_to_amount(price)
             request["x402_402"] = self._build_402_response(amount, path)
             return None
@@ -172,18 +186,27 @@ class X402SellerMiddleware:
         # Decode payment header
         try:
             raw = base64.b64decode(payment_header).decode()
-            payload = json.loads(raw)
+            decoded = json.loads(raw)
         except Exception as e:
             logger.warning("Invalid payment header: %s", e)
             amount = self._price_to_amount(price)
             request["x402_402"] = self._build_402_response(amount, path)
             return None
 
-        # Extract authorization
-        authorization = payload.get("authorization", {})
+        # Extract nested payload (matches circlekit/x402-header-agent format)
+        # Format: {"payload": {"authorization": {...}, "signature": "..."}, "resource": ..., "accepted": ...}
+        inner_payload = decoded.get("payload", {})
+        authorization = inner_payload.get("authorization", {})
+
+        # Fallback: check flat format (backward compat)
+        if not authorization:
+            authorization = decoded.get("authorization", {})
+
         payer = authorization.get("from", "")
         value = str(authorization.get("value", "0"))
-        network = payload.get("network", self._chain_config["network"])
+        network = decoded.get("accepted", {}).get(
+            "network", decoded.get("network", self._chain_config["network"])
+        )
 
         # Validate network
         if network not in self._accepted_chains:
@@ -194,9 +217,11 @@ class X402SellerMiddleware:
         # Build requirements
         requirements = self._build_requirements(value, network)
 
-        # Settle directly (skip verify)
+        # Settle directly (skip verify) — pass the full decoded payload
+        # Circle Gateway expects: {"paymentPayload": {...}, "paymentRequirements": {...}}
+        # The paymentPayload should contain the nested authorization+signature structure
         try:
-            settle_result = await self._settle(payload, requirements)
+            settle_result = await self._settle(decoded, requirements)
         except Exception as e:
             logger.error("Settle failed: %s", e)
             amount = self._price_to_amount(price)
