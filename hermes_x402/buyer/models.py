@@ -7,10 +7,13 @@ from typing import Any, Literal
 
 PaymentStatus = Literal[
     "not_submitted",
-    "submission_unknown",
+    "payment_started",
     "proof_created",
+    "payment_succeeded",
+    "submission_unknown",
     "resource_succeeded",
     "resource_failed_after_payment",
+    "payment_failed",
 ]
 
 
@@ -28,10 +31,23 @@ class PaymentProof:
 
 
 @dataclass(frozen=True)
+class ManagedPaymentResult:
+    """A normalized response from a backend that owns payment and protected fetch."""
+
+    status: int | None
+    data: Any
+    payer: str
+    amount: str
+    network: str
+    payment_status: PaymentStatus
+    transaction_id: str | None = None
+
+
+@dataclass(frozen=True)
 class BuyerResult:
     """Normalized result of a resource request, with payment lifecycle state."""
 
-    status: int
+    status: int | None
     data: Any
     payer: str
     amount: str

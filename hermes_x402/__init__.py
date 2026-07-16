@@ -1,7 +1,7 @@
 """Hermes x402 — Circle Gateway seller middleware and pluggable buyer backends."""
 
 from hermes_x402.agent import X402HermesAgent
-from hermes_x402.backends import CircleDcwBuyerBackend
+from hermes_x402.backends import CircleCliBuyerBackend, CircleDcwBuyerBackend
 from hermes_x402.buyer import (
     BuyerBackend,
     BuyerResult,
@@ -22,6 +22,23 @@ from hermes_x402.buyer.errors import (
     PaymentSubmissionUnknownError,
     UnsupportedBuyerBackendError,
 )
+from hermes_x402.circle_cli import CircleCliClient, CircleCliRunner
+from hermes_x402.circle_cli.errors import (
+    CircleCliAuthenticationRequiredError,
+    CircleCliError,
+    CircleCliNotInstalledError,
+    CircleCliOutputError,
+    CircleCliPaymentFailedError,
+    CircleCliPaymentOutcomeUnknownError,
+    CircleCliPaymentRejectedError,
+    CircleCliReadError,
+    CircleCliTimeoutError,
+    CircleCliUnsupportedCapabilityError,
+    CircleCliUnsupportedNetworkError,
+    CircleCliVersionError,
+    CircleCliWalletMismatchError,
+    CircleCliWalletNotFoundError,
+)
 from hermes_x402.config import ARC_MAINNET, ARC_TESTNET, X402Config
 from hermes_x402.context import X402ContextBridge, get_payment_context, set_payment_context
 from hermes_x402.middleware import X402SellerMiddleware, create_aiohttp_middleware
@@ -33,6 +50,23 @@ __all__ = [
     "BuyerBackend",
     "BuyerConfigurationError",
     "BuyerResult",
+    "CircleCliAuthenticationRequiredError",
+    "CircleCliBuyerBackend",
+    "CircleCliClient",
+    "CircleCliError",
+    "CircleCliNotInstalledError",
+    "CircleCliOutputError",
+    "CircleCliPaymentFailedError",
+    "CircleCliPaymentOutcomeUnknownError",
+    "CircleCliPaymentRejectedError",
+    "CircleCliReadError",
+    "CircleCliRunner",
+    "CircleCliTimeoutError",
+    "CircleCliUnsupportedCapabilityError",
+    "CircleCliUnsupportedNetworkError",
+    "CircleCliVersionError",
+    "CircleCliWalletMismatchError",
+    "CircleCliWalletNotFoundError",
     "CircleDcwBuyerBackend",
     "DcwApiError",
     "DcwSigningError",

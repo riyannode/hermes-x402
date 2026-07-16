@@ -17,7 +17,6 @@ from hermes_x402 import (
     InvalidPaymentChallengeError,
     PaymentPolicy,
     PaymentPolicyError,
-    UnsupportedBuyerBackendError,
     X402BuyerService,
     X402Config,
     X402HermesAgent,
@@ -116,8 +115,8 @@ class TestConfig:
                 role="buyer", wallet_id="id", wallet_address="0xBuyer", entity_secret="0" * 64
             ).validate()
 
-    def test_cli_is_explicitly_unsupported(self):
-        with pytest.raises(UnsupportedBuyerBackendError):
+    def test_cli_requires_explicit_selection(self):
+        with pytest.raises(BuyerConfigurationError, match="circle_cli_wallet_address"):
             X402Config(role="buyer", buyer_backend="cli").validate()
 
     def test_invalid_runtime_role_is_rejected(self):

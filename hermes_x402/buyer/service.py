@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
-from hermes_x402.buyer.backend import BuyerBackend
-from hermes_x402.buyer.challenge import PAYMENT_SIGNATURE_HEADER, parse_payment_required
-from hermes_x402.buyer.errors import BuyerError, PaidResourceRequestError, PaymentProofError
+from hermes_x402.buyer.backend import BuyerBackend, ManagedPaymentBackend, PaymentProofBackend
+from hermes_x402.buyer.challenge import parse_payment_required
+from hermes_x402.buyer.errors import (
+    BuyerError,
+    PaidResourceRequestError,
+    PaymentProofError,
+    PaymentSubmissionUnknownError,
+)
 from hermes_x402.buyer.models import BuyerResult
 from hermes_x402.buyer.policy import PaymentPolicy
 
+_PROTECTED_PAYMENT_HEADERS = {"payment-signature", "x-payment", "x-payment-response"}
+
 
 class X402BuyerService:
-    """Common x402 buyer flow. Wallet backends only create payment proofs."""
+    """Common URL/policy/challenge flow for proof and managed-payment backends."""
 
     def __init__(self, *, backend: BuyerBackend, policy: PaymentPolicy):
         self.backend = backend
@@ -31,7 +38,7 @@ class X402BuyerService:
         return {
             key: value
             for key, value in (headers or {}).items()
-            if key.lower() != PAYMENT_SIGNATURE_HEADER.lower()
+            if key.lower() not in _PROTECTED_PAYMENT_HEADERS
         }
 
     async def pay(
@@ -67,11 +74,44 @@ class X402BuyerService:
                 payment_required = parse_payment_required(
                     response.headers.get("Payment-Required", "")
                 )
-                accepted = payment_required["accepts"][0]
-                self.policy.validate_amount(accepted["amount"], max_usdc)
+                if hasattr(self.backend, "pay_and_fetch"):
+                    # A managed CLI may choose internally; validate every advertised
+                    # option before its one protected request.
+                    for accepted in payment_required["accepts"]:
+                        self.policy.validate_amount(accepted["amount"], max_usdc)
+                    # The official CLI performs its own protected request. The first
+                    # common request above is unpaid and exists solely for policy and
+                    # challenge validation; there is no Python paid retry.
+                    effective_cap = max_usdc or self.policy.max_usdc
+                    managed_backend = cast(ManagedPaymentBackend, self.backend)
+                    managed = await managed_backend.pay_and_fetch(
+                        url=url,
+                        method=normalized_method,
+                        body=body,
+                        headers=request_headers,
+                        payment_required=payment_required,
+                        max_usdc=(
+                            self.policy.normalize_max_usdc(effective_cap)
+                            if effective_cap is not None
+                            else None
+                        ),
+                    )
+                    return BuyerResult(
+                        status=managed.status,
+                        data=managed.data,
+                        payer=managed.payer,
+                        amount=managed.amount,
+                        network=managed.network,
+                        transaction_id=managed.transaction_id,
+                        payment_status=managed.payment_status,
+                    )
 
+                if not hasattr(self.backend, "create_payment_proof"):
+                    raise PaymentProofError("Buyer backend does not support a payment capability")
+                proof_backend = cast(PaymentProofBackend, self.backend)
+                self.policy.validate_amount(payment_required["accepts"][0]["amount"], max_usdc)
                 try:
-                    proof = await self.backend.create_payment_proof(
+                    proof = await proof_backend.create_payment_proof(
                         url=url,
                         method=normalized_method,
                         body=body,
@@ -95,6 +135,8 @@ class X402BuyerService:
                     raise PaidResourceRequestError(
                         "Paid resource request failed after payment proof creation"
                     ) from exc
+        except PaymentSubmissionUnknownError:
+            raise
         except httpx.HTTPError as exc:
             raise PaidResourceRequestError("Resource request failed") from exc
 

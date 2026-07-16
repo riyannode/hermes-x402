@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING, Any
 
-from hermes_x402.buyer.backend import BuyerBackend
+from hermes_x402.buyer.backend import BuyerBackend, ManagedPaymentBackend, PaymentProofBackend
 from hermes_x402.buyer.errors import BuyerConfigurationError
 from hermes_x402.buyer.models import BuyerResult
 from hermes_x402.buyer.policy import PaymentPolicy
@@ -165,6 +165,8 @@ __all__ = [
     "BuyerBackend",
     "BuyerResult",
     "CircleDcwBuyerBackend",
+    "ManagedPaymentBackend",
+    "PaymentProofBackend",
     "PaymentPolicy",
     "X402BuyerService",
     "X402BuyerTool",
