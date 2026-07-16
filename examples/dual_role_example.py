@@ -6,7 +6,6 @@ This demonstrates the full flow:
     3. Payment proof propagates via ContextVar
 """
 
-import asyncio
 import logging
 import os
 
@@ -59,11 +58,13 @@ async def analyze(request: web.Request):
         downstream = None
 
     # Step 4: Return result
-    return web.json_response({
-        "result": "Analysis complete",
-        "paid_by": payment_info["payer"] if payment_info else "unknown",
-        "downstream_paid": downstream is not None,
-    })
+    return web.json_response(
+        {
+            "result": "Analysis complete",
+            "paid_by": payment_info["payer"] if payment_info else "unknown",
+            "downstream_paid": downstream is not None,
+        }
+    )
 
 
 def create_app() -> web.Application:

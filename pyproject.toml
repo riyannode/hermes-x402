@@ -55,6 +55,11 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# Pre-existing seller/context compatibility annotations and wire-format documentation.
+"hermes_x402/context.py" = ["UP045"]
+"hermes_x402/middleware.py" = ["E501", "UP045"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

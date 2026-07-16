@@ -6,7 +6,6 @@ Flow:
     3. Server settles directly via Circle Gateway → returns premium content
 """
 
-import asyncio
 import logging
 import os
 
@@ -40,13 +39,15 @@ async def premium_data(request: web.Request):
         )
 
     # Payment succeeded
-    return web.json_response({
-        "secret": "The treasure is hidden under the doormat.",
-        "paid_by": result.payer,
-        "amount_usdc": result.amount,
-        "network": result.network,
-        "transaction": result.transaction,
-    })
+    return web.json_response(
+        {
+            "secret": "The treasure is hidden under the doormat.",
+            "paid_by": result.payer,
+            "amount_usdc": result.amount,
+            "network": result.network,
+            "transaction": result.transaction,
+        }
+    )
 
 
 async def health(request: web.Request):
