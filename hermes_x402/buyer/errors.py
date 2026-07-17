@@ -21,6 +21,14 @@ class PaymentPolicyError(BuyerError):
     """A requested payment violates local host or spending policy."""
 
 
+class HostPolicyError(PaymentPolicyError):
+    """A URL host is not in the configured allowlist."""
+
+
+class PaymentLimitExceededError(PaymentPolicyError):
+    """A payment amount exceeds the configured maximum."""
+
+
 class PaymentNotSubmittedError(BuyerError):
     """Payment was rejected before a proof could be safely created."""
 

@@ -43,6 +43,9 @@ dev = [
     "cryptography>=42.0",
 ]
 
+[project.entry-points."hermes_agent.plugins"]
+hermes-x402 = "hermes_x402.hermes_plugin.entry"
+
 [project.urls]
 Homepage = "https://github.com/riyannode/hermes-x402"
 Repository = "https://github.com/riyannode/hermes-x402"
