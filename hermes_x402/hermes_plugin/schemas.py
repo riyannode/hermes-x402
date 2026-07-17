@@ -20,6 +20,8 @@ MAX_HEADER_COUNT = 10
 MAX_HEADER_LENGTH = 1024
 MAX_OUTPUT_SIZE = 100_000  # 100 KB before truncation
 MAX_OUTPUT_BYTES = 65536  # 64 KB body read limit
+MAX_SEARCH_LIMIT = 25
+MAX_SEARCH_RESULTS = 25
 
 # ---------------------------------------------------------------------------
 # Tool schemas (OpenAI function-calling format)
@@ -67,11 +69,24 @@ X402_WALLET_BALANCE_SCHEMA: dict[str, Any] = {
     },
 }
 
+X402_NETWORKS_SCHEMA: dict[str, Any] = {
+    "name": "x402_networks",
+    "description": (
+        "List x402 networks supported by the active backend. "
+        "Read-only. Returns capability matrix for each network."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
 X402_SERVICE_SEARCH_SCHEMA: dict[str, Any] = {
     "name": "x402_service_search",
     "description": (
-        "Search for x402-enabled services by query. CLI backend only. "
-        "Returns bounded results without arbitrary CLI flags."
+        "Search the Circle service marketplace for x402-enabled services. "
+        "Returns bounded results without payment. Read-only."
     ),
     "parameters": {
         "type": "object",
@@ -79,6 +94,10 @@ X402_SERVICE_SEARCH_SCHEMA: dict[str, Any] = {
             "query": {
                 "type": "string",
                 "description": "Search query for x402 services.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum results to return (1-25, default 10).",
             },
         },
         "required": ["query"],
@@ -98,6 +117,29 @@ X402_SERVICE_INSPECT_SCHEMA: dict[str, Any] = {
             "url": {
                 "type": "string",
                 "description": "URL of the x402 service to inspect.",
+            },
+        },
+        "required": ["url"],
+    },
+}
+
+X402_SUPPORTS_SCHEMA: dict[str, Any] = {
+    "name": "x402_supports",
+    "description": (
+        "Check whether a URL supports x402 payments. Read-only preflight. "
+        "Never signs, settles, deposits, or pays."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "URL to check for x402 support.",
+            },
+            "method": {
+                "type": "string",
+                "description": "HTTP method intended for payment (default: GET).",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
         },
         "required": ["url"],

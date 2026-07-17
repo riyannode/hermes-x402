@@ -44,6 +44,22 @@ class ManagedPaymentResult:
 
 
 @dataclass(frozen=True)
+class PaymentOption:
+    """A single payment option extracted from a 402 challenge."""
+
+    scheme: str  # e.g. "x402", "x402-faucet"
+    payment_system: str  # "gateway_batching" | "vanilla"
+    network: str  # canonical network key from registry
+    network_id: str  # CAIP-2 identifier
+    amount_atomic: str  # atomic USDC amount (integer string)
+    amount_usdc: str  # human-readable USDC string
+    asset: str  # USDC contract address
+    supported_by_backend: bool  # whether the active backend supports this network
+    pay_to: str  # payTo address from challenge
+    max_timeout_seconds: int  # max_seconds from challenge
+
+
+@dataclass(frozen=True)
 class BuyerResult:
     """Normalized result of a resource request, with payment lifecycle state."""
 

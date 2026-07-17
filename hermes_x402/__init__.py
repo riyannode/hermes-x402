@@ -42,6 +42,9 @@ from hermes_x402.circle_cli.errors import (
 from hermes_x402.config import ARC_MAINNET, ARC_TESTNET, X402Config
 from hermes_x402.context import X402ContextBridge, get_payment_context, set_payment_context
 from hermes_x402.middleware import X402SellerMiddleware, create_aiohttp_middleware
+from hermes_x402.network_policy import NetworkPolicy, parse_network_policy
+from hermes_x402.networks import NetworkConfig, get_network, list_networks, normalize_network
+from hermes_x402.seller_gateway import X402Gateway, create_aiohttp_gateway
 
 __version__ = "0.1.0"
 __all__ = [
@@ -71,6 +74,8 @@ __all__ = [
     "DcwApiError",
     "DcwSigningError",
     "InvalidPaymentChallengeError",
+    "NetworkConfig",
+    "NetworkPolicy",
     "PaidResourceRequestError",
     "PaymentNotSubmittedError",
     "PaymentPolicy",
@@ -82,10 +87,16 @@ __all__ = [
     "X402BuyerTool",
     "X402Config",
     "X402ContextBridge",
+    "X402Gateway",
     "X402HermesAgent",
     "X402SellerMiddleware",
+    "create_aiohttp_gateway",
     "create_aiohttp_middleware",
     "create_buyer_tool",
+    "get_network",
     "get_payment_context",
+    "list_networks",
+    "normalize_network",
+    "parse_network_policy",
     "set_payment_context",
 ]

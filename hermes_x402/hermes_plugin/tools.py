@@ -7,6 +7,9 @@ Registered tools:
   x402_status          — plugin status and configuration
   x402_wallet_status   — Circle wallet status (read-only)
   x402_wallet_balance  — wallet USDC balance (read-only)
+  x402_networks        — list supported networks with capability matrix
+  x402_service_search  — search Circle marketplace for x402 services
+  x402_supports        — check if a URL supports x402 payments
   x402_service_inspect — inspect a service URL without paying
   x402_fetch           — fetch a URL without paying
   x402_pay             — pay for an x402 resource (may transfer USDC)
@@ -38,11 +41,16 @@ from hermes_x402.hermes_plugin.schemas import (
     MAX_OUTPUT_BYTES,
     MAX_OUTPUT_SIZE,
     MAX_QUERY_LENGTH,
+    MAX_SEARCH_LIMIT,
+    MAX_SEARCH_RESULTS,
     MAX_URL_LENGTH,
     X402_FETCH_SCHEMA,
+    X402_NETWORKS_SCHEMA,
     X402_PAY_SCHEMA,
     X402_SERVICE_INSPECT_SCHEMA,
+    X402_SERVICE_SEARCH_SCHEMA,
     X402_STATUS_SCHEMA,
+    X402_SUPPORTS_SCHEMA,
     X402_WALLET_BALANCE_SCHEMA,
     X402_WALLET_STATUS_SCHEMA,
 )
@@ -93,10 +101,7 @@ def _validate_max_usdc(
     if caller_value is None:
         return configured_value, None
 
-    caller, error = _parse_usdc_cap(
-        caller_value,
-        field="max_usdc",
-    )
+    caller, error = _parse_usdc_cap(caller_value, field="max_usdc")
     if error:
         return None, error
 
@@ -257,7 +262,6 @@ def _bounded_response(
                 "original_size": original_size,
             }
         except (UnicodeDecodeError, json.JSONDecodeError):
-            # Malformed JSON — fall through to text
             pass
 
     # Text/binary fallback
@@ -314,7 +318,6 @@ def register_status_tools(ctx: Any) -> None:
         if runtime.config:
             host_allowlist = runtime.config.host_allowlist
 
-        # Fix #9: configured means role/backend are set, not just plugin loaded
         role = runtime.role
         is_configured = role is not None and runtime.is_configured
 
@@ -399,7 +402,6 @@ def register_wallet_tools(ctx: Any) -> None:
         description=("Report Circle wallet status. Read-only. Never exposes secrets."),
     )
 
-    # Fix #2: async handler, no _run_async
     async def wallet_balance_handler(**kwargs: Any) -> str:
         runtime = get_runtime()
         runtime.ensure_initialized()
@@ -474,6 +476,235 @@ def register_wallet_tools(ctx: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Network tools
+# ---------------------------------------------------------------------------
+
+
+def register_network_tools(ctx: Any) -> None:
+    """Register x402_networks tool."""
+
+    def networks_handler(**kwargs: Any) -> str:
+        from hermes_x402.networks import list_networks
+
+        runtime = get_runtime()
+        runtime.ensure_initialized()
+
+        backend_name = runtime.backend_name
+
+        # Determine which capability filter to apply based on backend
+        all_networks = list_networks()
+
+        result_networks = []
+        for net in all_networks:
+            backend_supported = False
+            if (
+                backend_name == "cli"
+                and net.buyer_cli_supported
+                or backend_name == "dcw"
+                and net.buyer_dcw_supported
+                or net.seller_supported
+            ):
+                backend_supported = True
+
+            result_networks.append(
+                {
+                    "key": net.key,
+                    "display_name": net.display_name,
+                    "caip2": net.caip2,
+                    "chain_id": net.chain_id,
+                    "environment": net.environment,
+                    "gateway_supported": net.gateway_supported,
+                    "backend_supported": backend_supported,
+                    "seller_supported": net.seller_supported,
+                }
+            )
+
+        return format_success_result(
+            {
+                "success": True,
+                "backend": backend_name or "none",
+                "count": len(result_networks),
+                "networks": result_networks,
+            }
+        )
+
+    ctx.register_tool(
+        name="x402_networks",
+        toolset="x402",
+        schema=X402_NETWORKS_SCHEMA,
+        handler=lambda args, **kw: networks_handler(**kw),
+        description=(
+            "List x402 networks supported by the active backend. "
+            "Read-only. Returns capability matrix for each network."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Discovery tools
+# ---------------------------------------------------------------------------
+
+
+def register_discovery_tools(ctx: Any) -> None:
+    """Register x402_service_search tool."""
+
+    async def service_search_handler(args: dict, **kwargs: Any) -> str:
+        query = args.get("query", "")
+        limit = args.get("limit", 10)
+
+        err = _validate_query(query)
+        if err:
+            return format_success_result(
+                {"success": False, "error": "invalid_input", "message": err}
+            )
+
+        # Bound limit
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 10
+        if limit < 1:
+            limit = 1
+        if limit > MAX_SEARCH_LIMIT:
+            limit = MAX_SEARCH_LIMIT
+
+        runtime = get_runtime()
+        runtime.ensure_initialized()
+
+        if runtime.cli_client is None:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "cli_not_available",
+                    "message": (
+                        "Service search requires the Circle CLI backend. "
+                        "Set X402_BUYER_BACKEND=cli and configure Circle CLI credentials."
+                    ),
+                }
+            )
+
+        try:
+            from hermes_x402.discovery.circle_marketplace import CircleCliMarketplaceProvider
+
+            provider = CircleCliMarketplaceProvider(runner=runtime.cli_client.runner)
+            services = await provider.search(query, limit=limit)
+
+            results = []
+            for svc in services[:MAX_SEARCH_RESULTS]:
+                results.append(
+                    {
+                        "name": svc.name,
+                        "description": svc.description or "",
+                        "url": svc.url,
+                        "advertised_price_usdc": svc.advertised_price_usdc or "",
+                        "advertised_networks": list(svc.advertised_networks),
+                    }
+                )
+
+            return format_success_result(
+                {
+                    "success": True,
+                    "provider": "circle_marketplace",
+                    "query": query,
+                    "count": len(results),
+                    "services": results,
+                }
+            )
+        except Exception as exc:
+            return format_error_result(exc)
+
+    ctx.register_tool(
+        name="x402_service_search",
+        toolset="x402",
+        schema=X402_SERVICE_SEARCH_SCHEMA,
+        handler=service_search_handler,
+        is_async=True,
+        description=(
+            "Search the Circle service marketplace for x402-enabled services. "
+            "Returns bounded results without payment. Read-only."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Supports tools
+# ---------------------------------------------------------------------------
+
+
+def register_supports_tools(ctx: Any) -> None:
+    """Register x402_supports tool."""
+
+    async def supports_handler(args: dict, **kwargs: Any) -> str:
+        url = args.get("url", "")
+        method = (args.get("method") or "GET").upper()
+
+        err = _validate_url(url)
+        if err:
+            return format_success_result(
+                {"success": False, "error": "invalid_input", "message": err}
+            )
+
+        err = _validate_method(method)
+        if err:
+            return format_success_result(
+                {"success": False, "error": "invalid_input", "message": err}
+            )
+
+        try:
+            from hermes_x402.buyer.supports import check_supports
+
+            result = await check_supports(url, method=method)
+            return format_success_result(
+                {
+                    "success": True,
+                    "supported": result.supported,
+                    "x402": result.x402,
+                    "gateway_batching": result.gateway_batching,
+                    "resource": result.resource,
+                    "method": result.method,
+                    "x402_version": result.version,
+                    "options": [
+                        {
+                            "scheme": opt.scheme,
+                            "payment_system": opt.payment_system,
+                            "network": opt.network,
+                            "network_id": opt.network_id,
+                            "amount_atomic": opt.amount_atomic,
+                            "amount_usdc": opt.amount_usdc,
+                            "asset": opt.asset,
+                            "supported_by_backend": opt.supported_by_backend,
+                        }
+                        for opt in result.options
+                    ],
+                    "unsupported_networks": list(result.unsupported_networks),
+                    "preferred_option": (
+                        {
+                            "network": result.preferred_option.network,
+                            "amount_usdc": result.preferred_option.amount_usdc,
+                        }
+                        if result.preferred_option
+                        else None
+                    ),
+                    "reason": result.reason,
+                }
+            )
+        except Exception as exc:
+            return format_error_result(exc)
+
+    ctx.register_tool(
+        name="x402_supports",
+        toolset="x402",
+        schema=X402_SUPPORTS_SCHEMA,
+        handler=supports_handler,
+        is_async=True,
+        description=(
+            "Check whether a URL supports x402 payments. Read-only preflight. "
+            "Never signs, settles, deposits, or pays."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Service tools
 # ---------------------------------------------------------------------------
 
@@ -481,9 +712,6 @@ def register_wallet_tools(ctx: Any) -> None:
 def register_service_tools(ctx: Any) -> None:
     """Register x402_service_inspect tool."""
 
-    # Fix #2: async handler, no _run_async
-    # Fix #4: follow_redirects=False
-    # Fix #3: centralized URL/host policy
     async def service_inspect_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
 
@@ -553,10 +781,6 @@ def register_service_tools(ctx: Any) -> None:
 def register_payment_tools(ctx: Any) -> None:
     """Register x402_fetch and x402_pay tools."""
 
-    # Fix #2: async handler, no _run_async
-    # Fix #4: follow_redirects=False
-    # Fix #5: enforce allowlist in fetch
-    # Fix #6: bound all fetch output including JSON
     async def fetch_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
         method = (args.get("method") or "GET").upper()
@@ -565,24 +789,15 @@ def register_payment_tools(ctx: Any) -> None:
         err = _validate_method(method)
         if err:
             return format_success_result(
-                {
-                    "success": False,
-                    "error": "invalid_input",
-                    "message": err,
-                }
+                {"success": False, "error": "invalid_input", "message": err}
             )
 
         err = _validate_body_size(body)
         if err:
             return format_success_result(
-                {
-                    "success": False,
-                    "error": "invalid_input",
-                    "message": err,
-                }
+                {"success": False, "error": "invalid_input", "message": err}
             )
 
-        # Fix #5: enforce allowlist before any network I/O
         runtime = get_runtime()
         runtime.ensure_initialized()
         host_allowlist = runtime.config.host_allowlist if runtime.config else []
@@ -632,7 +847,6 @@ def register_payment_tools(ctx: Any) -> None:
                         }
                     )
 
-                # Fix #6: bounded response read
                 result = _bounded_response(response)
                 return format_success_result(result)
         except httpx.HTTPError as exc:
@@ -656,7 +870,6 @@ def register_payment_tools(ctx: Any) -> None:
         ),
     )
 
-    # Fix #2: async handler, no _run_async
     async def pay_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
         method = (args.get("method") or "GET").upper()
@@ -666,31 +879,19 @@ def register_payment_tools(ctx: Any) -> None:
         err = _validate_url(url)
         if err:
             return format_success_result(
-                {
-                    "success": False,
-                    "error": "invalid_input",
-                    "message": err,
-                }
+                {"success": False, "error": "invalid_input", "message": err}
             )
 
         err = _validate_method(method)
         if err:
             return format_success_result(
-                {
-                    "success": False,
-                    "error": "invalid_input",
-                    "message": err,
-                }
+                {"success": False, "error": "invalid_input", "message": err}
             )
 
         err = _validate_body_size(body)
         if err:
             return format_success_result(
-                {
-                    "success": False,
-                    "error": "invalid_input",
-                    "message": err,
-                }
+                {"success": False, "error": "invalid_input", "message": err}
             )
 
         runtime = get_runtime()
@@ -706,7 +907,6 @@ def register_payment_tools(ctx: Any) -> None:
             )
 
         configured_max = runtime.config.max_usdc_per_payment if runtime.config else None
-        # Fix #1: fail-closed cap validation
         validated_cap, err = _validate_max_usdc(max_usdc, configured_max)
         if err:
             return format_success_result(
@@ -716,6 +916,17 @@ def register_payment_tools(ctx: Any) -> None:
                     "message": err,
                 }
             )
+
+        # New-host approval check
+        if runtime.config and runtime.config.require_approval_for_new_host:
+            try:
+                from hermes_x402.buyer.approval import check_approval_required
+
+                approval = check_approval_required(url, config=runtime.config)
+                if approval is not None:
+                    return format_success_result(approval)
+            except Exception:
+                pass  # If approval check fails, don't block payment
 
         buyer = runtime.buyer_tool
         if buyer is None:
@@ -769,7 +980,7 @@ def register_payment_tools(ctx: Any) -> None:
         handler=pay_handler,
         is_async=True,
         description=(
-            "⚠️ May transfer USDC. Pay for an x402 resource. "
+            "⚠️ This tool may transfer USDC. Pay for an x402 resource. "
             "Cannot change configured wallet, network, or backend. "
             "Capped by local configuration."
         ),
