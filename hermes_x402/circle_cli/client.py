@@ -333,10 +333,25 @@ class CircleCliClient:
     # Session management (v0.0.6 wallet-scoped commands)
     # ------------------------------------------------------------------
 
-    async def login_start(self, *, email: str) -> LoginStartResult:
-        """Start email OTP login using Circle CLI v0.0.6 wallet-scoped command."""
+    async def login_start(
+        self,
+        *,
+        email: str,
+        testnet: bool = False,
+    ) -> LoginStartResult:
+        """Start email OTP login using Circle CLI v0.0.6 wallet-scoped command.
+
+        Args:
+            email: Email address for login.
+            testnet: If True, add --testnet flag for testnet environments.
+        """
+        args = ["wallet", "login", email, "--type", "agent", "--init"]
+        if testnet:
+            args.append("--testnet")
+        args.extend(["--output", "json"])
+
         result = await self.runner.run_json(
-            ("wallet", "login", email, "--type", "agent", "--init", "--output", "json"),
+            tuple(args),
             timeout_seconds=self.runner.read_timeout_seconds,
             operation="auth",
         )
@@ -397,6 +412,7 @@ class CircleCliClient:
 
         Raises CircleCliOutputError for malformed balance responses.
         Never fabricates zero from malformed data.
+        Rejects NaN, Infinity, -Infinity, and negative balances.
         """
         from decimal import Decimal, InvalidOperation
 
@@ -417,24 +433,32 @@ class CircleCliClient:
         self._require_read_success(result)
         data = self._data(result)
 
+        def _validate_balance(raw: str, context: str) -> Decimal:
+            """Parse and validate a balance string. Raises on any issue."""
+            if not isinstance(raw, str):
+                raise CircleCliOutputError(
+                    f"Gateway balance {context} is not a string: {type(raw).__name__}"
+                )
+            if not raw.strip():
+                raise CircleCliOutputError(f"Gateway balance {context} is empty")
+            try:
+                parsed = Decimal(raw)
+            except (InvalidOperation, ValueError) as exc:
+                raise CircleCliOutputError(
+                    f"Gateway balance {context} is not a valid decimal: {raw!r}"
+                ) from exc
+            if not parsed.is_finite():
+                raise CircleCliOutputError(f"Gateway balance {context} is not finite: {raw!r}")
+            if parsed < 0:
+                raise CircleCliOutputError(f"Gateway balance {context} is negative: {raw!r}")
+            return parsed
+
         # Parse balance — fail closed on any malformed response
         balance_str: str | None = None
 
         if "total" in data:
-            raw = data["total"]
-            if not isinstance(raw, str):
-                raise CircleCliOutputError(
-                    f"Gateway balance 'total' is not a string: {type(raw).__name__}"
-                )
-            if not raw.strip():
-                raise CircleCliOutputError("Gateway balance 'total' is empty")
-            try:
-                Decimal(raw)
-            except (InvalidOperation, ValueError) as exc:
-                raise CircleCliOutputError(
-                    f"Gateway balance 'total' is not a valid decimal: {raw!r}"
-                ) from exc
-            balance_str = raw
+            parsed = _validate_balance(data["total"], "'total'")
+            balance_str = str(parsed)
         elif "balances" in data:
             balances = data["balances"]
             if not isinstance(balances, list):
@@ -456,37 +480,18 @@ class CircleCliClient:
                     raise CircleCliOutputError(
                         f"Gateway balance entry 'amount' is not a string: {amount!r}"
                     )
-                if not amount.strip():
-                    raise CircleCliOutputError(
-                        f"Gateway balance entry 'amount' is empty for {symbol}"
-                    )
-                try:
-                    parsed = Decimal(amount)
-                except (InvalidOperation, ValueError) as exc:
-                    raise CircleCliOutputError(
-                        f"Gateway balance entry 'amount' is not a valid decimal: {amount!r}"
-                    ) from exc
+                parsed = _validate_balance(amount, f"entry[{symbol!r}].amount")
                 if symbol == "USDC":
                     total += parsed
                     found_usdc = True
             if not found_usdc:
                 raise CircleCliOutputError("Gateway balance response has no USDC entry")
+            if not total.is_finite():
+                raise CircleCliOutputError("Gateway balance summed total is not finite")
             balance_str = str(total)
         elif "totalBalance" in data:
-            raw = data["totalBalance"]
-            if not isinstance(raw, str):
-                raise CircleCliOutputError(
-                    f"Gateway balance 'totalBalance' is not a string: {type(raw).__name__}"
-                )
-            if not raw.strip():
-                raise CircleCliOutputError("Gateway balance 'totalBalance' is empty")
-            try:
-                Decimal(raw)
-            except (InvalidOperation, ValueError) as exc:
-                raise CircleCliOutputError(
-                    f"Gateway balance 'totalBalance' is not a valid decimal: {raw!r}"
-                ) from exc
-            balance_str = raw
+            parsed = _validate_balance(data["totalBalance"], "'totalBalance'")
+            balance_str = str(parsed)
         else:
             raise CircleCliOutputError(
                 "Gateway balance response is missing 'total', 'balances', and 'totalBalance'"

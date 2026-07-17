@@ -31,10 +31,15 @@ class MockCtx:
 
     def __init__(self) -> None:
         self.tools: dict[str, dict[str, Any]] = {}
+        self.hooks: list[dict[str, Any]] = []
 
     def register_tool(self, **kwargs: Any) -> None:
         name = kwargs.get("name", "")
         self.tools[name] = kwargs
+
+    def register_hook(self, hook_type: str, handler: Any) -> None:
+        """Register a hook with the plugin context."""
+        self.hooks.append({"hook_type": hook_type, "handler": handler})
 
 
 def _make_config(**overrides: Any) -> Any:
@@ -265,7 +270,7 @@ class TestLoginLifecycle:
         register_login_tools(ctx)
         handler = ctx.tools["x402_login_start"]["handler"]
 
-        rt = _make_runtime_mock()
+        rt = _make_runtime_mock(allow_chat_otp=True)
         status = MagicMock()
         status.authenticated = False
         status.terms_accepted = True
@@ -279,12 +284,18 @@ class TestLoginLifecycle:
         )
 
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"email": "user@example.com"})
+            result = await handler(
+                {
+                    "email": "user@example.com",
+                    "mode": "chat_otp",
+                }
+            )
 
         import json
 
         data = json.loads(result)
         assert data["success"] is True
+        assert data["mode"] == "chat_otp"
         assert "login_id" in data
         # login_id must NOT be the raw Circle request ID
         assert data["login_id"] != "circle-raw-request-id-123"
@@ -366,8 +377,13 @@ class TestLoginLifecycle:
         )
 
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            # Start login
-            start_result = await start_handler({"email": "user@example.com"})
+            # Start login in chat_otp mode
+            start_result = await start_handler(
+                {
+                    "email": "user@example.com",
+                    "mode": "chat_otp",
+                }
+            )
             import json
 
             start_data = json.loads(start_result)

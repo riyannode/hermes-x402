@@ -1455,8 +1455,26 @@ def register_payment_tools(ctx: Any) -> None:
 def register_login_tools(ctx: Any) -> None:
     """Register x402_login_start and x402_login_complete."""
 
-    # Pending login state (in-memory only)
+    # Pending login state (in-memory only) — only used for chat_otp mode
     _pending_logins: dict[str, dict[str, Any]] = {}
+
+    def _resolve_network_info(runtime: Any) -> tuple[str, bool, str]:
+        """Resolve network code, testnet flag, and CLI chain name."""
+        network_code = (
+            runtime.config.circle_cli_network or runtime.config.blockchain
+            if runtime.config
+            else runtime.network
+        )
+        try:
+            from hermes_x402.networks import get_network
+
+            net = get_network(network_code)
+            is_testnet = net.environment == "testnet"
+            cli_chain = net.cli_chain or network_code
+        except Exception:
+            is_testnet = "testnet" in network_code.lower()
+            cli_chain = network_code
+        return network_code, is_testnet, cli_chain
 
     async def login_start_handler(args: dict, **kwargs: Any) -> str:
         runtime = get_runtime()
@@ -1480,7 +1498,17 @@ def register_login_tools(ctx: Any) -> None:
                 }
             )
 
-        # Fail-closed: check existing session first
+        mode = (args.get("mode") or "manual_cli").strip().lower()
+        if mode not in ("manual_cli", "chat_otp"):
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "invalid_input",
+                    "message": "mode must be 'manual_cli' or 'chat_otp'.",
+                }
+            )
+
+        # Fail-closed: check existing session for the configured environment
         try:
             status = await runtime.cli_client.agent_wallet_status()
         except Exception:
@@ -1511,13 +1539,44 @@ def register_login_tools(ctx: Any) -> None:
                 }
             )
 
-        # Expire pending logins before rejecting parallel login
+        network_code, is_testnet, cli_chain = _resolve_network_info(runtime)
+        testnet_flag = " --testnet" if is_testnet else ""
+
+        # manual_cli mode: do NOT call login_start(), just return the command
+        if mode == "manual_cli":
+            manual_command = f"circle wallet login {email} --type agent{testnet_flag}"
+            return format_success_result(
+                {
+                    "success": True,
+                    "mode": "manual_cli",
+                    "command": manual_command,
+                    "message": (
+                        "Run this command in your terminal to complete login. "
+                        "The OTP never enters Hermes chat."
+                    ),
+                }
+            )
+
+        # chat_otp mode: require X402_ALLOW_CHAT_OTP=true
+        allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
+        if not allow_chat_otp:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "chat_otp_disabled",
+                    "message": (
+                        "Chat OTP login is disabled. "
+                        "Set X402_ALLOW_CHAT_OTP=true or use mode=manual_cli."
+                    ),
+                }
+            )
+
+        # Reject parallel pending logins
         now = time.time()
         expired = [k for k, v in _pending_logins.items() if now > v.get("expires_at", 0)]
         for k in expired:
             _pending_logins.pop(k, None)
 
-        # Reject parallel pending logins (only for active, non-expired entries)
         active = [k for k, v in _pending_logins.items() if v.get("active")]
         if active:
             return format_success_result(
@@ -1530,82 +1589,33 @@ def register_login_tools(ctx: Any) -> None:
                 }
             )
 
+        # Call login_start with testnet flag
         try:
-            result = await runtime.cli_client.login_start(email=email)
+            result = await runtime.cli_client.login_start(
+                email=email,
+                testnet=is_testnet,
+            )
 
-            # Generate plugin-owned opaque login_id
             login_id = secrets.token_urlsafe(16)
             _pending_logins[login_id] = {
                 "active": True,
                 "circle_request_id": result.request_id,
                 "email": email,
                 "created_at": now,
-                "expires_at": now + 300,  # 5-minute expiry
+                "expires_at": now + 300,
             }
-
-            # Determine if chat OTP is available
-            allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
-
-            # Resolve network for correct login command
-            network_code = (
-                runtime.config.circle_cli_network or runtime.config.blockchain
-                if runtime.config
-                else runtime.network
-            )
-            try:
-                from hermes_x402.networks import get_network
-
-                net = get_network(network_code)
-                is_testnet = net.environment == "testnet"
-                cli_chain = net.cli_chain or network_code
-            except Exception:
-                is_testnet = "testnet" in network_code.lower()
-                cli_chain = network_code
-
-            # Build manual login command with correct --testnet flag
-            testnet_flag = " --testnet" if is_testnet else ""
-            manual_command = f"circle wallet login --type agent --chain {cli_chain}{testnet_flag}"
-
-            next_actions = [
-                {
-                    "action": "manual_cli_login",
-                    "description": (
-                        "Recommended: Complete login through Circle CLI in your terminal. "
-                        "The OTP never enters Hermes chat."
-                    ),
-                    "command": manual_command,
-                }
-            ]
-
-            if allow_chat_otp:
-                next_actions.append(
-                    {
-                        "action": "x402_login_complete",
-                        "description": (
-                            "Optional: Send the OTP through chat. "
-                            "WARNING: The OTP will pass through the conversation "
-                            "and model/tool context."
-                        ),
-                        "warning": (
-                            "Chat OTP is not secure or private. "
-                            "The plugin does not intentionally persist or log it, "
-                            "but it will exist in conversation history."
-                        ),
-                    }
-                )
 
             return format_success_result(
                 {
                     "success": True,
+                    "mode": "chat_otp",
                     "login_id": login_id,
                     "email_masked": result.email_masked,
                     "otp_required": result.otp_required,
-                    "chat_otp_available": allow_chat_otp,
-                    "next_actions": next_actions,
                     "message": (
-                        "OTP sent to your email. "
-                        "Use the manual CLI login (recommended) or "
-                        "x402_login_complete with the OTP (if enabled)."
+                        "OTP sent to your email. Use x402_login_complete with the OTP. "
+                        "WARNING: The OTP will pass through conversation and "
+                        "model/tool context."
                     ),
                 }
             )
@@ -1989,7 +1999,6 @@ def register_gateway_tools(ctx: Any) -> None:
         # Extract details from the gateway option
         network = gateway_option.network
         gateway_network = gateway_option.network_id
-        gateway_domain = None
 
         # Verify session validity
         try:
@@ -2058,62 +2067,88 @@ def register_gateway_tools(ctx: Any) -> None:
         except Exception:
             pass  # Gateway balance is informational
 
-        # Resolve deposit method (fail-closed for Arc Testnet)
-        deposit_method = "direct"
-        # Arc Testnet direct deposit support must be verified
-        network_lower = network.lower()
-        if "arc" in network_lower and "testnet" in network_lower:
-            # Only allow direct if we can prove Arc Testnet supports it
-            # For now, reject if Gateway support cannot be proven for Arc Testnet
-            from hermes_x402.networks import list_networks
+        # Resolve network and verify Gateway support — fail closed
+        try:
+            from hermes_x402.networks import get_network
 
-            all_networks = list_networks()
-            arc_testnet_net = None
-            for net in all_networks:
-                if (
-                    net.key.lower() == network.lower()
-                    or net.display_name.lower() == network.lower()
-                ):
-                    arc_testnet_net = net
-                    break
-            if arc_testnet_net and not arc_testnet_net.gateway_supported:
+            resolved_net = get_network(network)
+            if not resolved_net.gateway_supported:
                 return format_success_result(
                     {
                         "success": False,
-                        "error": "arc_gateway_not_supported",
-                        "message": (
-                            "Arc Testnet Gateway deposit support cannot "
-                            f"be proven for network {network}."
-                        ),
+                        "error": "gateway_not_supported",
+                        "message": (f"Network {network} does not support Gateway deposits."),
                     }
                 )
+        except Exception as exc:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "network_resolution_failed",
+                    "message": f"Could not resolve network: {exc}",
+                }
+            )
+
+        # Deposit method: direct only for this PR
+        deposit_method = "direct"
 
         # Configuration fingerprint
         config_fingerprint = hashlib.sha256(
             f"{runtime.wallet_address}:{network}".encode()
         ).hexdigest()[:16]
 
-        # Generate preview ID
+        # Body hash for deterministic body comparison
+        body = args.get("body") if method in {"POST", "PUT", "PATCH"} else None
+        body_hash = (
+            hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:16]
+            if body is not None
+            else None
+        )
+
+        # Service payment-option fingerprint from all option fields
+        service_option_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "scheme": gateway_option.scheme,
+                    "payment_system": gateway_option.payment_system,
+                    "network": gateway_option.network,
+                    "network_id": gateway_option.network_id,
+                    "amount_atomic": gateway_option.amount_atomic,
+                    "asset": gateway_option.asset,
+                    "pay_to": gateway_option.pay_to,
+                    "max_timeout_seconds": gateway_option.max_timeout_seconds,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+
+        # Generate preview ID with full state
         preview_id = secrets.token_urlsafe(16)
         _previews[preview_id] = {
-            "amount": amount,
-            "wallet": runtime.wallet_address,
-            "network": network,
-            "canonical_caip2": gateway_network or network,
+            # Deposit parameters
+            "deposit_amount": amount,
+            # Service payment-option fields (for fingerprint)
+            "service_payment_amount": gateway_option.amount_usdc,
+            "x402_version": support.version,
+            "scheme": gateway_option.scheme,
+            "payment_system": gateway_option.payment_system,
+            "network": gateway_option.network,
+            "network_id": gateway_option.network_id,
+            "asset": gateway_option.asset,
+            "pay_to": gateway_option.pay_to,
+            "max_timeout_seconds": gateway_option.max_timeout_seconds,
+            # Service binding
             "service_url": service_url,
             "method": method,
-            "payment_option_fingerprint": hashlib.sha256(
-                json.dumps(
-                    {"network": gateway_network, "domain": gateway_domain}, sort_keys=True
-                ).encode()
-            ).hexdigest()[:16],
-            "gateway_scheme": "circle_gateway",
-            "gateway_destination_network": gateway_network,
-            "gateway_destination_domain": gateway_domain,
+            "body_hash": body_hash,
+            # Wallet and config
+            "wallet": runtime.wallet_address,
+            "wallet_network": network,
             "deposit_method": deposit_method,
             "config_fingerprint": config_fingerprint,
+            "service_option_fingerprint": service_option_fingerprint,
             "created_at": time.time(),
-            "expires_at": time.time() + 300,  # 5 minutes
+            "expires_at": time.time() + 300,
             "consumed": False,
         }
 
@@ -2251,7 +2286,7 @@ def register_gateway_tools(ctx: Any) -> None:
                     "message": "Wallet changed since preview. Create a new preview.",
                 }
             )
-        if preview["network"] != current_network:
+        if preview["wallet_network"] != current_network:
             return format_success_result(
                 {
                     "success": False,
@@ -2268,65 +2303,50 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Enforce minimum deposit of 0.5 USDC
-        preview_amount = Decimal(preview["amount"])
-        if preview_amount < Decimal("0.5"):
+        # Enforce minimum deposit of 0.5 USDC (defense in depth)
+        deposit_amount = Decimal(preview["deposit_amount"])
+        if deposit_amount < Decimal("0.5"):
             return format_success_result(
                 {
                     "success": False,
                     "error": "minimum_deposit_not_met",
                     "message": (
-                        f"Minimum Gateway deposit is 0.5 USDC. Requested: {preview['amount']}."
+                        f"Minimum Gateway deposit is 0.5 USDC. "
+                        f"Requested: {preview['deposit_amount']}."
                     ),
                 }
             )
 
-        # Resolve network through get_network()
+        # Resolve network through get_network() — fail closed
         try:
             from hermes_x402.networks import get_network
 
-            net = get_network(current_network)
-        except Exception:
-            pass
-
-        # Verify deposit method is valid for this network
-        deposit_method = preview.get("deposit_method", "direct")
-        if deposit_method == "direct":
-            # direct requires a verified Gateway-supported network
-            try:
-                from hermes_x402.networks import get_network
-
-                net = get_network(current_network)
-                if not net.gateway_supported:
-                    return format_success_result(
-                        {
-                            "success": False,
-                            "error": "unsupported_deposit_method",
-                            "message": f"Direct deposit not supported for {current_network}.",
-                        }
-                    )
-            except Exception:
-                pass
-        elif deposit_method == "eco":
-            # eco is allowed only for Base/Base Sepolia
-            allowed_eco = {"base", "baseSepolia", "BASE-SEPOLIA", "BASE"}
-            if current_network not in allowed_eco:
+            resolved_net = get_network(current_network)
+            if not resolved_net.gateway_supported:
                 return format_success_result(
                     {
                         "success": False,
-                        "error": "unsupported_deposit_method",
-                        "message": (
-                            f"Eco deposit only supported for Base networks. "
-                            f"Current network: {current_network}."
-                        ),
+                        "error": "gateway_not_supported",
+                        "message": f"Network {current_network} does not support Gateway deposits.",
                     }
                 )
-        else:
+        except Exception as exc:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "network_resolution_failed",
+                    "message": f"Could not resolve network: {exc}",
+                }
+            )
+
+        # Verify deposit method is direct only
+        deposit_method = preview.get("deposit_method", "direct")
+        if deposit_method != "direct":
             return format_success_result(
                 {
                     "success": False,
                     "error": "unsupported_deposit_method",
-                    "message": f"Unknown deposit method: {deposit_method}.",
+                    "message": f"Only 'direct' deposit is supported. Got: {deposit_method}.",
                 }
             )
 
@@ -2340,7 +2360,7 @@ def register_gateway_tools(ctx: Any) -> None:
                 if b.symbol == "USDC":
                     usdc_balance = b.amount
                     break
-            if Decimal(usdc_balance) < preview_amount:
+            if Decimal(usdc_balance) < deposit_amount:
                 return format_success_result(
                     {
                         "success": False,
@@ -2360,7 +2380,7 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Re-fetch challenge and recompute payment-option fingerprint
+        # Re-fetch challenge and compare service payment-option fingerprint
         from hermes_x402.buyer.supports import check_supports
 
         try:
@@ -2388,7 +2408,7 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Find the matching gateway option and compare fingerprint
+        # Find the matching gateway option with exact fingerprint
         fresh_gateway_option = None
         for opt in fresh_support.options:
             if opt.payment_system == "gateway_batching" and opt.supported_by_backend:
@@ -2404,58 +2424,32 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Recompute and compare payment-option fingerprint
-        new_fingerprint = hashlib.sha256(
+        # Recompute service payment-option fingerprint from fresh option
+        fresh_fingerprint = hashlib.sha256(
             json.dumps(
-                {"network": fresh_gateway_option.network_id, "domain": None},
+                {
+                    "scheme": fresh_gateway_option.scheme,
+                    "payment_system": fresh_gateway_option.payment_system,
+                    "network": fresh_gateway_option.network,
+                    "network_id": fresh_gateway_option.network_id,
+                    "amount_atomic": fresh_gateway_option.amount_atomic,
+                    "asset": fresh_gateway_option.asset,
+                    "pay_to": fresh_gateway_option.pay_to,
+                    "max_timeout_seconds": fresh_gateway_option.max_timeout_seconds,
+                },
                 sort_keys=True,
             ).encode()
         ).hexdigest()[:16]
 
-        if preview.get("payment_option_fingerprint") != new_fingerprint:
+        # Reject if service payment-option fingerprint changed
+        if preview.get("service_option_fingerprint") != fresh_fingerprint:
             return format_success_result(
                 {
                     "success": False,
                     "error": "payment_option_changed",
                     "message": (
-                        "Payment option changed since preview. "
-                        "Network, scheme, or amount may have changed. "
-                        "Create a new preview."
+                        "Service payment option changed since preview. Create a new preview."
                     ),
-                }
-            )
-
-        # Reject if key fields changed
-        if fresh_gateway_option.network_id != preview.get("gateway_destination_network"):
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "payment_option_changed",
-                    "message": "Gateway network changed since preview. Create a new preview.",
-                }
-            )
-        if fresh_gateway_option.asset != preview.get("gateway_asset"):
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "payment_option_changed",
-                    "message": "Payment asset changed since preview. Create a new preview.",
-                }
-            )
-        if fresh_gateway_option.pay_to != preview.get("gateway_pay_to"):
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "payment_option_changed",
-                    "message": "PayTo address changed since preview. Create a new preview.",
-                }
-            )
-        if fresh_gateway_option.amount_usdc != preview.get("amount"):
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "payment_option_changed",
-                    "message": "Payment amount changed since preview. Create a new preview.",
                 }
             )
 
@@ -2465,8 +2459,8 @@ def register_gateway_tools(ctx: Any) -> None:
         try:
             result = await runtime.cli_client.gateway_deposit(
                 wallet_address=preview["wallet"],
-                network=preview["network"],
-                amount=preview["amount"],
+                network=preview["wallet_network"],
+                amount=preview["deposit_amount"],
                 method=deposit_method,
             )
             output: dict[str, Any] = {

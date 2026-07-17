@@ -14,24 +14,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Tools that require native Hermes approval before execution
-_APPROVAL_REQUIRED_TOOLS = frozenset(
-    {
-        "x402_pay",
-        "x402_gateway_deposit_execute",
-        "x402_login_complete",
-    }
-)
-
-# Human-readable descriptions for approval prompts
-_APPROVAL_DESCRIPTIONS: dict[str, str] = {
-    "x402_pay": "Pay for an x402 resource (may transfer USDC)",
-    "x402_gateway_deposit_execute": "Execute Gateway deposit (may transfer USDC)",
-    "x402_login_complete": (
-        "Complete Circle login with OTP via chat (OTP exposed in conversation)"
-    ),
-}
-
 
 def register(ctx: Any) -> None:
     """Register x402 tools with the Hermes plugin context.
@@ -69,10 +51,29 @@ def register(ctx: Any) -> None:
     register_login_tools(ctx)
     register_gateway_tools(ctx)
 
-    # Register native approval hook (synchronous callback)
+    # Register native approval hook — fail closed if unavailable
     _register_approval_hook(ctx)
 
     logger.debug("hermes-x402 plugin: registered x402 tools and approval hook")
+
+
+# Tools that require native Hermes approval before execution
+_APPROVAL_REQUIRED_TOOLS = frozenset(
+    {
+        "x402_pay",
+        "x402_gateway_deposit_execute",
+        "x402_login_complete",
+    }
+)
+
+# Human-readable descriptions for approval prompts
+_APPROVAL_DESCRIPTIONS: dict[str, str] = {
+    "x402_pay": "Pay for an x402 resource (may transfer USDC)",
+    "x402_gateway_deposit_execute": "Execute Gateway deposit (may transfer USDC)",
+    "x402_login_complete": (
+        "Complete Circle login with OTP via chat (OTP exposed in conversation)"
+    ),
+}
 
 
 def _register_approval_hook(ctx: Any) -> None:
@@ -84,11 +85,9 @@ def _register_approval_hook(ctx: Any) -> None:
     Fails closed when the Hermes approval API is unavailable.
     """
     if not hasattr(ctx, "register_hook"):
-        logger.debug(
-            "hermes-x402: Hermes approval API unavailable — "
-            "pre_tool_call hook not registered. Approval bypassed."
+        raise RuntimeError(
+            "Hermes native approval API is required for hermes-x402. Plugin registration aborted."
         )
-        return
 
     def approval_hook(
         tool_name: str,
@@ -100,6 +99,7 @@ def _register_approval_hook(ctx: Any) -> None:
         """Synchronous pre_tool_call hook for native Hermes approval.
 
         Returns action=approve for financial tools, None for unaffected tools.
+        Blocks when tool_call_id is missing for financial operations.
         """
         if tool_name not in _APPROVAL_REQUIRED_TOOLS:
             return None
@@ -115,16 +115,15 @@ def _register_approval_hook(ctx: Any) -> None:
                 # Chat OTP is disabled — tool will return chat_otp_disabled error
                 return None
 
-        # Build unique identity from tool_call_id, then turn_id
-        unique_id = tool_call_id or turn_id
-        if not unique_id:
-            # No unique identity available — block execution
+        # Financial operations MUST require tool_call_id for unique identity.
+        # Do NOT fall back to turn_id — multiple calls may occur in one turn.
+        if not tool_call_id:
             return {
                 "action": "block",
-                "message": f"No unique identity for {tool_name} approval",
+                "message": "Unique tool-call identity is unavailable.",
             }
 
-        rule_key = f"hermes-x402:{tool_name}:{unique_id}"
+        rule_key = f"hermes-x402:{tool_name}:{tool_call_id}"
         description = _APPROVAL_DESCRIPTIONS.get(tool_name, f"Execute {tool_name}")
 
         return {
@@ -133,8 +132,6 @@ def _register_approval_hook(ctx: Any) -> None:
             "rule_key": rule_key,
         }
 
-    try:
-        ctx.register_hook("pre_tool_call", approval_hook)
-        logger.debug("hermes-x402: registered pre_tool_call approval hook")
-    except Exception as exc:
-        logger.warning("hermes-x402: failed to register approval hook: %s", exc)
+    # Register without try/except — let exceptions propagate
+    ctx.register_hook("pre_tool_call", approval_hook)
+    logger.debug("hermes-x402: registered pre_tool_call approval hook")

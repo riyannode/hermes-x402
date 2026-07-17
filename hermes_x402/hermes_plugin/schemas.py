@@ -240,6 +240,14 @@ X402_LOGIN_START_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": "Email address for Circle Agent Wallet login.",
             },
+            "mode": {
+                "type": "string",
+                "enum": ["manual_cli", "chat_otp"],
+                "description": (
+                    "Login mode. manual_cli (default): user runs CLI command. "
+                    "chat_otp: OTP sent through chat (requires X402_ALLOW_CHAT_OTP=true)."
+                ),
+            },
         },
         "required": ["email"],
     },
@@ -315,6 +323,9 @@ X402_GATEWAY_DEPOSIT_PREVIEW_SCHEMA: dict[str, Any] = {
             "amount": {
                 "type": "string",
                 "description": "USDC amount to preview depositing.",
+            },
+            "body": {
+                "description": "Request body (for POST/PUT/PATCH).",
             },
         },
         "required": ["service_url", "method", "amount"],

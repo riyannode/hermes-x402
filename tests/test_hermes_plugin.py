@@ -38,6 +38,7 @@ class FakeHermesContext:
 
     def __init__(self):
         self.tools: list[dict[str, Any]] = []
+        self.hooks: list[dict[str, Any]] = []
 
     def register_tool(
         self,
@@ -62,6 +63,10 @@ class FakeHermesContext:
                 "description": description,
             }
         )
+
+    def register_hook(self, hook_type: str, handler: Any) -> None:
+        """Register a hook with the plugin context."""
+        self.hooks.append({"hook_type": hook_type, "handler": handler})
 
 
 @pytest.fixture
