@@ -22,14 +22,20 @@ def register(ctx: Any) -> None:
     registers related tools under the ``x402`` toolset.
     """
     from hermes_x402.hermes_plugin.tools import (
+        register_discovery_tools,
+        register_network_tools,
         register_payment_tools,
         register_service_tools,
         register_status_tools,
+        register_supports_tools,
         register_wallet_tools,
     )
 
     register_status_tools(ctx)
     register_wallet_tools(ctx)
+    register_network_tools(ctx)
+    register_discovery_tools(ctx)
+    register_supports_tools(ctx)
     register_service_tools(ctx)
     register_payment_tools(ctx)
 

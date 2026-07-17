@@ -16,6 +16,7 @@ from hermes_x402.circle_cli.errors import (
     CircleCliPaymentOutcomeUnknownError,
     CircleCliUnsupportedNetworkError,
 )
+from hermes_x402.networks import NetworkNotFoundError, get_network
 
 
 @dataclass
@@ -31,6 +32,7 @@ class CircleCliBuyerBackend:
     client: CircleCliClient
     _ready: bool = field(default=False, init=False, repr=False)
     _x402_network: str | None = field(default=None, init=False, repr=False)
+    _canonical_caip2: str | None = field(default=None, init=False, repr=False)
     _active_fingerprints: set[str] = field(default_factory=set, init=False, repr=False)
 
     @property
@@ -52,13 +54,32 @@ class CircleCliBuyerBackend:
             return
         await self.client.version()
         supported = await self.client.supported_networks()
-        if self.network.lower() not in {network.lower() for network in supported}:
+        # Normalize the configured network through the registry to obtain
+        # the CLI chain code (e.g. "arcTestnet" → "ARC-TESTNET").  The CLI
+        # blockchain list uses uppercase hyphenated names, not registry keys.
+        cli_chain: str = self.network
+        try:
+            nc = get_network(self.network)
+            self._canonical_caip2 = nc.caip2
+            if nc.cli_chain:
+                cli_chain = nc.cli_chain
+        except (NetworkNotFoundError, Exception):
+            # Fallback: treat the raw network string as both the CLI chain
+            # code and the canonical CAIP-2 (will be resolved below).
+            self._canonical_caip2 = None
+        # Check CLI support using the resolved CLI chain code.
+        if cli_chain.lower() not in {n.lower() for n in supported}:
             raise CircleCliUnsupportedNetworkError(
-                f"Configured Circle CLI network {self.network!r} is not supported by this CLI"
+                f"Configured Circle CLI network {self.network!r} "
+                f"(resolved to {cli_chain!r}) is not supported by this CLI"
             )
-        self._x402_network = await self.client.network_x402_identifier(self.network)
+        self._x402_network = await self.client.network_x402_identifier(cli_chain)
+        # Ensure canonical CAIP-2 is set from the CLI identifier if the
+        # registry resolution did not provide one.
+        if self._canonical_caip2 is None:
+            self._canonical_caip2 = self._x402_network
         await self.client.verify_selected_wallet(
-            wallet_address=self.wallet_address_value, network=self.network
+            wallet_address=self.wallet_address_value, network=cli_chain
         )
         self._ready = True
 
@@ -145,6 +166,8 @@ class CircleCliBuyerBackend:
     def _reported_usdc_atomic(amount: str) -> int:
         try:
             decimal, unit = amount.strip().split()
+            # Strip $ prefix (CLI 0.0.6+ returns "$0.000003 USDC")
+            decimal = decimal.lstrip("$")
             value = Decimal(decimal)
             exponent = value.as_tuple().exponent
             if (
@@ -211,10 +234,15 @@ class CircleCliBuyerBackend:
             raise
         reported_atomic = self._reported_usdc_atomic(paid.amount)
         cap_atomic = int(Decimal(max_usdc) * Decimal(1_000_000)) if max_usdc else None
+        # CLI 0.0.6+ may report the payment mechanism name ("GatewayWalletBatched")
+        # as the scheme instead of the x402 scheme ("exact").  Normalize for
+        # comparison — the actual x402 scheme is always "exact".
+        _CLI_SCHEME_NORMALIZE = {"GatewayWalletBatched": "exact"}
+        cli_scheme = _CLI_SCHEME_NORMALIZE.get(paid.scheme, paid.scheme)
         if (
             paid.seller.lower() != selected["payTo"].lower()
-            or paid.chain.lower() != self.network.lower()
-            or paid.scheme != selected["scheme"]
+            or paid.chain.lower() != (self._canonical_caip2 or "").lower()
+            or cli_scheme != selected["scheme"]
             or reported_atomic != selected_atomic
             or (cap_atomic is not None and reported_atomic > cap_atomic)
         ):

@@ -197,29 +197,54 @@ class X402SellerMiddleware:
         # Format: {"payload": {"authorization": {...}, "signature": "..."}, "resource": ..., "accepted": ...}
         inner_payload = decoded.get("payload", {})
         authorization = inner_payload.get("authorization", {})
-
         # Fallback: check flat format (backward compat)
         if not authorization:
             authorization = decoded.get("authorization", {})
-
-        payer = authorization.get("from", "")
-        value = str(authorization.get("value", "0"))
-        network = decoded.get("accepted", {}).get(
-            "network", decoded.get("network", self._chain_config["network"])
-        )
-
-        # Validate network
-        if network not in self._accepted_chains:
+        if not authorization:
+            logger.warning("Missing authorization in payment payload")
             amount = self._price_to_amount(price)
             request["x402_402"] = self._build_402_response(amount, path)
             return None
 
-        # Build requirements
-        requirements = self._build_requirements(value, network)
+        payer = authorization.get("from", "")
+        client_value = str(authorization.get("value", "0"))
+        network = decoded.get("accepted", {}).get(
+            "network", decoded.get("network", self._chain_config["network"])
+        )
+
+        # Validate network is CAIP-2 and accepted by this seller
+        if network not in self._accepted_chains:
+            logger.warning("Network %s not accepted by this seller", network)
+            amount = self._price_to_amount(price)
+            request["x402_402"] = self._build_402_response(amount, path)
+            return None
+
+        # Compute SERVER amount from price — never trust client value for settlement
+        server_amount = self._price_to_amount(price)
+
+        # Validate client value matches server-computed amount
+        try:
+            client_atomic = int(client_value)
+            server_atomic = int(server_amount)
+        except (ValueError, TypeError):
+            logger.warning("Malformed authorization value: %s", client_value)
+            amount = self._price_to_amount(price)
+            request["x402_402"] = self._build_402_response(amount, path)
+            return None
+
+        if client_atomic != server_atomic:
+            logger.warning(
+                "Underpayment rejected: client=%s server=%s", client_value, server_amount
+            )
+            amount = self._price_to_amount(price)
+            request["x402_402"] = self._build_402_response(amount, path)
+            return None
+
+        # Build requirements from SERVER-computed amount
+        requirements = self._build_requirements(server_amount, network)
 
         # Settle directly (skip verify) — pass the full decoded payload
         # Circle Gateway expects: {"paymentPayload": {...}, "paymentRequirements": {...}}
-        # The paymentPayload should contain the nested authorization+signature structure
         try:
             settle_result = await self._settle(decoded, requirements)
         except Exception as e:
@@ -235,11 +260,11 @@ class X402SellerMiddleware:
             request["x402_402"] = self._build_402_response(amount, path)
             return None
 
-        # Payment succeeded
+        # Payment succeeded — use server-computed amount in result
         transaction = settle_result.get("transaction", "")
         result = PaymentResult(
             payer=payer,
-            amount=value,
+            amount=server_amount,
             network=network,
             transaction=transaction,
         )
@@ -248,12 +273,12 @@ class X402SellerMiddleware:
         request["x402_payment"] = result
         set_payment_context(
             payer=payer,
-            amount=value,
+            amount=server_amount,
             network=network,
             transaction=transaction,
         )
 
-        logger.info("Payment settled: %s USDC by %s tx=%s", value, payer, transaction)
+        logger.info("Payment settled: %s USDC by %s tx=%s", server_amount, payer, transaction)
         return result
 
     @staticmethod

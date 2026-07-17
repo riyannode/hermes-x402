@@ -90,7 +90,7 @@ class FakeRunner:
                     "response": {"premium": True},
                     "payment": {
                         "amount": "0.01 USDC",
-                        "chain": "BASE",
+                        "chain": "eip155:8453",
                         "scheme": "exact",
                         "seller": SELLER,
                         "receipt": "payment-receipt",
@@ -319,7 +319,7 @@ class TestCircleCliClientAndBackend:
                     "response": {"premium": True},
                     "payment": {
                         "amount": "0.02 USDC",
-                        "chain": "BASE",
+                        "chain": "eip155:8453",
                         "scheme": "exact",
                         "seller": SELLER,
                     },
@@ -447,20 +447,25 @@ class TestCircleCliClientAndBackend:
             {
                 "payment": {
                     "amount": "0.01 USDC",
-                    "chain": "BASE",
+                    "chain": "eip155:8453",
                     "scheme": "exact",
                     "seller": SELLER,
                 }
             },
             {
                 "response": {},
-                "payment": {"amount": 1, "chain": "BASE", "scheme": "exact", "seller": SELLER},
+                "payment": {
+                    "amount": 1,
+                    "chain": "eip155:8453",
+                    "scheme": "exact",
+                    "seller": SELLER,
+                },
             },
             {
                 "response": {},
                 "payment": {
                     "amount": "0.01 USDC",
-                    "chain": "BASE",
+                    "chain": "eip155:8453",
                     "scheme": "exact",
                     "seller": SELLER,
                     "receipt": 1,
@@ -568,3 +573,207 @@ class TestCliConfigAndAgent:
             kwargs["seller_address"] = SELLER
         with pytest.raises(BuyerConfigurationError):
             X402Config(**kwargs).validate()
+
+
+# ---------------------------------------------------------------------------
+# Chain-identity comparison: ARC-TESTNET vs eip155:5042002
+# ---------------------------------------------------------------------------
+
+
+class TestChainIdentityComparison:
+    """Verify that configured ARC-TESTNET and reported eip155:5042002 compare
+    as the same network via the centralized registry CAIP-2 resolution."""
+
+    @staticmethod
+    def _arc_testnet_runner(
+        *, pay_chain: str = "eip155:5042002", pay_scheme: str = "exact"
+    ) -> FakeRunner:
+        """Return a FakeRunner whose blockchain list includes ARC-TESTNET."""
+        runner = FakeRunner.__new__(FakeRunner)
+        runner.read_timeout_seconds = 1
+        runner.payment_timeout_seconds = 1
+        runner.calls = []
+        runner.pay_result = result(
+            ("services", "pay"),
+            {
+                "response": {"ok": True},
+                "payment": {
+                    "amount": "$0.000003 USDC",
+                    "chain": pay_chain,
+                    "scheme": pay_scheme,
+                    "seller": SELLER,
+                },
+            },
+        )
+        # Override run_json to include ARC-TESTNET in blockchain list
+        _original_run_json = FakeRunner.run_json
+
+        async def _run_json(self_inner, args, **kw):
+            args = tuple(args)
+            self_inner.calls.append(args)
+            if args[:2] == ("blockchain", "list"):
+                return result(
+                    args,
+                    {
+                        "blockchains": [
+                            {
+                                "blockchain": "ARC-TESTNET",
+                                "name": "Arc Testnet",
+                                "evmChainId": 5042002,
+                            }
+                        ]
+                    },
+                )
+            # Delegate other commands to the original
+            return await _original_run_json(self_inner, args, **kw)
+
+        runner.run_json = lambda args, **kw: _run_json(runner, args, **kw)
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_arc_testnet_configured_reported_caip2_accepted(self):
+        """Configured ARC-TESTNET + reported eip155:5042002 → accepted."""
+        runner = self._arc_testnet_runner()
+        backend = CircleCliBuyerBackend(ADDRESS, "ARC-TESTNET", CircleCliClient(runner))
+        challenge = {
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:5042002",
+                    "amount": "3",
+                    "asset": "0x3600000000000000000000000000000000000000",
+                    "payTo": SELLER,
+                }
+            ],
+        }
+        result_obj = await backend.pay_and_fetch(
+            url="https://paylabs.vercel.app/api/paylabs/brain/run",
+            method="POST",
+            body=None,
+            headers={},
+            payment_required=challenge,
+            max_usdc="0.01",
+        )
+        assert result_obj.payment_status == "resource_succeeded"
+
+    @pytest.mark.asyncio
+    async def test_arc_alias_configured_reported_caip2_accepted(self):
+        """Configured Arc alias + reported eip155:5042002 → accepted."""
+        runner = self._arc_testnet_runner()
+        # Use lowercase alias that the registry resolves to arcTestnet
+        backend = CircleCliBuyerBackend(ADDRESS, "arcTestnet", CircleCliClient(runner))
+        challenge = {
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:5042002",
+                    "amount": "3",
+                    "asset": "0x3600000000000000000000000000000000000000",
+                    "payTo": SELLER,
+                }
+            ],
+        }
+        result_obj = await backend.pay_and_fetch(
+            url="https://paylabs.vercel.app/api/paylabs/brain/run",
+            method="POST",
+            body=None,
+            headers={},
+            payment_required=challenge,
+            max_usdc="0.01",
+        )
+        assert result_obj.payment_status == "resource_succeeded"
+
+    @pytest.mark.asyncio
+    async def test_base_configured_reported_arc_rejected(self):
+        """Configured Base + reported Arc Testnet → rejected."""
+        runner = FakeRunner(
+            pay_result=result(
+                ("services", "pay"),
+                {
+                    "response": {"ok": True},
+                    "payment": {
+                        "amount": "0.01 USDC",
+                        "chain": "eip155:5042002",  # Arc Testnet CAIP-2
+                        "scheme": "exact",
+                        "seller": SELLER,
+                    },
+                },
+            )
+        )
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        challenge = {
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:8453",
+                    "amount": "10000",
+                    "asset": "0x3",
+                    "payTo": SELLER,
+                }
+            ],
+        }
+        from hermes_x402.buyer.errors import PaymentSubmissionUnknownError
+
+        with pytest.raises(PaymentSubmissionUnknownError, match="does not match"):
+            await backend.pay_and_fetch(
+                url="https://allowed.example/premium",
+                method="GET",
+                body=None,
+                headers={},
+                payment_required=challenge,
+                max_usdc="1.00",
+            )
+
+    @pytest.mark.asyncio
+    async def test_unknown_reported_network_rejected(self):
+        """Unknown reported network → rejected."""
+        runner = FakeRunner(
+            pay_result=result(
+                ("services", "pay"),
+                {
+                    "response": {"ok": True},
+                    "payment": {
+                        "amount": "0.01 USDC",
+                        "chain": "eip155:9999999",  # Unknown chain ID
+                        "scheme": "exact",
+                        "seller": SELLER,
+                    },
+                },
+            )
+        )
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        challenge = {
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:8453",
+                    "amount": "10000",
+                    "asset": "0x3",
+                    "payTo": SELLER,
+                }
+            ],
+        }
+        from hermes_x402.buyer.errors import PaymentSubmissionUnknownError
+
+        with pytest.raises(PaymentSubmissionUnknownError, match="does not match"):
+            await backend.pay_and_fetch(
+                url="https://allowed.example/premium",
+                method="GET",
+                body=None,
+                headers={},
+                payment_required=challenge,
+                max_usdc="1.00",
+            )
+
+    @pytest.mark.asyncio
+    async def test_canonical_caip2_resolved_during_ensure_ready(self):
+        """_ensure_ready() resolves canonical CAIP-2 through the registry."""
+        runner = self._arc_testnet_runner()
+        backend = CircleCliBuyerBackend(ADDRESS, "ARC-TESTNET", CircleCliClient(runner))
+        await backend._ensure_ready()
+        assert backend._canonical_caip2 == "eip155:5042002"
+        assert backend._x402_network == "eip155:5042002"
