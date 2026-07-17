@@ -372,6 +372,71 @@ class TestWalletNetworkMatching:
         )
         assert result is False
 
+    # --- Arc CLI wallet-network matching ---
+
+    def test_cli_arc_testnet_matches_arc_testnet(self):
+        """CLI ARC-TESTNET wallet + eip155:5042002 → supported."""
+        result = _detect_backend_support(
+            "arcTestnet",
+            configured_backend="cli",
+            wallet_network="arcTestnet",
+        )
+        assert result is True
+
+    def test_cli_arc_testnet_matches_arc_testnet_alias(self):
+        """CLI ARC-TESTNET wallet + arcTestnet alias → supported after normalization."""
+        result = _detect_backend_support(
+            "arcTestnet",
+            configured_backend="cli",
+            wallet_network="ARC-TESTNET",
+        )
+        assert result is True
+
+    def test_cli_arc_testnet_rejects_base(self):
+        """CLI ARC-TESTNET wallet + Base challenge → unsupported."""
+        result = _detect_backend_support(
+            "base",
+            configured_backend="cli",
+            wallet_network="arcTestnet",
+        )
+        assert result is False
+
+    def test_cli_arc_testnet_rejects_polygon(self):
+        """CLI ARC-TESTNET wallet + Polygon challenge → unsupported."""
+        result = _detect_backend_support(
+            "polygon",
+            configured_backend="cli",
+            wallet_network="arcTestnet",
+        )
+        assert result is False
+
+    def test_cli_base_rejects_arc_testnet(self):
+        """CLI BASE wallet + Arc Testnet challenge → unsupported."""
+        result = _detect_backend_support(
+            "arcTestnet",
+            configured_backend="cli",
+            wallet_network="base",
+        )
+        assert result is False
+
+    def test_cli_polygon_rejects_arc_testnet(self):
+        """CLI Polygon wallet + Arc Testnet challenge → unsupported."""
+        result = _detect_backend_support(
+            "arcTestnet",
+            configured_backend="cli",
+            wallet_network="polygon",
+        )
+        assert result is False
+
+    def test_dcw_arc_testnet_rejects_ethereum(self):
+        """DCW Arc Testnet wallet + Ethereum challenge → unsupported."""
+        result = _detect_backend_support(
+            "ethereum",
+            configured_backend="dcw",
+            wallet_network="arcTestnet",
+        )
+        assert result is False
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Finding 7: DCW capability matrix
@@ -557,10 +622,10 @@ class TestDailyBudgetClaim:
 class TestCapabilityOutput:
     """buyer_backend_supported must not leak through seller flag."""
 
-    def test_arc_testnet_cli_not_supported(self):
-        """arcTestnet buyer_cli_supported must be False."""
+    def test_arc_testnet_cli_supported(self):
+        """arcTestnet buyer_cli_supported verified by live payment 2026-07-17."""
         net = get_network("arcTestnet")
-        assert net.buyer_cli_supported is False
+        assert net.buyer_cli_supported is True
 
     def test_arc_testnet_dcw_supported(self):
         """arcTestnet buyer_dcw_supported must be True."""

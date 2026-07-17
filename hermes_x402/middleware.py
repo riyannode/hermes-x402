@@ -204,12 +204,37 @@ class X402SellerMiddleware:
 
         payer = authorization.get("from", "")
         value = str(authorization.get("value", "0"))
+        auth_asset = authorization.get("asset", "")
+        auth_pay_to = authorization.get("payTo", "")
         network = decoded.get("accepted", {}).get(
             "network", decoded.get("network", self._chain_config["network"])
         )
 
         # Validate network
         if network not in self._accepted_chains:
+            amount = self._price_to_amount(price)
+            request["x402_402"] = self._build_402_response(amount, path)
+            return None
+
+        # Validate asset — reject before facilitator if missing or wrong
+        expected_asset = self._chain_config["usdc"]
+        if not auth_asset or auth_asset.lower() != expected_asset.lower():
+            logger.warning(
+                "Payment asset mismatch: got %r, expected %r",
+                auth_asset,
+                expected_asset,
+            )
+            amount = self._price_to_amount(price)
+            request["x402_402"] = self._build_402_response(amount, path)
+            return None
+
+        # Validate payTo — reject before facilitator if missing or wrong
+        if not auth_pay_to or auth_pay_to.lower() != self.seller_address.lower():
+            logger.warning(
+                "Payment payTo mismatch: got %r, expected %r",
+                auth_pay_to,
+                self.seller_address,
+            )
             amount = self._price_to_amount(price)
             request["x402_402"] = self._build_402_response(amount, path)
             return None

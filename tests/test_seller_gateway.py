@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from decimal import Decimal
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from hermes_x402.networks import get_network
 from hermes_x402.seller_gateway import (
     X402Gateway,
     _parse_price,
@@ -310,3 +314,97 @@ class TestSettleRequirements:
         gateway = _make_gateway()
         with pytest.raises(ValueError, match="not in accepted networks"):
             gateway._build_settle_requirements("10000", "nonexistent", gateway._networks)
+
+
+# ---------------------------------------------------------------------------
+# Seller authorization hardening — asset/payTo validation
+# ---------------------------------------------------------------------------
+
+
+class TestSellerAuthValidation:
+    """Missing or wrong asset/payTo must be rejected before facilitator."""
+
+    def _make_auth_header(self, *, asset: str = "", pay_to: str = "", **overrides):
+        """Build a base64 payment header with specified authorization fields."""
+        auth = {
+            "from": overrides.get("from", "0x" + "cd" * 20),
+            "value": overrides.get("value", "1000"),
+        }
+        if asset:
+            auth["asset"] = asset
+        if pay_to:
+            auth["payTo"] = pay_to
+        payload = {"payload": {"authorization": auth, "signature": "sig"}}
+        return base64.b64encode(json.dumps(payload).encode()).decode()
+
+    @pytest.mark.asyncio
+    async def test_missing_asset_rejected_before_facilitator(self):
+        """Authorization without asset → 402, facilitator not called."""
+        gw = _make_gateway()
+        seller_addr = "0x" + "ab" * 20
+        gw._seller_address = seller_addr
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {"Payment-Signature": self._make_auth_header(pay_to=seller_addr)}
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            resp = await gw._handle_request(mock_request, AsyncMock(), "$0.01", None, None, "desc")
+            mock_settle.assert_not_called()
+            assert resp.status == 402
+
+    @pytest.mark.asyncio
+    async def test_wrong_asset_rejected_before_facilitator(self):
+        """Authorization with wrong asset → 402, facilitator not called."""
+        gw = _make_gateway()
+        seller_addr = "0x" + "ab" * 20
+        gw._seller_address = seller_addr
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {
+            "Payment-Signature": self._make_auth_header(asset="0x" + "ff" * 20, pay_to=seller_addr)
+        }
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            resp = await gw._handle_request(mock_request, AsyncMock(), "$0.01", None, None, "desc")
+            mock_settle.assert_not_called()
+            assert resp.status == 402
+
+    @pytest.mark.asyncio
+    async def test_missing_pay_to_rejected_before_facilitator(self):
+        """Authorization without payTo → 402, facilitator not called."""
+        gw = _make_gateway()
+        net = get_network("base")
+        expected_asset = net.usdc_address
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {"Payment-Signature": self._make_auth_header(asset=expected_asset)}
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            resp = await gw._handle_request(mock_request, AsyncMock(), "$0.01", None, None, "desc")
+            mock_settle.assert_not_called()
+            assert resp.status == 402
+
+    @pytest.mark.asyncio
+    async def test_wrong_pay_to_rejected_before_facilitator(self):
+        """Authorization with wrong payTo → 402, facilitator not called."""
+        gw = _make_gateway()
+        seller_addr = "0x" + "ab" * 20
+        gw._seller_address = seller_addr
+        net = get_network("base")
+        expected_asset = net.usdc_address
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {
+            "Payment-Signature": self._make_auth_header(
+                asset=expected_asset, pay_to="0x" + "ff" * 20
+            )
+        }
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            resp = await gw._handle_request(mock_request, AsyncMock(), "$0.01", None, None, "desc")
+            mock_settle.assert_not_called()
+            assert resp.status == 402

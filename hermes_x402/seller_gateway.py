@@ -442,9 +442,11 @@ class X402Gateway:
             )
 
         # Validate asset matches expected USDC contract
-        if auth_asset and auth_asset.lower() != network_config.usdc_address.lower():
+        if not auth_asset or auth_asset.lower() != network_config.usdc_address.lower():
             logger.warning(
-                "Wrong asset: got %s expected %s", auth_asset, network_config.usdc_address
+                "Payment asset mismatch: got %r, expected %r",
+                auth_asset,
+                network_config.usdc_address,
             )
             body = self._build_402_body(
                 amount, request.path, description, route_networks, route_accepts
@@ -457,8 +459,12 @@ class X402Gateway:
             )
 
         # Validate payTo matches configured seller address
-        if auth_pay_to and auth_pay_to.lower() != self._seller_address.lower():
-            logger.warning("Wrong payTo: got %s expected %s", auth_pay_to, self._seller_address)
+        if not auth_pay_to or auth_pay_to.lower() != self._seller_address.lower():
+            logger.warning(
+                "Payment payTo mismatch: got %r, expected %r",
+                auth_pay_to,
+                self._seller_address,
+            )
             body = self._build_402_body(
                 amount, request.path, description, route_networks, route_accepts
             )
