@@ -29,8 +29,8 @@ _APPROVAL_REQUIRED_TOOLS = frozenset(
 # Maximum displayed URL length in approval messages
 _MAX_DISPLAY_URL_LENGTH = 120
 
-# Control characters pattern for stripping
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+# Control characters: all ASCII control chars including CR/LF
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def register(ctx: Any) -> None:
@@ -112,6 +112,25 @@ def _register_approval_hook(ctx: Any) -> None:
                 "message": "Unique tool-call identity is unavailable.",
             }
 
+        # Gateway deposit execute: block if preview is invalid
+        if tool_name == "x402_gateway_deposit_execute":
+            preview_id = args.get("preview_id", "")
+            if not isinstance(preview_id, str) or not preview_id.strip():
+                return {
+                    "action": "block",
+                    "message": "Gateway preview ID is required.",
+                }
+            from hermes_x402.hermes_plugin.gateway_state import (
+                get_gateway_preview_approval_summary,
+            )
+
+            summary = get_gateway_preview_approval_summary(preview_id.strip())
+            if summary is None:
+                return {
+                    "action": "block",
+                    "message": ("Gateway preview is missing, expired, or already consumed."),
+                }
+
         rule_key = f"hermes-x402:{tool_name}:{tool_call_id}"
 
         # Build informative sanitized approval messages
@@ -128,29 +147,42 @@ def _register_approval_hook(ctx: Any) -> None:
     logger.debug("hermes-x402: registered pre_tool_call approval hook")
 
 
-def _sanitize_url_for_display(raw_url: str) -> str:
+def _sanitize_url_for_display(raw_url: Any) -> str:
     """Sanitize URL for approval display.
 
-    - removes userinfo (username:password)
+    - requires raw_url to be a string
+    - strips all ASCII control characters
+    - rebuilds netloc from hostname and port (never uses parsed.netloc)
+    - removes userinfo
+    - removes query
     - removes fragment
-    - redacts query string
-    - strips control characters
+    - returns "[invalid URL]" on malformed input
     - limits displayed length
     """
+    if not isinstance(raw_url, str):
+        return "[invalid URL]"
+
     # Strip control characters
     cleaned = _CONTROL_CHARS.sub("", raw_url)
 
     try:
         parsed = urlparse(cleaned)
     except Exception:
-        # If URL parsing fails, return truncated cleaned version
-        return cleaned[:_MAX_DISPLAY_URL_LENGTH]
+        return "[invalid URL]"
+
+    # Rebuild netloc from hostname and port — never use parsed.netloc
+    # which may retain userinfo
+    hostname = parsed.hostname
+    if not hostname:
+        return "[invalid URL]"
+
+    netloc = f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
 
     # Rebuild without userinfo, fragment, or query
     sanitized = urlunparse(
         (
             parsed.scheme,
-            parsed.netloc,
+            netloc,
             parsed.path,
             "",  # params
             "",  # query — redacted

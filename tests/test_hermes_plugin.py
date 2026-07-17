@@ -1303,7 +1303,24 @@ class TestApprovalHookUnitTests:
 
     def test_gateway_execute_approval_message(self):
         """Gateway deposit execute gets informative approval message."""
+        import time
+
         from hermes_x402.hermes_plugin.entry import register
+        from hermes_x402.hermes_plugin.gateway_state import store_preview
+
+        # Store a valid preview for the test
+        store_preview(
+            "abc123",
+            {
+                "service_url": "https://api.example.com/pay",
+                "deposit_amount": "2.5",
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
+                "wallet_network": "ARC-TESTNET",
+                "deposit_method": "direct",
+                "expires_at": time.time() + 300,
+                "consumed": False,
+            },
+        )
 
         ctx = FakeHermesContext()
         register(ctx)
@@ -1317,4 +1334,272 @@ class TestApprovalHookUnitTests:
         )
         assert result is not None
         assert result["action"] == "approve"
-        assert "abc123" in result["message"]
+        assert "2.5" in result["message"]
+        assert "example.com" in result["message"]
+        assert "ARC-TESTNET" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Focused regression tests — preview blocking, URL sanitization, atomicity
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewBlocking:
+    """Tests that invalid Gateway previews are blocked in the approval hook."""
+
+    def test_missing_preview_returns_block(self):
+        """Missing preview returns action=block."""
+        from hermes_x402.hermes_plugin.entry import register
+
+        ctx = FakeHermesContext()
+        register(ctx)
+        hook_fn = ctx.hooks[0]["handler"]
+
+        result = hook_fn(
+            "x402_gateway_deposit_execute",
+            {"preview_id": "nonexistent_id"},
+            tool_call_id="call_1",
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "missing" in result["message"].lower() or "expired" in result["message"].lower()
+
+    def test_expired_preview_returns_block(self):
+        """Expired preview returns action=block."""
+        # Store a preview that is already expired
+        import time
+
+        from hermes_x402.hermes_plugin.entry import register
+        from hermes_x402.hermes_plugin.gateway_state import store_preview
+
+        store_preview(
+            "expired_123",
+            {
+                "service_url": "https://example.com",
+                "deposit_amount": "1.0",
+                "wallet": "0x1234567890abcdef",
+                "wallet_network": "ARC-TESTNET",
+                "deposit_method": "direct",
+                "expires_at": time.time() - 10,  # Already expired
+                "consumed": False,
+            },
+        )
+
+        ctx = FakeHermesContext()
+        register(ctx)
+        hook_fn = ctx.hooks[0]["handler"]
+
+        result = hook_fn(
+            "x402_gateway_deposit_execute",
+            {"preview_id": "expired_123"},
+            tool_call_id="call_2",
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_consumed_preview_returns_block(self):
+        """Consumed preview returns action=block."""
+        import time
+
+        from hermes_x402.hermes_plugin.entry import register
+        from hermes_x402.hermes_plugin.gateway_state import store_preview
+
+        store_preview(
+            "consumed_123",
+            {
+                "service_url": "https://example.com",
+                "deposit_amount": "1.0",
+                "wallet": "0x1234567890abcdef",
+                "wallet_network": "ARC-TESTNET",
+                "deposit_method": "direct",
+                "expires_at": time.time() + 300,
+                "consumed": True,  # Already consumed
+            },
+        )
+
+        ctx = FakeHermesContext()
+        register(ctx)
+        hook_fn = ctx.hooks[0]["handler"]
+
+        result = hook_fn(
+            "x402_gateway_deposit_execute",
+            {"preview_id": "consumed_123"},
+            tool_call_id="call_3",
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+
+class TestUrlSanitization:
+    """Tests that URL sanitization strips sensitive components."""
+
+    def test_userinfo_not_in_approval_url(self):
+        """Userinfo (username:password) does not appear in approval URL."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display("https://user:password@example.com/api?token=secret")
+        assert "user" not in result.lower()
+        assert "password" not in result.lower()
+        assert "token" not in result.lower()
+        assert "secret" not in result.lower()
+        assert "example.com" in result
+
+    def test_query_not_in_approval_url(self):
+        """Query string does not appear in approval URL."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display("https://example.com/api?token=secret&key=value")
+        assert "?" not in result
+        assert "token" not in result
+        assert "key" not in result
+
+    def test_fragment_not_in_approval_url(self):
+        """Fragment does not appear in approval URL."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display("https://example.com/api#section")
+        assert "#" not in result
+        assert "section" not in result
+
+    def test_control_characters_stripped(self):
+        """CR/LF/control characters do not appear in approval URL."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display("https://example.com/api\r\ninjection")
+        assert "\r" not in result
+        assert "\n" not in result
+        assert "\x00" not in result
+
+    def test_malformed_url_returns_invalid(self):
+        """Malformed URL returns [invalid URL]."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display("not a url at all")
+        assert result == "[invalid URL]"
+
+    def test_non_string_url_returns_invalid(self):
+        """Non-string URL returns [invalid URL]."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display(123)
+        assert result == "[invalid URL]"
+
+
+class TestPreviewAtomicity:
+    """Tests that concurrent preview claims are atomic."""
+
+    def test_concurrent_claims_one_succeeds(self):
+        """Two concurrent claims produce exactly one successful claim."""
+        import threading
+        import time
+
+        from hermes_x402.hermes_plugin.gateway_state import (
+            claim_preview_for_execution,
+            store_preview,
+        )
+
+        store_preview(
+            "atomic_test",
+            {
+                "service_url": "https://example.com",
+                "deposit_amount": "1.0",
+                "wallet": "0x1234567890abcdef",
+                "wallet_network": "ARC-TESTNET",
+                "deposit_method": "direct",
+                "expires_at": time.time() + 300,
+                "consumed": False,
+            },
+        )
+
+        results = []
+
+        def claim():
+            r = claim_preview_for_execution("atomic_test")
+            results.append(r is not None)
+
+        t1 = threading.Thread(target=claim)
+        t2 = threading.Thread(target=claim)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Exactly one should succeed
+        assert results.count(True) == 1
+        assert results.count(False) == 1
+
+
+class TestPreviewStoreBounds:
+    """Tests that the preview store remains bounded."""
+
+    def test_purge_expired_on_store(self):
+        """Expired previews are purged during store."""
+        import time
+
+        from hermes_x402.hermes_plugin.gateway_state import (
+            _lock,
+            _previews,
+            store_preview,
+        )
+
+        # Store an expired preview
+        with _lock:
+            _previews["old_expired"] = {
+                "expires_at": time.time() - 100,
+                "consumed": False,
+            }
+
+        # Store a new valid preview — should purge expired
+        store_preview(
+            "new_valid",
+            {
+                "service_url": "https://example.com",
+                "deposit_amount": "1.0",
+                "wallet": "0x1234567890abcdef",
+                "wallet_network": "ARC-TESTNET",
+                "deposit_method": "direct",
+                "expires_at": time.time() + 300,
+                "consumed": False,
+            },
+        )
+
+        with _lock:
+            assert "old_expired" not in _previews
+            assert "new_valid" in _previews
+
+    def test_store_rejects_when_full(self):
+        """Store rejects new preview when at capacity."""
+        import time
+
+        from hermes_x402.hermes_plugin.gateway_state import (
+            _MAX_ACTIVE_PREVIEWS,
+            _lock,
+            _previews,
+            store_preview,
+        )
+
+        # Fill the store
+        with _lock:
+            for i in range(_MAX_ACTIVE_PREVIEWS):
+                _previews[f"fill_{i}"] = {
+                    "expires_at": time.time() + 300,
+                    "consumed": False,
+                }
+
+        # Try to store one more — should raise
+        try:
+            store_preview(
+                "overflow",
+                {
+                    "service_url": "https://example.com",
+                    "deposit_amount": "1.0",
+                    "wallet": "0x1234567890abcdef",
+                    "wallet_network": "ARC-TESTNET",
+                    "deposit_method": "direct",
+                    "expires_at": time.time() + 300,
+                    "consumed": False,
+                },
+            )
+            raise AssertionError("Expected RuntimeError for full store")
+        except RuntimeError:
+            pass

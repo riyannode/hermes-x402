@@ -657,7 +657,7 @@ class TestGatewayDepositExecute:
 
         data = json.loads(result)
         assert data["success"] is False
-        assert data["error"] == "invalid_preview"
+        assert data["error"] == "preview_invalid"
 
 
 # ===========================================================================

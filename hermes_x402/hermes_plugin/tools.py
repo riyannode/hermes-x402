@@ -1840,8 +1840,6 @@ def register_gateway_tools(ctx: Any) -> None:
 
     # Preview store — delegated to shared module
     from hermes_x402.hermes_plugin.gateway_state import (
-        get_preview,
-        pop_preview,
         store_preview,
     )
 
@@ -2285,34 +2283,24 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        preview = get_preview(preview_id)
-        if not preview:
+        # Atomically claim the preview under a single lock
+        from hermes_x402.hermes_plugin.gateway_state import (
+            claim_preview_for_execution,
+        )
+
+        preview = claim_preview_for_execution(preview_id)
+        if preview is None:
             return format_success_result(
                 {
                     "success": False,
-                    "error": "invalid_preview",
-                    "message": "No preview found for this ID. Create a new preview.",
+                    "error": "preview_invalid",
+                    "message": (
+                        "Preview is missing, expired, or already consumed. Create a new preview."
+                    ),
                 }
             )
 
-        if time.time() > preview.get("expires_at", 0):
-            pop_preview(preview_id)
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "preview_expired",
-                    "message": "Preview expired. Create a new preview.",
-                }
-            )
-
-        if preview.get("consumed"):
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "preview_consumed",
-                    "message": "Preview already used. Create a new preview.",
-                }
-            )
+        # preview is now claimed — consumed flag is set under the lock
 
         # Resolve configured environment for session check
         preview_network = preview.get("wallet_network", "")
