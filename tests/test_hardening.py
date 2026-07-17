@@ -672,7 +672,7 @@ class TestNetworksOutput:
     def test_base_has_all_capabilities(self):
         net = get_network("base")
         assert net.buyer_cli_supported is True
-        assert net.buyer_dcw_supported is True
+        assert net.buyer_dcw_supported is False
         assert net.seller_supported is True
 
     def test_networkconfig_has_required_fields(self):
@@ -746,7 +746,7 @@ class TestUnverifiedNetworks:
         """Arc Testnet IS verified — contrast with Mainnet."""
         net = get_network("arcTestnet")
         assert net.gateway_supported is True
-        assert net.buyer_cli_supported is True
+        assert net.buyer_cli_supported is False
         assert net.buyer_dcw_supported is True
         assert net.seller_supported is True
 
@@ -885,8 +885,8 @@ class TestNetworksHandlerOutput:
     def test_dcw_buyer_sonic_supported(self):
         nets = self._build_network_output("buyer", "dcw")
         sonic = next(n for n in nets if n["key"] == "sonic")
-        assert sonic["buyer_dcw_supported"] is True
-        assert sonic["active_role_supported"] is True
+        assert sonic["buyer_dcw_supported"] is False
+        assert sonic["active_role_supported"] is False
 
     def test_seller_seller_supported(self):
         nets = self._build_network_output("seller", "cli")

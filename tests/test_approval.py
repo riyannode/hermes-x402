@@ -212,7 +212,7 @@ class TestCheckApprovalRequired:
             mod._store = None
 
             config = MagicMock()
-            config.require_approval = False
+            config.require_approval_for_new_host = False
 
             with patch.dict("os.environ", {"X402_REQUIRE_APPROVAL_FOR_NEW_HOST": "true"}):
                 result = check_approval_required("https://example.com/data", config=config)

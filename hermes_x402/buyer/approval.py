@@ -613,8 +613,9 @@ def check_approval_required(url: str, config: Any = None) -> dict[str, Any] | No
 
     Args:
         url: The resource URL to check.
-        config: Optional config object.  If it has a ``require_approval``
-                attribute, that takes precedence over env vars.
+        config: Optional config object.  If it has a
+                ``require_approval_for_new_host`` attribute, that takes
+                precedence over environment variables.
 
     Returns:
         ``None`` if approval is not required (or not configured).
@@ -627,16 +628,14 @@ def check_approval_required(url: str, config: Any = None) -> dict[str, Any] | No
         OSError: if the store file is symlinked or otherwise
                  irrecoverably broken — caller must propagate.
     """
-    # Determine if approval is required
-    require_approval = False
+    # Determine if approval is required.
+    # Config takes precedence over environment; environment is only used
+    # when no config object exists.
+    require_approval: bool | None = None
 
     if config is not None:
-        require_approval = getattr(config, "require_approval", None)
-        if require_approval is not None:
-            pass
-        else:
-            require_approval = False
-    if not require_approval and config is None:
+        require_approval = bool(getattr(config, "require_approval_for_new_host", False))
+    else:
         approval_config = parse_approval_config()
         require_approval = approval_config.get("require_approval", False)
 

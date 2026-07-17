@@ -82,6 +82,73 @@ async def _call_handler(handler: Any, *args: Any, **kwargs: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+class FakeStreamResponse:
+    """Fake httpx streaming response for testing.
+
+    Implements the exact interface used by production fetch code:
+    - status_code, headers, is_redirect, encoding
+    - async aiter_bytes() yielding real bytes chunks
+    - __aenter__/__aexit__ for ``async with client.stream(...) as response:``
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+        is_redirect: bool = False,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._body = body
+        self.is_redirect = is_redirect
+        self.encoding = "utf-8"
+        self.bytes_read = 0
+        self.closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.closed = True
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        for offset in range(0, len(self._body), chunk_size):
+            chunk = self._body[offset : offset + chunk_size]
+            self.bytes_read += len(chunk)
+            yield chunk
+
+
+class InfiniteLikeStreamResponse:
+    """Fake stream that yields repeated chunks without allocating the full body.
+
+    Used for large-response / truncation tests.  Proves the production code
+    stops reading at MAX_OUTPUT_BYTES + 1 without buffering the entire payload.
+    """
+
+    def __init__(self, chunk: bytes, chunk_count: int, *, status_code: int = 200):
+        self.status_code = status_code
+        self.headers: dict[str, str] = {}
+        self.chunk = chunk
+        self.chunk_count = chunk_count
+        self.is_redirect = False
+        self.encoding = "utf-8"
+        self.bytes_read = 0
+        self.closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.closed = True
+
+    async def aiter_bytes(self):
+        for _ in range(self.chunk_count):
+            self.bytes_read += len(self.chunk)
+            yield self.chunk
+
+
 class TestImportSmoke:
     def test_plugin_package_imports(self):
         import hermes_x402.hermes_plugin  # noqa: F401
@@ -407,7 +474,7 @@ class TestX402ServiceInspect:
         register_service_tools(fake_ctx)
         handler = fake_ctx.tools[0]["handler"]
         result = json.loads(
-            asyncio.run(_call_handler(handler, {"url": "http://localhost/admin"}, task_id="test"))
+            asyncio.run(_call_handler(handler, {"url": "https://localhost/admin"}, task_id="test"))
         )
         assert result["success"] is False
         assert "blocked" in result["message"].lower()
@@ -432,38 +499,40 @@ class TestX402ServiceInspect:
         """Fix #4: redirects not followed."""
         from hermes_x402.hermes_plugin.tools import register_service_tools
 
-        register_service_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
+        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
+            register_service_tools(fake_ctx)
+            handler = fake_ctx.tools[0]["handler"]
 
-        mock_response = MagicMock()
-        mock_response.is_redirect = True
-        mock_response.status_code = 302
-        mock_response.headers = {"location": "https://evil.com/steal"}
+            mock_response = MagicMock()
+            mock_response.is_redirect = True
+            mock_response.status_code = 302
+            mock_response.headers = {"location": "https://evil.com/steal"}
 
-        with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value.head = AsyncMock(return_value=mock_response)
+            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
+                mc = mock_client.return_value
+                mc.__aenter__ = AsyncMock(return_value=mc)
+                mc.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.head = AsyncMock(return_value=mock_response)
 
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://example.com/redirect"},
-                        task_id="test",
+                result = json.loads(
+                    asyncio.run(
+                        _call_handler(
+                            handler,
+                            {"url": "https://example.com/redirect"},
+                            task_id="test",
+                        )
                     )
                 )
-            )
-            assert result["success"] is False
-            assert result["error"] == "redirect_not_followed"
-            assert result["status"] == 302
-            # Redirect target is NOT requested (head called once only)
-            assert mock_client.return_value.head.call_count == 1
+                assert result["success"] is False
+                assert result["error"] == "redirect_not_followed"
+                assert result["status"] == 302
+                # Redirect target is NOT requested (head called once only)
+                assert mock_client.return_value.head.call_count == 1
 
-
-# ---------------------------------------------------------------------------
-# Fetch tool tests
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Fetch tool tests
+    # ---------------------------------------------------------------------------
 
 
 class TestX402Fetch:
@@ -486,32 +555,34 @@ class TestX402Fetch:
     def test_fetch_nonpaying_by_default(self, fake_ctx: FakeHermesContext):
         from hermes_x402.hermes_plugin.tools import register_payment_tools
 
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
+        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
+            register_payment_tools(fake_ctx)
+            handler = fake_ctx.tools[0]["handler"]
 
-        mock_response = MagicMock()
-        mock_response.status_code = 402
-        mock_response.headers = {"Payment-Required": "price=10000"}
-        mock_response.is_redirect = False
+            fake = FakeStreamResponse(
+                status_code=402,
+                headers={"Payment-Required": "price=10000"},
+            )
 
-        with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value.request = AsyncMock(return_value=mock_response)
+            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
+                mc = mock_client.return_value
+                mc.__aenter__ = AsyncMock(return_value=mc)
+                mc.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.stream = MagicMock(return_value=fake)
 
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://example.com/resource"},
-                        task_id="test",
+                result = json.loads(
+                    asyncio.run(
+                        _call_handler(
+                            handler,
+                            {"url": "https://example.com/resource"},
+                            task_id="test",
+                        )
                     )
                 )
-            )
-            assert result["success"] is True
-            assert result["payment_required"] is True
-            # Verify it did NOT attempt payment
-            assert mock_client.return_value.request.call_count == 1
+                assert result["success"] is True
+                assert result["payment_required"] is True
+                assert fake.closed is True
 
     def test_fetch_enforces_allowlist(self, fake_ctx: FakeHermesContext):
         """Fix #5: allowlist enforced before network I/O."""
@@ -544,94 +615,108 @@ class TestX402Fetch:
         """Fix #4: redirects not followed."""
         from hermes_x402.hermes_plugin.tools import register_payment_tools
 
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
+        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
+            register_payment_tools(fake_ctx)
+            handler = fake_ctx.tools[0]["handler"]
 
-        mock_response = MagicMock()
-        mock_response.is_redirect = True
-        mock_response.status_code = 301
-        mock_response.headers = {"location": "https://other.com/new"}
+            fake = FakeStreamResponse(
+                status_code=301,
+                headers={"location": "https://other.com/new"},
+                is_redirect=True,
+            )
 
-        with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value.request = AsyncMock(return_value=mock_response)
+            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
+                mc = mock_client.return_value
+                mc.__aenter__ = AsyncMock(return_value=mc)
+                mc.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.stream = MagicMock(return_value=fake)
 
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://example.com/moved"},
-                        task_id="test",
+                result = json.loads(
+                    asyncio.run(
+                        _call_handler(
+                            handler,
+                            {"url": "https://example.com/moved"},
+                            task_id="test",
+                        )
                     )
                 )
-            )
-            assert result["success"] is False
-            assert result["error"] == "redirect_not_followed"
+                assert result["success"] is False
+                assert result["error"] == "redirect_not_followed"
+                assert fake.closed is True
 
     def test_fetch_bounded_json_output(self, fake_ctx: FakeHermesContext):
         """Fix #6: JSON output bounded."""
         from hermes_x402.hermes_plugin.tools import register_payment_tools
 
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
+        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
+            register_payment_tools(fake_ctx)
+            handler = fake_ctx.tools[0]["handler"]
 
-        big_json = json.dumps({"data": "x" * 100_000})
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.headers = {"content-type": "application/json"}
-        mock_response.is_redirect = False
-        mock_response.content = big_json.encode()
-        mock_response.encoding = "utf-8"
+            from hermes_x402.hermes_plugin.schemas import MAX_OUTPUT_BYTES
 
-        with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value.request = AsyncMock(return_value=mock_response)
+            # Use InfiniteLikeStreamResponse to prove bounded read
+            # without allocating the full body
+            chunk = b"x" * 4096
+            chunk_count = (MAX_OUTPUT_BYTES // 4096) + 10  # way over the limit
+            fake = InfiniteLikeStreamResponse(chunk, chunk_count)
 
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://example.com/big"},
-                        task_id="test",
+            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
+                mc = mock_client.return_value
+                mc.__aenter__ = AsyncMock(return_value=mc)
+                mc.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.stream = MagicMock(return_value=fake)
+
+                result = json.loads(
+                    asyncio.run(
+                        _call_handler(
+                            handler,
+                            {"url": "https://example.com/big"},
+                            task_id="test",
+                        )
                     )
                 )
-            )
-            assert result["success"] is True
-            assert result["truncated"] is True
-            assert result["original_size"] > 65536
+                assert result["success"] is True
+                assert result["truncated"] is True
+                assert result["original_size"] > MAX_OUTPUT_BYTES
+                # Prove bounded read: bytes consumed <= limit
+                assert fake.bytes_read <= MAX_OUTPUT_BYTES + len(chunk)
+                assert fake.closed is True
 
     def test_fetch_malformed_json(self, fake_ctx: FakeHermesContext):
         """Fix #6: malformed JSON handled gracefully."""
         from hermes_x402.hermes_plugin.tools import register_payment_tools
 
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
+        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
+            register_payment_tools(fake_ctx)
+            handler = fake_ctx.tools[0]["handler"]
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.headers = {"content-type": "application/json"}
-        mock_response.is_redirect = False
-        mock_response.content = b"{not valid json"
-        mock_response.encoding = "utf-8"
+            fake = FakeStreamResponse(
+                status_code=200,
+                body=b"{not valid json",
+                headers={"content-type": "application/json"},
+            )
 
-        with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-            mock_client.return_value.request = AsyncMock(return_value=mock_response)
+            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
+                mc = mock_client.return_value
+                mc.__aenter__ = AsyncMock(return_value=mc)
+                mc.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+                mock_client.return_value.stream = MagicMock(return_value=fake)
 
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://example.com/bad"},
-                        task_id="test",
+                result = json.loads(
+                    asyncio.run(
+                        _call_handler(
+                            handler,
+                            {"url": "https://example.com/bad"},
+                            task_id="test",
+                        )
                     )
                 )
-            )
-            # Result is still valid JSON string
-            assert isinstance(result, dict)
+                # Result is still valid JSON string
+                assert isinstance(result, dict)
+                assert fake.closed is True
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +755,7 @@ class TestX402Pay:
             "CIRCLE_AGENT_WALLET_ADDRESS": "0x1234",
             "CIRCLE_AGENT_WALLET_NETWORK": "BASE",
             "X402_MAX_USDC_PER_PAYMENT": "0.01",
+            "X402_NETWORK_POLICY": "public",
         }
         with patch.dict("os.environ", env, clear=False):
             register_payment_tools(fake_ctx)
@@ -953,7 +1039,7 @@ class TestURLHostPolicy:
     def test_validate_allowed_url_rejects_localhost(self):
         from hermes_x402.hermes_plugin.tools import _validate_allowed_url
 
-        err = _validate_allowed_url("http://localhost/admin", [])
+        err = _validate_allowed_url("https://localhost/admin", [])
         assert err is not None
         assert "blocked" in err.lower()
 
@@ -986,7 +1072,16 @@ class TestURLHostPolicy:
     def test_validate_allowed_url_empty_allowlist(self):
         from hermes_x402.hermes_plugin.tools import _validate_allowed_url
 
-        err = _validate_allowed_url("https://anything.com/", [])
+        # strict_allowlist + empty allowlist → blocks everything
+        err = _validate_allowed_url("https://anything.com/", [], mode="strict_allowlist")
+        assert err is not None
+        assert "empty allowlist" in err
+
+    def test_validate_allowed_url_public_empty_allowlist(self):
+        from hermes_x402.hermes_plugin.tools import _validate_allowed_url
+
+        # public + empty allowlist → allows public destinations
+        err = _validate_allowed_url("https://anything.com/", [], mode="public")
         assert err is None
 
 

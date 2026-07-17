@@ -171,11 +171,14 @@ _BLOCKED_HOSTS = frozenset(
 def _validate_allowed_url(
     url: str,
     host_allowlist: Sequence[str],
+    mode: str = "strict_allowlist",
+    allow_http: bool = False,
 ) -> str | None:
     """Validate URL scheme, length, hostname, and host allowlist.
 
+    Enforces the authoritative runtime NetworkPolicy mode.
     Returns error message or None. Centralizes all URL/host policy
-    checks for inspect, fetch, and pay tools.
+    checks for inspect, fetch, supports, and pay tools.
     """
     err = _validate_url(url)
     if err:
@@ -183,6 +186,10 @@ def _validate_allowed_url(
 
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
+
+    # HTTP requires explicit allow_http
+    if parsed.scheme == "http" and not allow_http:
+        return "HTTP URLs are not allowed. Use HTTPS or enable allow_http."
 
     # Block well-known SSRF targets
     if hostname in _BLOCKED_HOSTS:
@@ -205,8 +212,21 @@ def _validate_allowed_url(
     if parsed.username or parsed.password:
         return "URL must not contain credentials (userinfo)."
 
-    # Enforce host allowlist
-    if host_allowlist:
+    # Enforce network policy mode
+    if mode == "strict_allowlist":
+        if host_allowlist:
+            allowed = any(
+                hostname == item.lower() or hostname.endswith(f".{item.lower()}")
+                for item in host_allowlist
+            )
+            if not allowed:
+                return f"Host not in allowlist: {hostname}"
+        else:
+            # Empty allowlist in strict mode = nothing allowed
+            return "No hosts are allowed (empty allowlist in strict_allowlist mode)."
+    elif mode == "public" and host_allowlist:
+        # In public mode, private/reserved IPs are already blocked above.
+        # An allowlist may further restrict destinations.
         allowed = any(
             hostname == item.lower() or hostname.endswith(f".{item.lower()}")
             for item in host_allowlist
@@ -521,6 +541,10 @@ def register_network_tools(ctx: Any) -> None:
                     "chain_id": net.chain_id,
                     "environment": net.environment,
                     "gateway_supported": net.gateway_supported,
+                    "buyer_backend_supported": (
+                        (backend_name == "cli" and buyer_cli)
+                        or (backend_name == "dcw" and buyer_dcw)
+                    ),
                     "buyer_cli_supported": buyer_cli,
                     "buyer_dcw_supported": buyer_dcw,
                     "seller_supported": seller,
@@ -663,6 +687,29 @@ def register_supports_tools(ctx: Any) -> None:
         runtime = get_runtime()
         runtime.ensure_initialized()
 
+        # --- Enforce runtime network policy ---
+        policy_mode = runtime.config.network_policy if runtime.config else "strict_allowlist"
+        policy_allowlist = runtime.config.host_allowlist if runtime.config else []
+        policy_allow_http = runtime.config.allow_http if runtime.config else False
+
+        err = _validate_allowed_url(
+            url, policy_allowlist, mode=policy_mode, allow_http=policy_allow_http
+        )
+        if err:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": (
+                        "invalid_input"
+                        if "required" in err or "exceeds" in err or "must use" in err
+                        else "host_rejected"
+                        if "allowlist" in err or "private" in err or "blocked" in err
+                        else "policy_rejected"
+                    ),
+                    "message": err,
+                }
+            )
+
         # --- DNS destination validation (fail closed) ---
         try:
             from hermes_x402.dns_validator import resolve_and_validate_destination
@@ -741,11 +788,21 @@ def register_service_tools(ctx: Any) -> None:
         runtime = get_runtime()
         runtime.ensure_initialized()
 
-        host_allowlist = runtime.config.host_allowlist if runtime.config else []
-        err = _validate_allowed_url(url, host_allowlist)
+        # --- Enforce runtime network policy ---
+        policy_mode = runtime.config.network_policy if runtime.config else "strict_allowlist"
+        policy_allowlist = runtime.config.host_allowlist if runtime.config else []
+        policy_allow_http = runtime.config.allow_http if runtime.config else False
+
+        err = _validate_allowed_url(
+            url, policy_allowlist, mode=policy_mode, allow_http=policy_allow_http
+        )
         if err:
             error_code = (
-                "invalid_input" if "required" in err or "exceeds" in err else "host_rejected"
+                "invalid_input"
+                if "required" in err or "exceeds" in err or "must use" in err
+                else "host_rejected"
+                if "allowlist" in err or "private" in err or "blocked" in err
+                else "policy_rejected"
             )
             return format_success_result(
                 {
@@ -833,16 +890,25 @@ def register_payment_tools(ctx: Any) -> None:
 
         runtime = get_runtime()
         runtime.ensure_initialized()
-        host_allowlist = runtime.config.host_allowlist if runtime.config else []
-        err = _validate_allowed_url(url, host_allowlist)
+
+        # --- Enforce runtime network policy ---
+        policy_mode = runtime.config.network_policy if runtime.config else "strict_allowlist"
+        policy_allowlist = runtime.config.host_allowlist if runtime.config else []
+        policy_allow_http = runtime.config.allow_http if runtime.config else False
+
+        err = _validate_allowed_url(
+            url, policy_allowlist, mode=policy_mode, allow_http=policy_allow_http
+        )
         if err:
             return format_success_result(
                 {
                     "success": False,
                     "error": (
                         "invalid_input"
-                        if "required" in err or "exceeds" in err
+                        if "required" in err or "exceeds" in err or "must use" in err
                         else "host_rejected"
+                        if "allowlist" in err or "private" in err or "blocked" in err
+                        else "policy_rejected"
                     ),
                     "message": err,
                 }
@@ -868,30 +934,90 @@ def register_payment_tools(ctx: Any) -> None:
                 if body is not None and method in {"POST", "PUT", "PATCH"}:
                     kwargs_req["json"] = body
 
-                response = await client.request(**kwargs_req)
+                # --- Streaming bounded read (Finding 10) ---
+                async with client.stream(**kwargs_req) as response:
+                    # Check redirect
+                    redirect = _check_redirect(response)
+                    if redirect:
+                        return format_success_result(redirect)
 
-                # Check redirect
-                redirect = _check_redirect(response)
-                if redirect:
-                    return format_success_result(redirect)
+                    if response.status_code == 402:
+                        # Bound 402 challenge body
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total <= MAX_OUTPUT_BYTES + 1:
+                                chunks.append(chunk)
+                            else:
+                                break
+                        return format_success_result(
+                            {
+                                "success": True,
+                                "status": 402,
+                                "payment_required": True,
+                                "message": (
+                                    "This resource requires payment. "
+                                    "Use x402_pay to purchase access."
+                                ),
+                                "payment_header": _bound_header(
+                                    response.headers.get("Payment-Required", "")
+                                ),
+                            }
+                        )
 
-                if response.status_code == 402:
+                    # Stream body with bounded read
+                    chunks = []
+                    total = 0
+                    truncated = False
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total <= MAX_OUTPUT_BYTES + 1:
+                            chunks.append(chunk)
+                        else:
+                            truncated = True
+                            break
+
+                    raw = b"".join(chunks[:MAX_OUTPUT_BYTES]) if chunks else b""
+                    original_size = total if truncated else len(raw)
+
+                    content_type = response.headers.get("content-type", "")
+                    is_json = "application/json" in content_type
+
+                    # Attempt JSON parse only on small enough, non-truncated bodies
+                    if is_json and not truncated:
+                        try:
+                            decoded = raw.decode(response.encoding or "utf-8", errors="replace")
+                            parsed = json.loads(decoded)
+                            return format_success_result(
+                                {
+                                    "success": True,
+                                    "status": response.status_code,
+                                    "content_type": content_type,
+                                    "data": parsed,
+                                    "truncated": False,
+                                    "original_size": original_size,
+                                }
+                            )
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            pass
+
+                    # Text/binary fallback
+                    try:
+                        decoded = raw.decode(response.encoding or "utf-8", errors="replace")
+                    except Exception:
+                        decoded = raw.decode("latin-1", errors="replace")
+
                     return format_success_result(
                         {
                             "success": True,
-                            "status": 402,
-                            "payment_required": True,
-                            "message": (
-                                "This resource requires payment. Use x402_pay to purchase access."
-                            ),
-                            "payment_header": _bound_header(
-                                response.headers.get("Payment-Required", "")
-                            ),
+                            "status": response.status_code,
+                            "content_type": content_type,
+                            "data": decoded,
+                            "truncated": truncated,
+                            "original_size": original_size,
                         }
                     )
-
-                result = _bounded_response(response)
-                return format_success_result(result)
         except httpx.HTTPError as exc:
             return format_success_result(
                 {
@@ -946,6 +1072,29 @@ def register_payment_tools(ctx: Any) -> None:
                     "success": False,
                     "error": "configuration_error",
                     "message": "x402 buyer is not available. Check configuration.",
+                }
+            )
+
+        # --- Enforce authoritative runtime network policy BEFORE payment ---
+        policy_mode = runtime.config.network_policy if runtime.config else "strict_allowlist"
+        policy_allowlist = runtime.config.host_allowlist if runtime.config else []
+        policy_allow_http = runtime.config.allow_http if runtime.config else False
+
+        err = _validate_allowed_url(
+            url, policy_allowlist, mode=policy_mode, allow_http=policy_allow_http
+        )
+        if err:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": (
+                        "invalid_input"
+                        if "required" in err or "exceeds" in err or "must use" in err
+                        else "host_rejected"
+                        if "allowlist" in err or "private" in err or "blocked" in err
+                        else "policy_rejected"
+                    ),
+                    "message": err,
                 }
             )
 

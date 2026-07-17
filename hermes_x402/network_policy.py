@@ -152,10 +152,16 @@ def _check_ip_address(hostname: str) -> str | None:
 
 
 def _check_reserved_ranges(hostname: str) -> str | None:
-    """Check common private/internal IP ranges that ipaddress may miss."""
+    """Check common private/internal IP ranges that ipaddress may miss.
+
+    Note: ``ipaddress.ip_address().is_private`` already correctly handles
+    172.16.0.0/12 (RFC1918).  The broad ``"172."`` prefix check is
+    intentionally omitted — only 10.0.0.0/8 and 192.168.0.0/16 are checked
+    here as fallback for edge cases where ``ipaddress`` may not classify
+    them.
+    """
     private_prefixes = (
         "10.",
-        "172.",
         "192.168.",
         "169.254.",
     )

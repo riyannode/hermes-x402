@@ -74,10 +74,9 @@ def _parse_price(price: str | Decimal) -> str:
     if callable(price):
         raise TypeError("price must be a string or Decimal, not a callable")
 
-    # Strip leading $ if present
-    raw = str(price).strip()
-    if raw.startswith("$"):
-        raw = raw[1:]
+    # Normalise currency marker: strip $ from anywhere, not just prefix.
+    # This handles "$0.01", "-$0.01", "$-0.01", and bare "0.01".
+    raw = str(price).strip().replace("$", "")
 
     if not raw:
         raise ValueError("price must not be empty")
@@ -353,15 +352,37 @@ class X402Gateway:
         if not authorization:
             authorization = decoded.get("authorization", {})
 
-        payer = authorization.get("from", "")
-        value = str(authorization.get("value", "0"))
-        network = decoded.get("accepted", {}).get("network", decoded.get("network", ""))
+        # --- Validate authorization fields before any settlement ---
+        if not authorization:
+            logger.warning("Missing authorization in payment payload")
+            body = self._build_402_body(
+                amount, request.path, description, route_networks, route_accepts
+            )
+            encoded = base64.b64encode(json.dumps(body).encode()).decode()
+            return web.json_response(
+                body,
+                status=402,
+                headers={PAYMENT_REQUIRED_HEADER: encoded},
+            )
 
-        # Validate network is one we accept
-        accepted_keys = {n.key for n in route_networks}
-        if network not in accepted_keys:
+        payer = authorization.get("from", "")
+        client_value = str(authorization.get("value", "0"))
+        auth_network = authorization.get("network", "")
+        auth_asset = authorization.get("asset", "")
+        auth_pay_to = authorization.get("payTo", "")
+
+        # Determine which network the client claims to pay on.
+        # The accepted-network field in the payload must be CAIP-2.
+        accepted = decoded.get("accepted", {})
+        payload_network = accepted.get("network", auth_network)
+
+        # Validate network is one we accept (CAIP-2 matching)
+        accepted_networks = {n.caip2 for n in route_networks}
+        if payload_network not in accepted_networks:
             logger.warning(
-                "Payment on unaccepted network %s (accepted: %s)", network, accepted_keys
+                "Payment on unaccepted network %s (accepted: %s)",
+                payload_network,
+                accepted_networks,
             )
             body = self._build_402_body(
                 amount, request.path, description, route_networks, route_accepts
@@ -373,8 +394,83 @@ class X402Gateway:
                 headers={PAYMENT_REQUIRED_HEADER: encoded},
             )
 
-        # Build requirements for settlement
-        requirements = self._build_settle_requirements(value, network, route_networks)
+        # Resolve the NetworkConfig for the claimed network
+        network_config: NetworkConfig | None = None
+        for net in route_networks:
+            if net.caip2 == payload_network:
+                network_config = net
+                break
+
+        if network_config is None:
+            logger.warning("No NetworkConfig found for network %s", payload_network)
+            body = self._build_402_body(
+                amount, request.path, description, route_networks, route_accepts
+            )
+            encoded = base64.b64encode(json.dumps(body).encode()).decode()
+            return web.json_response(
+                body,
+                status=402,
+                headers={PAYMENT_REQUIRED_HEADER: encoded},
+            )
+
+        # --- Validate client value matches server-computed amount ---
+        try:
+            client_atomic = int(client_value)
+            server_atomic = int(amount)
+        except (ValueError, TypeError):
+            logger.warning("Malformed authorization value: %s", client_value)
+            body = self._build_402_body(
+                amount, request.path, description, route_networks, route_accepts
+            )
+            encoded = base64.b64encode(json.dumps(body).encode()).decode()
+            return web.json_response(
+                body,
+                status=402,
+                headers={PAYMENT_REQUIRED_HEADER: encoded},
+            )
+
+        if client_atomic != server_atomic:
+            logger.warning("Underpayment rejected: client=%s server=%s", client_value, amount)
+            body = self._build_402_body(
+                amount, request.path, description, route_networks, route_accepts
+            )
+            encoded = base64.b64encode(json.dumps(body).encode()).decode()
+            return web.json_response(
+                body,
+                status=402,
+                headers={PAYMENT_REQUIRED_HEADER: encoded},
+            )
+
+        # Validate asset matches expected USDC contract
+        if auth_asset and auth_asset.lower() != network_config.usdc_address.lower():
+            logger.warning(
+                "Wrong asset: got %s expected %s", auth_asset, network_config.usdc_address
+            )
+            body = self._build_402_body(
+                amount, request.path, description, route_networks, route_accepts
+            )
+            encoded = base64.b64encode(json.dumps(body).encode()).decode()
+            return web.json_response(
+                body,
+                status=402,
+                headers={PAYMENT_REQUIRED_HEADER: encoded},
+            )
+
+        # Validate payTo matches configured seller address
+        if auth_pay_to and auth_pay_to.lower() != self._seller_address.lower():
+            logger.warning("Wrong payTo: got %s expected %s", auth_pay_to, self._seller_address)
+            body = self._build_402_body(
+                amount, request.path, description, route_networks, route_accepts
+            )
+            encoded = base64.b64encode(json.dumps(body).encode()).decode()
+            return web.json_response(
+                body,
+                status=402,
+                headers={PAYMENT_REQUIRED_HEADER: encoded},
+            )
+
+        # --- Build settle requirements from SERVER-computed amount ---
+        requirements = self._build_settle_requirements(amount, payload_network, route_networks)
 
         # Settle via Circle Gateway (skip verify)
         try:
@@ -408,8 +504,8 @@ class X402Gateway:
         transaction = settle_result.get("transaction", "")
         result = PaymentResult(
             payer=payer,
-            amount=value,
-            network=network,
+            amount=client_value,
+            network=payload_network,
             transaction=transaction,
         )
 
@@ -417,12 +513,12 @@ class X402Gateway:
         request["x402_payment"] = result
         set_payment_context(
             payer=payer,
-            amount=value,
-            network=network,
+            amount=client_value,
+            network=payload_network,
             transaction=transaction,
         )
 
-        logger.info("Payment settled: %s USDC by %s tx=%s", value, payer, transaction)
+        logger.info("Payment settled: %s USDC by %s tx=%s", client_value, payer, transaction)
 
         # Forward to the original handler
         return await handler_call(request)
@@ -437,7 +533,7 @@ class X402Gateway:
         for net in networks:
             entry: dict[str, Any] = {
                 "scheme": CIRCLE_BATCHING_SCHEME,
-                "network": net.key,
+                "network": net.caip2,
                 "asset": net.usdc_address,
                 "amount": override_amount or "0",
                 "payTo": self._seller_address,

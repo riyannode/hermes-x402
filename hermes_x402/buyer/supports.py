@@ -116,20 +116,41 @@ def _detect_backend_support(
     configured_backend: str | None,
     wallet_network: str | None,
 ) -> bool:
-    """Check if the network is supported by the configured backend."""
+    """Check if the network is supported by the configured backend.
+
+    For CLI: the configured wallet network must match the challenge network.
+    For DCW: the exact network the current backend supports (Arc Testnet only).
+    Normalize both the configured wallet network and challenge network through
+    the central registry before comparison.
+    """
     if not configured_backend:
         return False
     try:
         from hermes_x402.networks import get_network
 
-        net = get_network(network_key)
+        challenge_net = get_network(network_key)
     except Exception:
         return False
 
+    # Resolve wallet network to canonical key for comparison
+    wallet_key: str | None = None
+    if wallet_network:
+        try:
+            wallet_net = get_network(wallet_network)
+            wallet_key = wallet_net.key
+        except Exception:
+            wallet_key = wallet_network  # fallback to raw string
+
     if configured_backend == "cli":
-        return net.buyer_cli_supported
+        if not challenge_net.buyer_cli_supported:
+            return False
+        # CLI wallet must be on the exact same network
+        return not (wallet_key and challenge_net.key != wallet_key)
     elif configured_backend == "dcw":
-        return net.buyer_dcw_supported
+        if not challenge_net.buyer_dcw_supported:
+            return False
+        # DCW must match the exact network (Arc Testnet only)
+        return not (wallet_key and challenge_net.key != wallet_key)
     return False
 
 

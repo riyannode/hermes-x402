@@ -181,7 +181,8 @@ X402_PAY_SCHEMA: dict[str, Any] = {
         "Capped by local configuration. Caller cap may reduce but "
         "never raise the configured cap. Protected payment headers "
         "cannot be supplied. Ambiguous outcomes return retry_safe=false "
-        "and must not be retried automatically."
+        "and must not be retried automatically. "
+        "Daily budget configuration is accepted but not enforced in this release."
     ),
     "parameters": {
         "type": "object",
