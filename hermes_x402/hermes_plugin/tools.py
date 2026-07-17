@@ -490,21 +490,28 @@ def register_network_tools(ctx: Any) -> None:
         runtime.ensure_initialized()
 
         backend_name = runtime.backend_name
+        role = runtime.role
 
-        # Determine which capability filter to apply based on backend
         all_networks = list_networks()
 
         result_networks = []
         for net in all_networks:
-            backend_supported = False
-            if (
-                backend_name == "cli"
-                and net.buyer_cli_supported
-                or backend_name == "dcw"
-                and net.buyer_dcw_supported
-                or net.seller_supported
-            ):
-                backend_supported = True
+            buyer_cli = net.buyer_cli_supported
+            buyer_dcw = net.buyer_dcw_supported
+            seller = net.seller_supported
+
+            # Calculate active_role_supported based on role + backend
+            active_role_supported = False
+            if role == "buyer":
+                if backend_name == "cli" and buyer_cli or backend_name == "dcw" and buyer_dcw:
+                    active_role_supported = True
+            elif role == "seller":
+                active_role_supported = seller
+            elif role == "dual":
+                buyer_ok = (backend_name == "cli" and buyer_cli) or (
+                    backend_name == "dcw" and buyer_dcw
+                )
+                active_role_supported = buyer_ok or seller
 
             result_networks.append(
                 {
@@ -514,8 +521,10 @@ def register_network_tools(ctx: Any) -> None:
                     "chain_id": net.chain_id,
                     "environment": net.environment,
                     "gateway_supported": net.gateway_supported,
-                    "backend_supported": backend_supported,
-                    "seller_supported": net.seller_supported,
+                    "buyer_cli_supported": buyer_cli,
+                    "buyer_dcw_supported": buyer_dcw,
+                    "seller_supported": seller,
+                    "active_role_supported": active_role_supported,
                 }
             )
 
@@ -523,6 +532,7 @@ def register_network_tools(ctx: Any) -> None:
             {
                 "success": True,
                 "backend": backend_name or "none",
+                "role": role or "unconfigured",
                 "count": len(result_networks),
                 "networks": result_networks,
             }
@@ -650,10 +660,23 @@ def register_supports_tools(ctx: Any) -> None:
                 {"success": False, "error": "invalid_input", "message": err}
             )
 
+        runtime = get_runtime()
+        runtime.ensure_initialized()
+
+        # --- DNS destination validation (fail closed) ---
+        try:
+            from hermes_x402.dns_validator import resolve_and_validate_destination
+
+            await resolve_and_validate_destination(url)
+        except ValueError as exc:
+            return format_success_result(
+                {"success": False, "error": "destination_rejected", "message": str(exc)}
+            )
+
         try:
             from hermes_x402.buyer.supports import check_supports
 
-            result = await check_supports(url, method=method)
+            result = await check_supports(url, method=method, config=runtime.config)
             return format_success_result(
                 {
                     "success": True,
@@ -730,6 +753,16 @@ def register_service_tools(ctx: Any) -> None:
                     "error": error_code,
                     "message": err,
                 }
+            )
+
+        # --- DNS destination validation (fail closed) ---
+        try:
+            from hermes_x402.dns_validator import resolve_and_validate_destination
+
+            await resolve_and_validate_destination(url)
+        except ValueError as exc:
+            return format_success_result(
+                {"success": False, "error": "destination_rejected", "message": str(exc)}
             )
 
         try:
@@ -813,6 +846,16 @@ def register_payment_tools(ctx: Any) -> None:
                     ),
                     "message": err,
                 }
+            )
+
+        # --- DNS destination validation (fail closed) ---
+        try:
+            from hermes_x402.dns_validator import resolve_and_validate_destination
+
+            await resolve_and_validate_destination(url)
+        except ValueError as exc:
+            return format_success_result(
+                {"success": False, "error": "destination_rejected", "message": str(exc)}
             )
 
         try:
@@ -917,7 +960,7 @@ def register_payment_tools(ctx: Any) -> None:
                 }
             )
 
-        # New-host approval check
+        # New-host approval check — fail closed on any error
         if runtime.config and runtime.config.require_approval_for_new_host:
             try:
                 from hermes_x402.buyer.approval import check_approval_required
@@ -925,8 +968,25 @@ def register_payment_tools(ctx: Any) -> None:
                 approval = check_approval_required(url, config=runtime.config)
                 if approval is not None:
                     return format_success_result(approval)
-            except Exception:
-                pass  # If approval check fails, don't block payment
+            except Exception as exc:
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "approval_check_failed",
+                        "retry_safe": False,
+                        "message": f"Approval check failed: {exc}",
+                    }
+                )
+
+        # --- DNS destination validation (fail closed) ---
+        try:
+            from hermes_x402.dns_validator import resolve_and_validate_destination
+
+            await resolve_and_validate_destination(url)
+        except ValueError as exc:
+            return format_success_result(
+                {"success": False, "error": "destination_rejected", "message": str(exc)}
+            )
 
         buyer = runtime.buyer_tool
         if buyer is None:

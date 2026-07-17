@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from hermes_x402.buyer.errors import BuyerConfigurationError
 from hermes_x402.config import X402Config
 
 # ---------------------------------------------------------------------------
@@ -221,23 +224,23 @@ class TestDailyBudget:
 
     def test_negative_budget_rejected(self):
         config = X402Config(daily_budget_usdc="-1")
-        result = config.validate_daily_budget()
-        assert result is None
+        with pytest.raises(BuyerConfigurationError, match="non-negative"):
+            config.validate_daily_budget()
 
     def test_nan_budget_rejected(self):
         config = X402Config(daily_budget_usdc="NaN")
-        result = config.validate_daily_budget()
-        assert result is None
+        with pytest.raises(BuyerConfigurationError, match="Invalid"):
+            config.validate_daily_budget()
 
     def test_infinity_budget_rejected(self):
         config = X402Config(daily_budget_usdc="Infinity")
-        result = config.validate_daily_budget()
-        assert result is None
+        with pytest.raises(BuyerConfigurationError, match="Invalid"):
+            config.validate_daily_budget()
 
     def test_invalid_string_rejected(self):
         config = X402Config(daily_budget_usdc="not-a-number")
-        result = config.validate_daily_budget()
-        assert result is None
+        with pytest.raises(BuyerConfigurationError, match="Invalid"):
+            config.validate_daily_budget()
 
     def test_decimal_budget(self):
         config = X402Config(daily_budget_usdc="0.01")

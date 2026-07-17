@@ -132,17 +132,27 @@ class X402Config:
             return
         raise UnsupportedBuyerBackendError(f"Unsupported buyer backend: {self.buyer_backend}")
 
-    # Validate daily budget
+    # Daily budget: config-only in this version, not durably enforced.
+    # TODO(follow-up): add durable per-day spending cap with persistence.
     def validate_daily_budget(self) -> str | None:
-        """Validate and return the daily budget, or None if unset/invalid."""
+        """Validate and return the daily budget, or None if unset.
+
+        Raises BuyerConfigurationError if X402_DAILY_BUDGET_USDC is set
+        but contains an invalid value (non-numeric, negative, non-finite).
+        """
         if self.daily_budget_usdc is None:
             return None
         try:
             value = Decimal(self.daily_budget_usdc)
-        except (InvalidOperation, ValueError):
-            return None
+        except (InvalidOperation, ValueError) as exc:
+            raise BuyerConfigurationError(
+                f"Invalid X402_DAILY_BUDGET_USDC value: {self.daily_budget_usdc!r}"
+            ) from exc
         if not value.is_finite() or value < 0:
-            return None
+            raise BuyerConfigurationError(
+                f"Invalid X402_DAILY_BUDGET_USDC value: {self.daily_budget_usdc!r} "
+                "(must be non-negative)"
+            )
         return str(value)
 
     @classmethod

@@ -103,12 +103,16 @@ class TestFilePersistence:
         store = TrustedHostStore(path=path)
         assert store.is_trusted("anything.com") is False
 
-    def test_corrupt_file_is_empty(self, tmp_path):
+    def test_corrupt_file_fails_closed(self, tmp_path):
+        """Corrupt store file must fail closed — deny all, not silently accept."""
         path = tmp_path / "corrupt.json"
         path.write_text("not json{{{")
 
         store = TrustedHostStore(path=path)
+        # Corrupt file → store denies all hosts (fail-closed)
         assert store.is_trusted("anything.com") is False
+        assert store.load_failed is True
+        assert store.load_failed is True
 
     def test_untrust_persists(self, tmp_path):
         path = tmp_path / "trusted.json"

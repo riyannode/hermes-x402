@@ -341,14 +341,15 @@ async def check_supports(
     urlparse(url)
 
     # --- URL validation via network policy ---
-    network_policy = parse_network_policy()
-    # Override with config if available
-    if config and hasattr(config, "host_allowlist") and config.host_allowlist:
+    # Use config as authoritative source when available; fall back to env vars
+    if config is not None and hasattr(config, "network_policy"):
         network_policy = NetworkPolicy(
-            mode=network_policy.mode,
-            host_allowlist=tuple(config.host_allowlist),
-            allow_http=network_policy.allow_http,
+            mode=getattr(config, "network_policy", "strict_allowlist"),
+            host_allowlist=tuple(getattr(config, "host_allowlist", ())),
+            allow_http=getattr(config, "allow_http", False),
         )
+    else:
+        network_policy = parse_network_policy()
     try:
         network_policy.validate_url(url)
     except PaymentPolicyError as exc:
