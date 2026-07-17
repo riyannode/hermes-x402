@@ -13,6 +13,8 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+import json
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -57,6 +59,7 @@ def _make_runtime_mock(
     role: str = "buyer",
     network: str = "ARC-TESTNET",
     wallet_address: str = "0xabcdef1234567890abcdef1234567890abcdef12",
+    allow_chat_otp: bool = False,
 ) -> MagicMock:
     rt = MagicMock()
     rt.is_configured = configured
@@ -75,6 +78,7 @@ def _make_runtime_mock(
         network_policy="public",
         require_approval_for_new_host=False,
         allow_http=False,
+        allow_chat_otp=allow_chat_otp,
     )
     rt.cli_client = AsyncMock()
     rt.buyer_tool = MagicMock()
@@ -310,9 +314,11 @@ class TestLoginLifecycle:
         register_login_tools(ctx)
         handler = ctx.tools["x402_login_complete"]["handler"]
 
-        rt = _make_runtime_mock()
+        rt = _make_runtime_mock(allow_chat_otp=True)
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"request_id": "nonexistent", "otp": "123456"})
+            result = await handler(
+                {"login_id": "nonexistent", "otp": "123456", "acknowledge_otp_exposure": True}
+            )
 
         import json
 
@@ -327,9 +333,9 @@ class TestLoginLifecycle:
         register_login_tools(ctx)
         handler = ctx.tools["x402_login_complete"]["handler"]
 
-        rt = _make_runtime_mock()
+        rt = _make_runtime_mock(allow_chat_otp=True)
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"request_id": "", "otp": ""})
+            result = await handler({"login_id": "", "otp": "", "acknowledge_otp_exposure": True})
 
         import json
 
@@ -346,7 +352,7 @@ class TestLoginLifecycle:
         start_handler = ctx.tools["x402_login_start"]["handler"]
         complete_handler = ctx.tools["x402_login_complete"]["handler"]
 
-        rt = _make_runtime_mock()
+        rt = _make_runtime_mock(allow_chat_otp=True)
         status = MagicMock()
         status.authenticated = False
         status.terms_accepted = True
@@ -369,13 +375,17 @@ class TestLoginLifecycle:
 
             # Simulate failed OTP (exception)
             rt.cli_client.login_complete = AsyncMock(side_effect=Exception("OTP invalid"))
-            await complete_handler({"request_id": login_id, "otp": "000000"})
+            await complete_handler(
+                {"login_id": login_id, "otp": "000000", "acknowledge_otp_exposure": True}
+            )
 
             # Try reuse — should fail because pending login was consumed
             rt.cli_client.login_complete = AsyncMock(
                 return_value=MagicMock(authenticated=True, testnet_status="VALID")
             )
-            reuse_result = await complete_handler({"request_id": login_id, "otp": "111111"})
+            reuse_result = await complete_handler(
+                {"login_id": login_id, "otp": "111111", "acknowledge_otp_exposure": True}
+            )
             reuse_data = json.loads(reuse_result)
             assert reuse_data["success"] is False
             assert reuse_data["error"] == "invalid_request"
@@ -412,7 +422,7 @@ class TestGatewayBalance:
         rt.cli_client.gateway_balance = AsyncMock(return_value=gw_result)
 
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({})
+            result = await handler()
 
         import json
 
@@ -435,7 +445,7 @@ class TestGatewayBalance:
         rt.cli_client.gateway_balance = AsyncMock(return_value=gw_result)
 
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({})
+            result = await handler()
 
         import json
 
@@ -463,7 +473,13 @@ class TestGatewayDepositPreview:
 
         rt = _make_runtime_mock()
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"amount": "0"})
+            result = await handler(
+                {
+                    "service_url": "https://api.example.com/premium",
+                    "method": "GET",
+                    "amount": "0",
+                }
+            )
 
         import json
 
@@ -480,7 +496,13 @@ class TestGatewayDepositPreview:
 
         rt = _make_runtime_mock()
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"amount": "-5.0"})
+            result = await handler(
+                {
+                    "service_url": "https://api.example.com/premium",
+                    "method": "GET",
+                    "amount": "-5.0",
+                }
+            )
 
         import json
 
@@ -508,10 +530,34 @@ class TestGatewayDepositPreview:
             return_value=(WalletBalance(symbol="USDC", amount="1.0"),)
         )
 
-        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"amount": "5.0"})
+        # Mock 402 response with Gateway option
+        mock_response = MagicMock()
+        mock_response.status_code = 402
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.text = json.dumps(
+            {
+                "paymentOptions": [
+                    {"paymentSystem": "circle_gateway", "network": "ARC-TESTNET", "domain": 26}
+                ]
+            }
+        )
 
-        import json
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt),
+            patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient", return_value=mock_client),
+        ):
+            result = await handler(
+                {
+                    "service_url": "https://api.example.com/premium",
+                    "method": "GET",
+                    "amount": "5.0",
+                }
+            )
 
         data = json.loads(result)
         assert data["success"] is False
@@ -530,10 +576,34 @@ class TestGatewayDepositPreview:
         status.terms_accepted = True
         rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
 
-        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"amount": "5.0"})
+        # Mock 402 response with Gateway option
+        mock_response = MagicMock()
+        mock_response.status_code = 402
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.text = json.dumps(
+            {
+                "paymentOptions": [
+                    {"paymentSystem": "circle_gateway", "network": "ARC-TESTNET", "domain": 26}
+                ]
+            }
+        )
 
-        import json
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt),
+            patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient", return_value=mock_client),
+        ):
+            result = await handler(
+                {
+                    "service_url": "https://api.example.com/premium",
+                    "method": "GET",
+                    "amount": "5.0",
+                }
+            )
 
         data = json.loads(result)
         assert data["success"] is False
@@ -592,7 +662,7 @@ class TestWalletStatusExtended:
 
         rt = _make_runtime_mock(configured=False)
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = handler({})
+            result = asyncio.run(handler())
 
         import json
 
@@ -610,7 +680,7 @@ class TestWalletStatusExtended:
         rt = _make_runtime_mock(backend="dcw")
         rt.cli_client = None
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = handler({})
+            result = asyncio.run(handler())
 
         import json
 

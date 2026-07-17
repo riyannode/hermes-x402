@@ -82,6 +82,7 @@ class X402Config:
     require_approval_for_new_host: bool = False
     daily_budget_usdc: str | None = None
     allow_http: bool = False
+    allow_chat_otp: bool = False
 
     def validate(self) -> None:
         if self.role is None:
@@ -194,6 +195,9 @@ class X402Config:
         allow_http_raw = os.environ.get("X402_ALLOW_HTTP", "").strip().lower()
         allow_http = allow_http_raw in {"1", "true", "yes"}
 
+        allow_chat_otp_raw = os.environ.get("X402_ALLOW_CHAT_OTP", "").strip().lower()
+        allow_chat_otp = allow_chat_otp_raw in {"1", "true", "yes"}
+
         config = cls(
             seller_address=os.environ.get("X402_SELLER_ADDRESS", ""),
             chain=os.environ.get("X402_CHAIN", "arcTestnet"),
@@ -220,6 +224,7 @@ class X402Config:
             require_approval_for_new_host=require_approval_for_new_host,
             daily_budget_usdc=os.environ.get("X402_DAILY_BUDGET_USDC") or None,
             allow_http=allow_http,
+            allow_chat_otp=allow_chat_otp,
         )
         config.validate()
         return config

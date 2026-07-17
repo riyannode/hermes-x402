@@ -133,11 +133,16 @@ Report configured wallet USDC balance. CLI backend uses the existing typed balan
 
 ### `x402_login_start`
 
-Start Circle Agent Wallet email OTP login. Only runs when no valid session exists. Returns an opaque login request ID. Never accepts or stores Circle Terms of Use. Apply expiry to pending login.
+Start Circle Agent Wallet email OTP login. Only runs when no valid session exists. Returns an opaque `login_id` with 5-minute expiry. Presents two choices:
+
+- **Choice A (recommended):** Manual CLI login — the OTP never enters Hermes chat. Complete login through Circle CLI in your terminal.
+- **Choice B (optional, disabled by default):** Chat OTP via `x402_login_complete` — requires `X402_ALLOW_CHAT_OTP=true`. The OTP passes through conversation and model/tool context.
+
+Never accepts or stores Circle Terms of Use.
 
 ### `x402_login_complete`
 
-Complete Circle Agent Wallet login with OTP. OTP exists in memory only for the duration of the call. Never logs or returns OTP. Failed OTP consumes the Circle request — require new login_start.
+Complete Circle Agent Wallet login with OTP via chat. **Disabled by default** — requires `X402_ALLOW_CHAT_OTP=true`. Requires `acknowledge_otp_exposure=true`. OTP exists in memory only for the duration of the call. Never logs or returns OTP. Failed OTP consumes the login — require new `x402_login_start`.
 
 ### `x402_networks`
 
@@ -169,11 +174,11 @@ Report Circle Gateway balance for the active wallet and configured network. Dist
 
 ### `x402_gateway_deposit_preview`
 
-Preview a Gateway deposit without moving USDC. Accepts amount. Verifies wallet, session, terms, and network support. Returns a short-lived preview ID bound to config. Read-only — must not move USDC.
+Service-bound Gateway deposit preview. Requires `service_url`, HTTP `method`, and `amount`. Validates URL policy, fetches a fresh 402 challenge to verify the seller advertises a Gateway payment option, checks network compatibility, session, terms, and wallet balance. Returns a short-lived preview ID bound to all parameters. Read-only — must not move USDC.
 
 ### `x402_gateway_deposit_execute`
 
-Execute a Gateway deposit using a preview ID from `x402_gateway_deposit_preview`. Do not accept replacement amount, wallet, network, or method. Revalidates session, config, wallet, and preview expiry. Execute exactly once. `retry_safe=false` for ambiguous outcomes.
+Execute a Gateway deposit using a preview ID from `x402_gateway_deposit_preview`. Do not accept replacement amount, wallet, network, or method. Revalidates session, config, wallet, service (fresh 402 challenge), and preview expiry. Execute exactly once. `retry_safe=false` for ambiguous outcomes.
 
 ## Intended Workflow
 
@@ -185,10 +190,11 @@ x402_wallet_status
 → x402_supports
 → x402_gateway_balance
 → x402_gateway_deposit_preview (when Gateway funding is required)
-→ present exact deposit details to user
-→ wait for explicit user approval
+→ show preview to user
+→ explicit user approval
 → x402_gateway_deposit_execute
-→ x402_pay with a fresh challenge and separate explicit payment approval
+→ wait/check balance
+→ fresh x402_pay with a fresh challenge and separate explicit payment approval
 ```
 
 Discovery remains open. Only fund-moving operations require explicit user approval.
@@ -231,6 +237,7 @@ All configuration is via environment variables. No config files required.
 | `X402_REQUIRE_APPROVAL_FOR_NEW_HOST` | `false` | Require user approval before paying new hosts |
 | `X402_DAILY_BUDGET_USDC` | *(none)* | Daily USDC spending cap |
 | `X402_MAX_USDC_PER_PAYMENT` | *(none)* | Max USDC per single payment (CLI backend requires this) |
+| `X402_ALLOW_CHAT_OTP` | `false` | Allow OTP through chat (not secure/private — OTP passes through conversation history) |
 
 ### Circle Credentials
 

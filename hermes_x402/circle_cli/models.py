@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 @dataclass(frozen=True)
 class CircleCliResult:
-    argv: tuple[str, ...]
+    argv: tuple[str, ...]  # OTP values are redacted to [REDACTED] for safety
     exit_code: int
     stdout: str
     stderr: str

@@ -38,7 +38,10 @@ from hermes_x402.buyer.errors import (
     BuyerError,
     PaymentSubmissionUnknownError,
 )
-from hermes_x402.circle_cli.errors import CircleCliError
+from hermes_x402.circle_cli.errors import (
+    CircleCliError,
+    CircleCliPaymentOutcomeUnknownError,
+)
 from hermes_x402.hermes_plugin.errors import format_error_result, format_success_result
 from hermes_x402.hermes_plugin.output import safe_wallet_address
 from hermes_x402.hermes_plugin.runtime import get_runtime
@@ -397,7 +400,7 @@ def register_status_tools(ctx: Any) -> None:
 def register_wallet_tools(ctx: Any) -> None:
     """Register x402_wallet_status and x402_wallet_balance tools."""
 
-    def wallet_status_handler(**kwargs: Any) -> str:
+    async def wallet_status_handler(**kwargs: Any) -> str:
         runtime = get_runtime()
         runtime.ensure_initialized()
 
@@ -422,28 +425,14 @@ def register_wallet_tools(ctx: Any) -> None:
         next_tool = "x402_service_search"
 
         if runtime.backend_name == "cli" and runtime.cli_client:
-            import asyncio
-
-            loop = asyncio.get_event_loop()
-
             # Circle CLI availability + version
-            cli_version = "unknown"
             try:
-                if loop.is_running():
-                    # Synchronous fallback — version check is best-effort
-                    result["cli_executable"] = (
-                        runtime.config.circle_cli_executable if runtime.config else "circle"
-                    )
-                    result["cli_available"] = True
-                    result["cli_version"] = "check_required"
-                else:
-                    ver = loop.run_until_complete(runtime.cli_client.version())
-                    cli_version = ver.value
-                    result["cli_executable"] = (
-                        runtime.config.circle_cli_executable if runtime.config else "circle"
-                    )
-                    result["cli_available"] = True
-                    result["cli_version"] = cli_version
+                ver = await runtime.cli_client.version()
+                result["cli_executable"] = (
+                    runtime.config.circle_cli_executable if runtime.config else "circle"
+                )
+                result["cli_available"] = True
+                result["cli_version"] = ver.value
             except Exception:
                 result["cli_executable"] = (
                     runtime.config.circle_cli_executable if runtime.config else "circle"
@@ -456,19 +445,13 @@ def register_wallet_tools(ctx: Any) -> None:
             session_environment = "unknown"
             terms_accepted = False
             try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    status = loop.run_until_complete(runtime.cli_client.agent_wallet_status())
-                    session_valid = status.authenticated
-                    session_environment = (
-                        "testnet" if status.testnet_status == "VALID" else "mainnet"
-                    )
-                    terms_accepted = status.terms_accepted
-                    if status.email and "@" in status.email:
-                        local, domain = status.email.split("@", 1)
-                        result["email_masked"] = (
-                            f"{local[0]}{'*' * max(len(local) - 1, 0)}@{domain}"
-                        )
+                status = await runtime.cli_client.agent_wallet_status()
+                session_valid = status.authenticated
+                session_environment = "testnet" if status.testnet_status == "VALID" else "mainnet"
+                terms_accepted = status.terms_accepted
+                if status.email and "@" in status.email:
+                    local, domain = status.email.split("@", 1)
+                    result["email_masked"] = f"{local[0]}{'*' * max(len(local) - 1, 0)}@{domain}"
             except Exception:
                 pass
 
@@ -490,14 +473,12 @@ def register_wallet_tools(ctx: Any) -> None:
 
             # Wallet existence
             wallet_exists = False
-            if runtime.wallet_address and not loop.is_running():
+            if runtime.wallet_address:
                 try:
-                    wallets = loop.run_until_complete(
-                        runtime.cli_client.list_wallets(
-                            network=runtime.config.circle_cli_network or runtime.config.blockchain
-                            if runtime.config
-                            else runtime.network
-                        )
+                    wallets = await runtime.cli_client.list_wallets(
+                        network=runtime.config.circle_cli_network or runtime.config.blockchain
+                        if runtime.config
+                        else runtime.network
                     )
                     wallet_exists = any(
                         w.address.lower() == runtime.wallet_address.lower() for w in wallets
@@ -515,34 +496,27 @@ def register_wallet_tools(ctx: Any) -> None:
                 )
 
             # Canonical CAIP-2 network
-            if not loop.is_running():
-                try:
-                    network_code = (
-                        runtime.config.circle_cli_network or runtime.config.blockchain
-                        if runtime.config
-                        else runtime.network
-                    )
-                    caip2 = loop.run_until_complete(
-                        runtime.cli_client.network_x402_identifier(network_code)
-                    )
-                    result["canonical_caip2"] = caip2
-                except Exception:
-                    result["canonical_caip2"] = "resolution_failed"
-            else:
-                result["canonical_caip2"] = "async_unavailable"
+            try:
+                network_code = (
+                    runtime.config.circle_cli_network or runtime.config.blockchain
+                    if runtime.config
+                    else runtime.network
+                )
+                caip2 = await runtime.cli_client.network_x402_identifier(network_code)
+                result["canonical_caip2"] = caip2
+            except Exception:
+                result["canonical_caip2"] = "resolution_failed"
 
             # On-chain wallet USDC balance (best-effort)
-            if wallet_exists and runtime.wallet_address and not loop.is_running():
+            if wallet_exists and runtime.wallet_address:
                 try:
                     network_code = (
                         runtime.config.circle_cli_network or runtime.config.blockchain
                         if runtime.config
                         else runtime.network
                     )
-                    balances = loop.run_until_complete(
-                        runtime.cli_client.get_balance(
-                            wallet_address=runtime.wallet_address, network=network_code
-                        )
+                    balances = await runtime.cli_client.get_balance(
+                        wallet_address=runtime.wallet_address, network=network_code
                     )
                     usdc_balance = "0"
                     for b in balances:
@@ -554,17 +528,15 @@ def register_wallet_tools(ctx: Any) -> None:
                     result["on_chain_usdc_balance"] = "unavailable"
 
             # Gateway balance (best-effort)
-            if wallet_exists and runtime.wallet_address and not loop.is_running():
+            if wallet_exists and runtime.wallet_address:
                 try:
                     network_code = (
                         runtime.config.circle_cli_network or runtime.config.blockchain
                         if runtime.config
                         else runtime.network
                     )
-                    gw = loop.run_until_complete(
-                        runtime.cli_client.gateway_balance(
-                            wallet_address=runtime.wallet_address, network=network_code
-                        )
+                    gw = await runtime.cli_client.gateway_balance(
+                        wallet_address=runtime.wallet_address, network=network_code
                     )
                     result["gateway_usdc_balance"] = gw.total_usdc
                 except Exception:
@@ -593,24 +565,39 @@ def register_wallet_tools(ctx: Any) -> None:
         gw_balance_str = result.get("gateway_usdc_balance")
         gateway_funding_ready = False
         if gw_balance_str and gw_balance_str != "unavailable":
-            import contextlib
-
-            with contextlib.suppress(InvalidOperation, ValueError, TypeError):
-                gateway_funding_ready = Decimal(gw_balance_str) > Decimal("0")
+            try:
+                gw_decimal = Decimal(gw_balance_str)
+                if gw_decimal.is_finite():
+                    gateway_funding_ready = gw_decimal > Decimal("0")
+            except (InvalidOperation, ValueError):
+                pass
 
         result["buyer_runtime_ready"] = buyer_runtime_ready
         result["gateway_funding_ready"] = gateway_funding_ready
 
+        # Separate blockers for buyer vs gateway
+        buyer_blockers: list[dict[str, str]] = []
+        gateway_blockers: list[dict[str, str]] = []
+
+        for blocker in blockers:
+            if blocker["code"] in ("gateway_balance_insufficient",):
+                gateway_blockers.append(blocker)
+            else:
+                buyer_blockers.append(blocker)
+
         if not gateway_funding_ready and buyer_runtime_ready:
             next_tool = "x402_gateway_balance"
-            blockers.append(
+            gateway_blockers.append(
                 {
-                    "code": "gateway_balance_insufficient",
+                    "code": "gateway_balance_empty",
                     "next_tool": "x402_gateway_deposit_preview",
                 }
             )
 
-        result["blockers"] = blockers
+        result["blockers"] = {
+            "buyer": buyer_blockers,
+            "gateway": gateway_blockers,
+        }
         result["next_tool"] = next_tool
 
         return format_success_result(result)
@@ -619,7 +606,8 @@ def register_wallet_tools(ctx: Any) -> None:
         name="x402_wallet_status",
         toolset="x402",
         schema=X402_WALLET_STATUS_SCHEMA,
-        handler=lambda args, **kw: wallet_status_handler(**kw),
+        handler=wallet_status_handler,
+        is_async=True,
         description=(
             "Report Circle wallet status: CLI installation, authentication, "
             "session validity, terms state, wallet existence, on-chain balance, "
@@ -1484,27 +1472,36 @@ def register_login_tools(ctx: Any) -> None:
                 }
             )
 
-        # Check existing session first
+        # Fail-closed: check existing session first
         try:
             status = await runtime.cli_client.agent_wallet_status()
-            if status.authenticated:
-                return format_success_result(
-                    {
-                        "success": False,
-                        "error": "session_active",
-                        "message": "A valid session already exists. No login needed.",
-                    }
-                )
-            if not status.terms_accepted:
-                return format_success_result(
-                    {
-                        "success": False,
-                        "error": "terms_action_required",
-                        "message": ("Circle Terms of Use must be accepted manually before login."),
-                    }
-                )
         except Exception:
-            pass  # Proceed with login attempt
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "session_status_unknown",
+                    "retry_safe": True,
+                    "message": "Could not determine Circle session status.",
+                }
+            )
+
+        if status.authenticated:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "session_active",
+                    "message": "A valid session already exists. No login needed.",
+                }
+            )
+
+        if not status.terms_accepted:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "terms_action_required",
+                    "message": "Circle Terms of Use must be accepted manually before login.",
+                }
+            )
 
         # Expire pending logins before rejecting parallel login
         now = time.time()
@@ -1512,7 +1509,7 @@ def register_login_tools(ctx: Any) -> None:
         for k in expired:
             _pending_logins.pop(k, None)
 
-        # Reject parallel pending logins
+        # Reject parallel pending logins (only for active, non-expired entries)
         active = [k for k, v in _pending_logins.items() if v.get("active")]
         if active:
             return format_success_result(
@@ -1537,13 +1534,51 @@ def register_login_tools(ctx: Any) -> None:
                 "created_at": now,
                 "expires_at": now + 300,  # 5-minute expiry
             }
+
+            # Determine if chat OTP is available
+            allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
+
+            next_actions = [
+                {
+                    "action": "manual_cli_login",
+                    "description": (
+                        "Recommended: Complete login through Circle CLI in your terminal. "
+                        "The OTP never enters Hermes chat."
+                    ),
+                    "command": "circle wallet login --type agent",
+                }
+            ]
+
+            if allow_chat_otp:
+                next_actions.append(
+                    {
+                        "action": "x402_login_complete",
+                        "description": (
+                            "Optional: Send the OTP through chat. "
+                            "WARNING: The OTP will pass through the conversation "
+                            "and model/tool context."
+                        ),
+                        "warning": (
+                            "Chat OTP is not secure or private. "
+                            "The plugin does not intentionally persist or log it, "
+                            "but it will exist in conversation history."
+                        ),
+                    }
+                )
+
             return format_success_result(
                 {
                     "success": True,
                     "login_id": login_id,
                     "email_masked": result.email_masked,
                     "otp_required": result.otp_required,
-                    "message": "OTP sent to your email. Use x402_login_complete with the OTP.",
+                    "chat_otp_available": allow_chat_otp,
+                    "next_actions": next_actions,
+                    "message": (
+                        "OTP sent to your email. "
+                        "Use the manual CLI login (recommended) or "
+                        "x402_login_complete with the OTP (if enabled)."
+                    ),
                 }
             )
         except Exception as exc:
@@ -1557,8 +1592,11 @@ def register_login_tools(ctx: Any) -> None:
         is_async=True,
         description=(
             "Start Circle Agent Wallet email OTP login. Only runs when no "
-            "valid session exists. Returns an opaque login request ID. Never "
-            "accepts or stores Circle Terms of Use. Apply expiry to pending login."
+            "valid session exists. Returns an opaque login_id with 5-minute "
+            "expiry. Choice A (recommended): manual CLI login — OTP never "
+            "enters chat. Choice B (optional, disabled by default): chat OTP "
+            "via x402_login_complete — requires X402_ALLOW_CHAT_OTP=true. "
+            "Never accepts or stores Circle Terms of Use."
         ),
     )
 
@@ -1574,14 +1612,41 @@ def register_login_tools(ctx: Any) -> None:
                 }
             )
 
-        login_id = args.get("request_id", "").strip()
+        # Check if chat OTP is allowed
+        allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
+        if not allow_chat_otp:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "chat_otp_disabled",
+                    "message": "Chat OTP login is disabled. Complete login through Circle CLI.",
+                    "next_action": "Use the manual Circle CLI login flow.",
+                }
+            )
+
+        login_id = args.get("login_id", "").strip()
         otp = args.get("otp", "").strip()
+        acknowledge = args.get("acknowledge_otp_exposure")
+
         if not login_id or not otp:
             return format_success_result(
                 {
                     "success": False,
                     "error": "invalid_input",
-                    "message": "Both request_id and otp are required.",
+                    "message": "Both login_id and otp are required.",
+                }
+            )
+
+        if acknowledge is not True:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "otp_exposure_not_acknowledged",
+                    "message": (
+                        "You must set acknowledge_otp_exposure=true. "
+                        "Chat OTP is not secure or private — the OTP passes "
+                        "through conversation and model/tool context."
+                    ),
                 }
             )
 
@@ -1639,9 +1704,12 @@ def register_login_tools(ctx: Any) -> None:
         handler=login_complete_handler,
         is_async=True,
         description=(
-            "Complete Circle Agent Wallet login with OTP. OTP exists in "
-            "memory only for the duration of the call. Never logs or returns "
-            "OTP. Failed OTP consumes the Circle request — require new login_start."
+            "Complete Circle Agent Wallet login with OTP via chat. "
+            "Disabled by default — requires X402_ALLOW_CHAT_OTP=true. "
+            "Requires acknowledge_otp_exposure=true. "
+            "OTP exists in memory only for the duration of the call. "
+            "Never logs or returns OTP. "
+            "Failed OTP consumes the login — require new login_start."
         ),
     )
 
@@ -1700,7 +1768,8 @@ def register_gateway_tools(ctx: Any) -> None:
         name="x402_gateway_balance",
         toolset="x402",
         schema=X402_GATEWAY_BALANCE_SCHEMA,
-        handler=lambda args, **kw: gateway_balance_handler(**kw),
+        handler=gateway_balance_handler,
+        is_async=True,
         description=(
             "Report Circle Gateway balance for the active wallet and configured "
             "network. Distinguishes Gateway balance from on-chain wallet USDC "
@@ -1731,7 +1800,29 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
+        # Require service_url, method, and amount
+        service_url = args.get("service_url", "").strip()
+        method = (args.get("method") or "").strip().upper()
         amount = args.get("amount", "").strip()
+
+        if not service_url:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "invalid_input",
+                    "message": "service_url is required.",
+                }
+            )
+        if method not in ALLOWED_HTTP_METHODS:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "invalid_input",
+                    "message": (
+                        f"HTTP method must be one of: {', '.join(sorted(ALLOWED_HTTP_METHODS))}"
+                    ),
+                }
+            )
         if not amount:
             return format_success_result(
                 {
@@ -1755,7 +1846,115 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
+        # Validate URL with public network policy
+        policy_mode = runtime.config.network_policy if runtime.config else "public"
+        policy_allowlist = runtime.config.host_allowlist if runtime.config else []
+        policy_allow_http = runtime.config.allow_http if runtime.config else False
+
+        err = _validate_allowed_url(
+            service_url, policy_allowlist, mode=policy_mode, allow_http=policy_allow_http
+        )
+        if err:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "host_rejected"
+                    if "allowlist" in err or "private" in err or "blocked" in err
+                    else "invalid_input",
+                    "message": err,
+                }
+            )
+
+        # DNS/SSRF validation
+        try:
+            from hermes_x402.dns_validator import resolve_and_validate_destination
+
+            await resolve_and_validate_destination(service_url)
+        except ValueError as exc:
+            return format_success_result(
+                {"success": False, "error": "destination_rejected", "message": str(exc)}
+            )
+
         network = runtime.config.circle_cli_network or runtime.config.blockchain
+
+        # Fetch fresh unpaid response to verify Gateway option
+        gateway_option_found = False
+        gateway_network = None
+        gateway_domain = None
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                kwargs_req: dict[str, Any] = {
+                    "method": method,
+                    "url": service_url,
+                    "follow_redirects": False,
+                }
+                response = await client.request(**kwargs_req)
+
+                if response.status_code != 402:
+                    return format_success_result(
+                        {
+                            "success": False,
+                            "error": "not_payment_required",
+                            "message": (
+                                f"Service returned {response.status_code}, "
+                                "not 402. No deposit needed."
+                            ),
+                            "next_tool": "x402_pay",
+                        }
+                    )
+
+                # Parse 402 payment options
+                content_type = response.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    try:
+                        body = json.loads(response.text)
+                        payment_options = (
+                            body if isinstance(body, list) else body.get("paymentOptions", [])
+                        )
+                        for opt in payment_options:
+                            if isinstance(opt, dict):
+                                payment_system = opt.get("paymentSystem", "")
+                                if (
+                                    "circle" in payment_system.lower()
+                                    or "gateway" in payment_system.lower()
+                                ):
+                                    gateway_option_found = True
+                                    gateway_network = opt.get("network", "")
+                                    gateway_domain = opt.get("domain")
+                                    break
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+        except httpx.HTTPError:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "service_unreachable",
+                    "message": "Could not reach the service to verify Gateway support.",
+                }
+            )
+
+        if not gateway_option_found:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "gateway_not_required",
+                    "message": "The service does not require Gateway funding.",
+                    "next_tool": "x402_pay",
+                }
+            )
+
+        # Verify Gateway network is compatible with configured network
+        if gateway_network and gateway_network.lower() != network.lower():
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "network_mismatch",
+                    "message": (
+                        f"Service Gateway network ({gateway_network}) "
+                        f"does not match configured network ({network})."
+                    ),
+                }
+            )
 
         # Verify session validity
         try:
@@ -1786,11 +1985,11 @@ def register_gateway_tools(ctx: Any) -> None:
             )
 
         # Verify wallet balance
+        usdc_balance = "0"
         try:
             balances = await runtime.cli_client.get_balance(
                 wallet_address=runtime.wallet_address, network=network
             )
-            usdc_balance = "0"
             for b in balances:
                 if b.symbol == "USDC":
                     usdc_balance = b.amount
@@ -1824,6 +2023,36 @@ def register_gateway_tools(ctx: Any) -> None:
         except Exception:
             pass  # Gateway balance is informational
 
+        # Resolve deposit method (fail-closed for Arc Testnet)
+        deposit_method = "direct"
+        # Arc Testnet direct deposit support must be verified
+        network_lower = network.lower()
+        if "arc" in network_lower and "testnet" in network_lower:
+            # Only allow direct if we can prove Arc Testnet supports it
+            # For now, reject if Gateway support cannot be proven for Arc Testnet
+            from hermes_x402.networks import list_networks
+
+            all_networks = list_networks()
+            arc_testnet_net = None
+            for net in all_networks:
+                if (
+                    net.key.lower() == network.lower()
+                    or net.display_name.lower() == network.lower()
+                ):
+                    arc_testnet_net = net
+                    break
+            if arc_testnet_net and not arc_testnet_net.gateway_supported:
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "arc_gateway_not_supported",
+                        "message": (
+                            "Arc Testnet Gateway deposit support cannot "
+                            f"be proven for network {network}."
+                        ),
+                    }
+                )
+
         # Configuration fingerprint
         config_fingerprint = hashlib.sha256(
             f"{runtime.wallet_address}:{network}".encode()
@@ -1835,7 +2064,18 @@ def register_gateway_tools(ctx: Any) -> None:
             "amount": amount,
             "wallet": runtime.wallet_address,
             "network": network,
-            "method": "direct",
+            "canonical_caip2": gateway_network or network,
+            "service_url": service_url,
+            "method": method,
+            "payment_option_fingerprint": hashlib.sha256(
+                json.dumps(
+                    {"network": gateway_network, "domain": gateway_domain}, sort_keys=True
+                ).encode()
+            ).hexdigest()[:16],
+            "gateway_scheme": "circle_gateway",
+            "gateway_destination_network": gateway_network,
+            "gateway_destination_domain": gateway_domain,
+            "deposit_method": deposit_method,
             "config_fingerprint": config_fingerprint,
             "created_at": time.time(),
             "expires_at": time.time() + 300,  # 5 minutes
@@ -1846,13 +2086,16 @@ def register_gateway_tools(ctx: Any) -> None:
             {
                 "success": True,
                 "preview_id": preview_id,
-                "masked_wallet": safe_wallet_address(runtime.wallet_address),
-                "network": network,
+                "service_url": service_url,
+                "method": method,
+                "wallet": safe_wallet_address(runtime.wallet_address),
                 "amount": amount,
-                "method": "direct",
-                "current_wallet_balance": usdc_balance,
-                "current_gateway_balance": gw_balance,
-                "expiry": _previews[preview_id]["expires_at"],
+                "deposit_method": deposit_method,
+                "source_network": network,
+                "gateway_destination": gateway_network,
+                "wallet_usdc_balance": usdc_balance,
+                "gateway_usdc_balance": gw_balance,
+                "expires_at": _previews[preview_id]["expires_at"],
                 "approval_required": True,
                 "message": (
                     "Preview created. Present deposit details to user for approval. "
@@ -1868,9 +2111,11 @@ def register_gateway_tools(ctx: Any) -> None:
         handler=deposit_preview_handler,
         is_async=True,
         description=(
-            "Preview a Gateway deposit without moving USDC. Accepts amount. "
-            "Verifies wallet, session, terms, and network support. "
-            "Returns a short-lived preview ID bound to config. "
+            "Preview a Gateway deposit for a specific service. Requires "
+            "service_url, HTTP method, and amount. Validates URL policy, "
+            "verifies the seller advertises a Gateway payment option, "
+            "checks network compatibility, session, terms, and wallet balance. "
+            "Returns a short-lived preview ID bound to all parameters. "
             "Read-only — must not move USDC."
         ),
     )
@@ -1988,6 +2233,89 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
+        # Reverify wallet has sufficient USDC
+        try:
+            balances = await runtime.cli_client.get_balance(
+                wallet_address=runtime.wallet_address, network=current_network
+            )
+            usdc_balance = "0"
+            for b in balances:
+                if b.symbol == "USDC":
+                    usdc_balance = b.amount
+                    break
+            if Decimal(usdc_balance) < Decimal(preview["amount"]):
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "insufficient_balance",
+                        "message": (
+                            f"On-chain USDC balance ({usdc_balance}) < "
+                            f"deposit amount ({preview['amount']})."
+                        ),
+                    }
+                )
+        except Exception as exc:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "balance_check_failed",
+                    "message": f"Could not verify wallet balance: {exc}",
+                }
+            )
+
+        # Re-verify service still advertises Gateway option (fresh challenge)
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                fresh_response = await client.request(
+                    method=preview["method"],
+                    url=preview["service_url"],
+                    follow_redirects=False,
+                )
+                if fresh_response.status_code != 402:
+                    return format_success_result(
+                        {
+                            "success": False,
+                            "error": "service_changed",
+                            "message": "Service no longer returns 402. Create a new preview.",
+                        }
+                    )
+                content_type = fresh_response.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    try:
+                        body = json.loads(fresh_response.text)
+                        payment_options = (
+                            body if isinstance(body, list) else body.get("paymentOptions", [])
+                        )
+                        still_has_gateway = False
+                        for opt in payment_options:
+                            if isinstance(opt, dict):
+                                ps = opt.get("paymentSystem", "")
+                                if "circle" in ps.lower() or "gateway" in ps.lower():
+                                    still_has_gateway = True
+                                    break
+                        if not still_has_gateway:
+                            return format_success_result(
+                                {
+                                    "success": False,
+                                    "error": "service_changed",
+                                    "message": (
+                                        "Service no longer advertises Gateway "
+                                        "payment. Create a new preview."
+                                    ),
+                                }
+                            )
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+        except httpx.HTTPError:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "service_unreachable",
+                    "message": "Could not reach service for revalidation. Do not proceed.",
+                    "retry_safe": False,
+                }
+            )
+
         # Mark consumed before submission
         preview["consumed"] = True
 
@@ -1997,7 +2325,6 @@ def register_gateway_tools(ctx: Any) -> None:
                 network=preview["network"],
                 amount=preview["amount"],
             )
-            _previews.pop(preview_id, None)
             output: dict[str, Any] = {
                 "success": True,
                 "status": result.status,
@@ -2008,9 +2335,20 @@ def register_gateway_tools(ctx: Any) -> None:
             if result.transaction_hash:
                 output["transaction_hash"] = result.transaction_hash
             return format_success_result(output)
+        except CircleCliPaymentOutcomeUnknownError:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "gateway_deposit_outcome_unknown",
+                    "retry_safe": False,
+                    "message": (
+                        "The Gateway deposit may have been submitted. "
+                        "Check balances or transaction status before any new deposit."
+                    ),
+                }
+            )
         except Exception as exc:
-            # Consumed previews remain unusable even after failure
-            _previews.pop(preview_id, None)
+            # Consumed tombstone remains — same-process replay rejected
             return format_error_result(exc)
 
     ctx.register_tool(
@@ -2023,7 +2361,7 @@ def register_gateway_tools(ctx: Any) -> None:
             "Execute a Gateway deposit using a preview ID from "
             "x402_gateway_deposit_preview. Do not accept replacement amount, "
             "wallet, network, or method. Revalidates session, config, wallet, "
-            "and preview expiry. Execute exactly once. "
+            "service, and preview expiry. Execute exactly once. "
             "retry_safe=false for ambiguous outcomes."
         ),
     )

@@ -262,8 +262,14 @@ class TestRegistration:
         register(fake_ctx)
 
         for tool in fake_ctx.tools:
-            # Some handlers use **kwargs only (wallet_balance), others take (args, **kwargs)
-            if tool["name"] in ("x402_wallet_balance",):
+            # Some handlers use **kwargs only (wallet_status, wallet_balance, gateway_balance),
+            # others take (args, **kwargs)
+            kwargs_only_tools = (
+                "x402_wallet_status",
+                "x402_wallet_balance",
+                "x402_gateway_balance",
+            )
+            if tool["name"] in kwargs_only_tools:
                 result = asyncio.run(_call_handler(tool["handler"], task_id="test"))
             else:
                 result = asyncio.run(_call_handler(tool["handler"], {}, task_id="test"))
@@ -382,7 +388,7 @@ class TestX402WalletStatus:
 
         register_wallet_tools(fake_ctx)
         handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(handler({}, task_id="test"))
+        result = json.loads(asyncio.run(_call_handler(handler, task_id="test")))
         assert result["success"] is True
         assert "configured" not in result or result.get("configured") is False
 
@@ -400,7 +406,7 @@ class TestX402WalletStatus:
         with patch.dict("os.environ", env, clear=False):
             register_wallet_tools(fake_ctx)
             handler = fake_ctx.tools[0]["handler"]
-            result_str = handler({}, task_id="test")
+            result_str = asyncio.run(_call_handler(handler, task_id="test"))
             assert "secret-value" not in result_str
             assert "key-value" not in result_str
 

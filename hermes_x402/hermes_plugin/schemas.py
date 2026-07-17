@@ -226,9 +226,12 @@ X402_PAY_SCHEMA: dict[str, Any] = {
 X402_LOGIN_START_SCHEMA: dict[str, Any] = {
     "name": "x402_login_start",
     "description": (
-        "Start Circle Agent Wallet email OTP login. Only runs when no valid "
-        "session exists. Returns an opaque login request ID. Never accepts "
-        "or stores Circle Terms of Use. Apply expiry to pending login."
+        "Start Circle Agent Wallet login. Supports two modes: "
+        "manual CLI (recommended) where the user runs a CLI command, "
+        "or chat OTP (optional, disabled by default) where the OTP is "
+        "delivered to this chat. Only runs when no valid session exists. "
+        "Returns an opaque login ID. Never accepts or stores Circle Terms "
+        "of Use. Apply expiry to pending login."
     ),
     "parameters": {
         "type": "object",
@@ -245,23 +248,32 @@ X402_LOGIN_START_SCHEMA: dict[str, Any] = {
 X402_LOGIN_COMPLETE_SCHEMA: dict[str, Any] = {
     "name": "x402_login_complete",
     "description": (
-        "Complete Circle Agent Wallet login with OTP. OTP exists in memory "
-        "only for the duration of the call. Never logs or returns OTP. "
+        "Complete Circle Agent Wallet login with OTP via chat. "
+        "Disabled by default — requires X402_ALLOW_CHAT_OTP=true and "
+        "acknowledge_otp_exposure=true. OTP exists in memory only for the "
+        "duration of the call. Never logs or returns OTP. "
         "Failed OTP consumes the Circle request — require new login_start."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "request_id": {
+            "login_id": {
                 "type": "string",
-                "description": "Opaque request ID from x402_login_start.",
+                "description": "Opaque login ID from x402_login_start.",
             },
             "otp": {
                 "type": "string",
                 "description": "One-time password from email.",
             },
+            "acknowledge_otp_exposure": {
+                "type": "boolean",
+                "description": (
+                    "Must be true to acknowledge that the OTP will be "
+                    "handled in chat. Required for chat OTP mode."
+                ),
+            },
         },
-        "required": ["request_id", "otp"],
+        "required": ["login_id", "otp", "acknowledge_otp_exposure"],
     },
 }
 
@@ -282,7 +294,8 @@ X402_GATEWAY_BALANCE_SCHEMA: dict[str, Any] = {
 X402_GATEWAY_DEPOSIT_PREVIEW_SCHEMA: dict[str, Any] = {
     "name": "x402_gateway_deposit_preview",
     "description": (
-        "Preview a Gateway deposit without moving USDC. Accepts amount. "
+        "Preview a service-bound Gateway deposit without moving USDC. "
+        "Accepts service URL, HTTP method, and amount. "
         "Verifies wallet, session, terms, and network support. "
         "Returns a short-lived preview ID bound to config. "
         "Read-only — must not move USDC."
@@ -290,12 +303,21 @@ X402_GATEWAY_DEPOSIT_PREVIEW_SCHEMA: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
+            "service_url": {
+                "type": "string",
+                "description": "URL of the x402 service for the deposit preview.",
+            },
+            "method": {
+                "type": "string",
+                "description": "HTTP method for the service request.",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+            },
             "amount": {
                 "type": "string",
                 "description": "USDC amount to preview depositing.",
             },
         },
-        "required": ["amount"],
+        "required": ["service_url", "method", "amount"],
     },
 }
 
