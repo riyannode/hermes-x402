@@ -1521,7 +1521,14 @@ def register_login_tools(ctx: Any) -> None:
                 }
             )
 
-        if status.authenticated:
+        # Check session for the configured environment specifically
+        network_code, is_testnet, cli_chain = _resolve_network_info(runtime)
+        if is_testnet:
+            session_valid = status.testnet_status == "VALID"
+        else:
+            session_valid = status.mainnet_status == "VALID"
+
+        if session_valid:
             return format_success_result(
                 {
                     "success": False,
@@ -1539,7 +1546,6 @@ def register_login_tools(ctx: Any) -> None:
                 }
             )
 
-        network_code, is_testnet, cli_chain = _resolve_network_info(runtime)
         testnet_flag = " --testnet" if is_testnet else ""
 
         # manual_cli mode: do NOT call login_start(), just return the command
@@ -1890,6 +1896,16 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
+        # Enforce 0.5 USDC minimum deposit BEFORE any network calls
+        if parsed_amount < Decimal("0.5"):
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "minimum_deposit_not_met",
+                    "message": (f"Minimum Gateway deposit is 0.5 USDC. Requested: {amount}."),
+                }
+            )
+
         # Validate URL with public network policy
         policy_mode = runtime.config.network_policy if runtime.config else "public"
         policy_allowlist = runtime.config.host_allowlist if runtime.config else []
@@ -2099,6 +2115,19 @@ def register_gateway_tools(ctx: Any) -> None:
 
         # Body hash for deterministic body comparison
         body = args.get("body") if method in {"POST", "PUT", "PATCH"} else None
+        # Bound body size to 64KB for storage
+        if body is not None:
+            import json as _json
+
+            body_bytes = _json.dumps(body, sort_keys=True, default=str).encode()
+            if len(body_bytes) > 65536:  # 64KB
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "invalid_input",
+                        "message": "Request body exceeds 64KB limit.",
+                    }
+                )
         body_hash = (
             hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:16]
             if body is not None
@@ -2117,6 +2146,7 @@ def register_gateway_tools(ctx: Any) -> None:
                     "asset": gateway_option.asset,
                     "pay_to": gateway_option.pay_to,
                     "max_timeout_seconds": gateway_option.max_timeout_seconds,
+                    "x402_version": support.version,
                 },
                 sort_keys=True,
             ).encode()
@@ -2141,6 +2171,7 @@ def register_gateway_tools(ctx: Any) -> None:
             "service_url": service_url,
             "method": method,
             "body_hash": body_hash,
+            "body": body,  # Stored for revalidation, never in output
             # Wallet and config
             "wallet": runtime.wallet_address,
             "wallet_network": network,
@@ -2367,7 +2398,7 @@ def register_gateway_tools(ctx: Any) -> None:
                         "error": "insufficient_balance",
                         "message": (
                             f"On-chain USDC balance ({usdc_balance}) < "
-                            f"deposit amount ({preview['amount']})."
+                            f"deposit amount ({preview['deposit_amount']})."
                         ),
                     }
                 )
@@ -2387,6 +2418,7 @@ def register_gateway_tools(ctx: Any) -> None:
             fresh_support = await check_supports(
                 preview["service_url"],
                 method=preview["method"],
+                body=preview.get("body"),  # Pass stored body for revalidation
                 config=runtime.config,
             )
         except Exception as exc:
@@ -2408,45 +2440,36 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Find the matching gateway option with exact fingerprint
+        # Find ALL compatible gateway options and search for exact fingerprint
         fresh_gateway_option = None
         for opt in fresh_support.options:
             if opt.payment_system == "gateway_batching" and opt.supported_by_backend:
-                fresh_gateway_option = opt
-                break
+                # Recompute fingerprint from this option
+                opt_fingerprint = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "scheme": opt.scheme,
+                            "payment_system": opt.payment_system,
+                            "network": opt.network,
+                            "network_id": opt.network_id,
+                            "amount_atomic": opt.amount_atomic,
+                            "asset": opt.asset,
+                            "pay_to": opt.pay_to,
+                            "max_timeout_seconds": opt.max_timeout_seconds,
+                            "x402_version": fresh_support.version,
+                        },
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest()[:16]
+                if opt_fingerprint == preview.get("service_option_fingerprint"):
+                    fresh_gateway_option = opt
+                    break
 
         if not fresh_gateway_option:
             return format_success_result(
                 {
                     "success": False,
                     "error": "service_changed",
-                    "message": "Gateway option no longer compatible. Create a new preview.",
-                }
-            )
-
-        # Recompute service payment-option fingerprint from fresh option
-        fresh_fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "scheme": fresh_gateway_option.scheme,
-                    "payment_system": fresh_gateway_option.payment_system,
-                    "network": fresh_gateway_option.network,
-                    "network_id": fresh_gateway_option.network_id,
-                    "amount_atomic": fresh_gateway_option.amount_atomic,
-                    "asset": fresh_gateway_option.asset,
-                    "pay_to": fresh_gateway_option.pay_to,
-                    "max_timeout_seconds": fresh_gateway_option.max_timeout_seconds,
-                },
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()[:16]
-
-        # Reject if service payment-option fingerprint changed
-        if preview.get("service_option_fingerprint") != fresh_fingerprint:
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "payment_option_changed",
                     "message": (
                         "Service payment option changed since preview. Create a new preview."
                     ),

@@ -230,6 +230,8 @@ class TestLoginLifecycle:
         status = MagicMock()
         status.authenticated = True
         status.terms_accepted = True
+        status.testnet_status = "VALID"  # For ARC-TESTNET
+        status.mainnet_status = "NOT_LOGGED_IN"
         rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
 
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):

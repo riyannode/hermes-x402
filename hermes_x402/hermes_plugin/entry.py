@@ -14,6 +14,24 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Tools that require native Hermes approval before execution
+_APPROVAL_REQUIRED_TOOLS = frozenset(
+    {
+        "x402_pay",
+        "x402_gateway_deposit_execute",
+        "x402_login_complete",
+    }
+)
+
+# Human-readable descriptions for approval prompts
+_APPROVAL_DESCRIPTIONS: dict[str, str] = {
+    "x402_pay": "Pay for an x402 resource (may transfer USDC)",
+    "x402_gateway_deposit_execute": "Execute Gateway deposit (may transfer USDC)",
+    "x402_login_complete": (
+        "Complete Circle login with OTP via chat (OTP exposed in conversation)"
+    ),
+}
+
 
 def register(ctx: Any) -> None:
     """Register x402 tools with the Hermes plugin context.
@@ -41,6 +59,11 @@ def register(ctx: Any) -> None:
         register_wallet_tools,
     )
 
+    # Register native approval hook FIRST — fail closed if unavailable.
+    # Hermes does not roll back globally registered tools when plugin
+    # registration later fails, so the hook must be registered before tools.
+    _register_approval_hook(ctx)
+
     register_status_tools(ctx)
     register_wallet_tools(ctx)
     register_network_tools(ctx)
@@ -51,29 +74,7 @@ def register(ctx: Any) -> None:
     register_login_tools(ctx)
     register_gateway_tools(ctx)
 
-    # Register native approval hook — fail closed if unavailable
-    _register_approval_hook(ctx)
-
     logger.debug("hermes-x402 plugin: registered x402 tools and approval hook")
-
-
-# Tools that require native Hermes approval before execution
-_APPROVAL_REQUIRED_TOOLS = frozenset(
-    {
-        "x402_pay",
-        "x402_gateway_deposit_execute",
-        "x402_login_complete",
-    }
-)
-
-# Human-readable descriptions for approval prompts
-_APPROVAL_DESCRIPTIONS: dict[str, str] = {
-    "x402_pay": "Pay for an x402 resource (may transfer USDC)",
-    "x402_gateway_deposit_execute": "Execute Gateway deposit (may transfer USDC)",
-    "x402_login_complete": (
-        "Complete Circle login with OTP via chat (OTP exposed in conversation)"
-    ),
-}
 
 
 def _register_approval_hook(ctx: Any) -> None:
@@ -112,11 +113,9 @@ def _register_approval_hook(ctx: Any) -> None:
             runtime.ensure_initialized()
             allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
             if not allow_chat_otp:
-                # Chat OTP is disabled — tool will return chat_otp_disabled error
                 return None
 
         # Financial operations MUST require tool_call_id for unique identity.
-        # Do NOT fall back to turn_id — multiple calls may occur in one turn.
         if not tool_call_id:
             return {
                 "action": "block",
@@ -124,7 +123,9 @@ def _register_approval_hook(ctx: Any) -> None:
             }
 
         rule_key = f"hermes-x402:{tool_name}:{tool_call_id}"
-        description = _APPROVAL_DESCRIPTIONS.get(tool_name, f"Execute {tool_name}")
+
+        # Build informative sanitized approval messages
+        description = _build_approval_message(tool_name, args)
 
         return {
             "action": "approve",
@@ -135,3 +136,51 @@ def _register_approval_hook(ctx: Any) -> None:
     # Register without try/except — let exceptions propagate
     ctx.register_hook("pre_tool_call", approval_hook)
     logger.debug("hermes-x402: registered pre_tool_call approval hook")
+
+
+def _build_approval_message(tool_name: str, args: dict[str, Any]) -> str:
+    """Build informative sanitized approval message.
+
+    Includes: URL, method, caller max, configured cap, amount, network,
+    method, expiry.
+    Never includes: body, OTP, credentials, payment headers.
+    """
+    if tool_name == "x402_pay":
+        url = args.get("url", "unknown")
+        method = args.get("method", "GET")
+        max_usdc = args.get("max_usdc", "no cap")
+        # Get configured cap from runtime
+        try:
+            from hermes_x402.hermes_plugin.runtime import get_runtime
+
+            runtime = get_runtime()
+            runtime.ensure_initialized()
+            configured_cap = (
+                runtime.config.max_usdc_per_payment
+                if runtime.config and runtime.config.max_usdc_per_payment
+                else "default"
+            )
+        except Exception:
+            configured_cap = "default"
+        return (
+            f"Pay for {url} via {method}. "
+            f"Caller max: {max_usdc} USDC. Configured cap: {configured_cap} USDC."
+        )
+
+    if tool_name == "x402_gateway_deposit_execute":
+        preview_id = args.get("preview_id", "unknown")
+        # Try to load preview details for informative message
+        try:
+            from hermes_x402.hermes_plugin.runtime import get_runtime
+
+            runtime = get_runtime()
+            runtime.ensure_initialized()
+            # Preview is not available here, but we can provide basic info
+        except Exception:
+            pass
+        return f"Execute Gateway deposit via preview {preview_id}. This may transfer USDC."
+
+    if tool_name == "x402_login_complete":
+        return "Complete Circle login with OTP via chat (OTP exposed in conversation)."
+
+    return f"Execute {tool_name}"

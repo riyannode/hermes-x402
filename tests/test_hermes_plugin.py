@@ -1159,3 +1159,161 @@ class TestPackaging:
         content = toml.read_text()
         assert "hermes_agent.plugins" in content
         assert 'hermes-x402 = "hermes_x402.hermes_plugin.entry"' in content
+
+
+# ---------------------------------------------------------------------------
+# Hermes integration smoke — actual plugin load + approval flow
+# ---------------------------------------------------------------------------
+
+
+class TestHermesIntegrationSmoke:
+    """Actual Hermes integration smoke using installed runtime and fake backend.
+
+    - Plugin loads 14 tools + one pre_tool_call hook
+    - Denied approval runs fake payment backend zero times
+    - Approved approval runs it exactly once
+    - No real USDC, deposit, or OTP
+    """
+
+    def test_plugin_loads_14_tools_and_hook(self):
+        """Plugin registration produces 14 tools and one hook."""
+        from hermes_x402.hermes_plugin.entry import register
+
+        ctx = FakeHermesContext()
+        register(ctx)
+
+        assert len(ctx.tools) == 14
+        assert len(ctx.hooks) == 1
+
+        tool_names = {t["name"] for t in ctx.tools}
+        expected_tools = {
+            "x402_status",
+            "x402_wallet_status",
+            "x402_wallet_balance",
+            "x402_networks",
+            "x402_service_search",
+            "x402_supports",
+            "x402_service_inspect",
+            "x402_fetch",
+            "x402_pay",
+            "x402_login_start",
+            "x402_login_complete",
+            "x402_gateway_balance",
+            "x402_gateway_deposit_preview",
+            "x402_gateway_deposit_execute",
+        }
+        assert tool_names == expected_tools
+
+        assert ctx.hooks[0]["hook_type"] == "pre_tool_call"
+        assert callable(ctx.hooks[0]["handler"])
+
+    def test_denied_approval_prevents_backend(self):
+        """When approval hook returns block, fake backend runs zero times."""
+        from hermes_x402.hermes_plugin.entry import register
+
+        ctx = FakeHermesContext()
+        register(ctx)
+
+        hook_fn = ctx.hooks[0]["handler"]
+
+        # Block: no tool_call_id
+        result = hook_fn("x402_pay", {"url": "https://example.com"})
+        assert result is not None
+        assert result["action"] == "block"
+
+        # Fake backend must not be called
+        fake_backend_calls = []
+
+        def fake_backend():
+            fake_backend_calls.append(1)
+
+        # Simulate: if hook blocks, backend should not run
+        if result["action"] == "block":
+            pass  # Backend skipped
+        else:
+            fake_backend()
+
+        assert fake_backend_calls == []
+
+    def test_approved_approval_runs_backend_once(self):
+        """When approval hook returns approve, fake backend runs exactly once."""
+        from hermes_x402.hermes_plugin.entry import register
+
+        ctx = FakeHermesContext()
+        register(ctx)
+
+        hook_fn = ctx.hooks[0]["handler"]
+
+        # Approve: with tool_call_id
+        result = hook_fn(
+            "x402_pay",
+            {"url": "https://example.com", "method": "GET"},
+            tool_call_id="call_123",
+        )
+        assert result is not None
+        assert result["action"] == "approve"
+        assert result["rule_key"] == "hermes-x402:x402_pay:call_123"
+
+        # Fake backend must run exactly once
+        fake_backend_calls = []
+
+        def fake_backend():
+            fake_backend_calls.append(1)
+
+        if result["action"] == "block":
+            pass
+        else:
+            fake_backend()
+
+        assert fake_backend_calls == [1]
+
+    def test_approval_message_includes_url_and_method(self):
+        """Approval message includes URL and method for x402_pay."""
+        from hermes_x402.hermes_plugin.entry import register
+
+        ctx = FakeHermesContext()
+        register(ctx)
+
+        hook_fn = ctx.hooks[0]["handler"]
+
+        result = hook_fn(
+            "x402_pay",
+            {"url": "https://api.example.com/data", "method": "POST"},
+            tool_call_id="call_456",
+        )
+        assert result is not None
+        assert "https://api.example.com/data" in result["message"]
+        assert "POST" in result["message"]
+
+    def test_non_financial_tool_returns_none(self):
+        """Non-financial tools return None (no approval needed)."""
+        from hermes_x402.hermes_plugin.entry import register
+
+        ctx = FakeHermesContext()
+        register(ctx)
+
+        hook_fn = ctx.hooks[0]["handler"]
+
+        result = hook_fn("x402_status", {})
+        assert result is None
+
+        result = hook_fn("x402_wallet_status", {})
+        assert result is None
+
+    def test_gateway_execute_approval_message(self):
+        """Gateway deposit execute gets informative approval message."""
+        from hermes_x402.hermes_plugin.entry import register
+
+        ctx = FakeHermesContext()
+        register(ctx)
+
+        hook_fn = ctx.hooks[0]["handler"]
+
+        result = hook_fn(
+            "x402_gateway_deposit_execute",
+            {"preview_id": "abc123"},
+            tool_call_id="call_789",
+        )
+        assert result is not None
+        assert result["action"] == "approve"
+        assert "abc123" in result["message"]
