@@ -12,9 +12,9 @@ Circle Gateway x402 integration for [Hermes Agent](https://github.com/NousResear
 | `buyer` | none | explicitly selected backend |
 | `dual` | payout address | explicitly selected backend |
 
-A seller only needs a validated **payout address**. It does not need buyer wallet IDs, an entity secret, Circle API credentials, a Circle CLI session, or any buyer-backend selection. A buyer creates a payment proof using one selected backend.
+A buyer uses one explicitly selected backend; it either creates a payment proof (DCW) or invokes an official managed payment flow (CLI).
 
-This release implements `dcw` through Circle Developer-Controlled Wallets. `cli` is reserved for a later Circle Agent Wallet / Circle CLI PR and raises `UnsupportedBuyerBackendError`; it does not contain a stub payment implementation.
+This release implements `dcw` through Circle Developer-Controlled Wallets and `cli` through the official Circle Agent Wallet CLI. The CLI is a **managed payment** backend: Circle CLI—not this library—creates payment authorization, executes payment, and performs the protected fetch. It is intentionally selected only by `buyer_backend="cli"` and never inferred from a logged-in CLI session.
 
 In dual role, seller and buyer wallet addresses are separate. The current safety behavior rejects equal addresses to prevent a Gateway self-transfer.
 
@@ -66,6 +66,56 @@ result = await tool.pay("https://api.example.com/premium")
 ```
 
 `CircleDcwBuyerBackend` owns entity-public-key retrieval/caching, fresh RSA-OAEP entity-secret encryption for every signing request, DCW `signTypedData`, signature normalization, and the existing nested EIP-3009/x402 proof wire format. The common buyer layer does not receive or serialize the entity secret.
+
+## Buyer with Circle Agent Wallet CLI
+
+| Backend | Payment model | Credentials in Python | Wallet selection |
+|---|---|---|---|
+| `dcw` | library creates proof and retries resource | DCW entity secret | DCW wallet ID + address |
+| `cli` | Circle CLI discovers, pays, and fetches | none | explicit Agent Wallet address + CLI chain |
+
+Install the official CLI (currently verified against `@circle-fin/cli` **0.0.6**, Node.js **>=20.18.2**):
+
+```bash
+npm install -g @circle-fin/cli
+circle --version
+# Human-operated only: login and any Terms consent must happen outside this library.
+circle wallet status --type agent --output json
+circle blockchain list --output json
+circle wallet list --chain BASE --type agent --output json
+circle wallet balance --address 0xBuyer --chain BASE --output json
+```
+
+Use a chain returned by `circle blockchain list --output json`; this library does not claim support for a network merely because a configuration value exists. The CLI backend verifies its version, the configured chain, authenticated Agent Wallet session, and the explicitly selected address before its first payment. It never chooses the first wallet or creates a wallet.
+
+```python
+from hermes_x402 import X402Config, X402HermesAgent
+
+config = X402Config(
+    role="dual",
+    seller_address="0xSeller...",       # seller payout address
+    buyer_backend="cli",
+    circle_cli_wallet_address="0xBuyer...",  # Agent Wallet address; distinct identity
+    circle_cli_network="BASE",
+    max_usdc_per_payment="0.01",
+    host_allowlist=["api.example.com"],
+)
+agent = X402HermesAgent.from_config(config)
+result = await agent.pay("https://api.example.com/premium")
+```
+
+Environment equivalents are `X402_BUYER_BACKEND=cli`, `CIRCLE_AGENT_WALLET_ADDRESS`, and `CIRCLE_AGENT_WALLET_NETWORK`. The runtime permits only the official `circle` executable and no custom CLI working directory. CLI configuration requires a non-empty `max_usdc_per_payment`; the library canonicalizes it as decimal USDC and always passes it as `--max-amount`. CLI configuration and DCW credentials are mutually exclusive. CLI configuration is rejected for seller-only role.
+
+> **Payment safety:** URL/host and amount cap validation occur before `circle services pay`. The library passes an explicit `--max-amount` cap and strips caller-supplied payment headers. It never retries login, OTP, Terms, wallet creation, or payment. A process timeout after payment starts is `PaymentSubmissionUnknownError`; inspect Circle CLI/payment state manually rather than retrying.
+
+The backend uses the documented CLI managed command equivalent to:
+
+```bash
+circle services pay <url> --address <configured-address> --chain <configured-chain> \
+  -X <method> --max-amount <cap> --output json
+```
+
+Circle CLI owns `Payment-Signature` creation and the paid fetch. Consequently this backend does **not** expose `create_payment_proof`. See [the focused CLI design note](docs/circle-cli-backend.md) for the exact JSON envelope and known CLI x402 v1 limitation.
 
 ## Legacy DCW buyer API
 
@@ -143,4 +193,4 @@ uv pip install --python .venv/bin/python -e '.[dev]'
 
 ## Non-scope
 
-This version does not implement Circle CLI, Agent Wallet provisioning/login, automatic backend detection, native Hermes plugin registration, `plugin.yaml`, Hermes slash commands, seller custody/backends, automatic payment retries, or a database/web UI.
+This version does not implement automatic Circle CLI login, OTP submission, Terms acceptance, seller wallet provisioning, automatic backend detection, native Hermes plugin registration, `plugin.yaml`, Hermes slash commands, seller custody/backends, automatic payment retries, or a database/web UI.

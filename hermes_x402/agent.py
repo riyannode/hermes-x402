@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from aiohttp import web
 
+from hermes_x402.backends.circle_cli import CircleCliBuyerBackend
 from hermes_x402.backends.circle_dcw import CircleDcwBuyerBackend
 from hermes_x402.buyer import BuyerBackend, X402BuyerService, X402BuyerTool, create_buyer_tool
 from hermes_x402.buyer.errors import BuyerConfigurationError
 from hermes_x402.buyer.policy import PaymentPolicy
+from hermes_x402.circle_cli import CircleCliClient, CircleCliRunner
 from hermes_x402.config import X402Config
 from hermes_x402.context import X402ContextBridge
 from hermes_x402.middleware import create_aiohttp_middleware
@@ -106,7 +108,7 @@ class X402HermesAgent:
                 raise BuyerConfigurationError("X402HermesAgent.from_config requires role='dual'")
 
         if config.role is None or config.buyer_backend == "dcw":
-            backend = CircleDcwBuyerBackend(
+            backend: BuyerBackend = CircleDcwBuyerBackend(
                 wallet_id=config.wallet_id,
                 wallet_address=config.wallet_address,
                 entity_secret=config.entity_secret,
@@ -114,15 +116,23 @@ class X402HermesAgent:
                 blockchain=config.blockchain,
                 chain=config.chain,
             )
-            return cls(
-                seller_address=config.seller_address,
-                chain=config.chain,
-                facilitator_url=config.facilitator_url,
-                buyer_backend=backend,
-                buyer_max_usdc=config.max_usdc_per_payment,
-                buyer_host_allowlist=config.host_allowlist,
+        elif config.buyer_backend == "cli":
+            runner = CircleCliRunner()
+            backend = CircleCliBuyerBackend(
+                wallet_address_value=config.circle_cli_wallet_address,
+                network=config.circle_cli_network,
+                client=CircleCliClient(runner),
             )
-        raise BuyerConfigurationError("X402HermesAgent requires an implemented buyer backend")
+        else:
+            raise BuyerConfigurationError("X402HermesAgent requires an implemented buyer backend")
+        return cls(
+            seller_address=config.seller_address,
+            chain=config.chain,
+            facilitator_url=config.facilitator_url,
+            buyer_backend=backend,
+            buyer_max_usdc=config.max_usdc_per_payment,
+            buyer_host_allowlist=config.host_allowlist,
+        )
 
     async def handle_request(self, request: web.Request, price: str) -> dict | None:
         result = await self.seller.process_request(request, price)

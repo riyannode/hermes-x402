@@ -46,6 +46,10 @@ class X402Config:
     entity_secret: str = ""
     api_key: str | None = None
     blockchain: str = "ARC-TESTNET"
+    circle_cli_executable: str = "circle"
+    circle_cli_cwd: str | None = None
+    circle_cli_wallet_address: str = ""
+    circle_cli_network: str = ""
     max_usdc_per_payment: str | None = None
     daily_budget_usdc: str | None = None
     host_allowlist: list[str] = field(default_factory=list)
@@ -55,29 +59,49 @@ class X402Config:
             return  # preserve legacy config construction; constructors select explicitly.
         if self.role not in {"seller", "buyer", "dual"}:
             raise BuyerConfigurationError(f"Unsupported x402 role: {self.role}")
-        has_buyer_credentials = any(
-            (self.wallet_id, self.wallet_address, self.entity_secret, self.api_key)
-        )
+        dcw_values = (self.wallet_id, self.wallet_address, self.entity_secret, self.api_key)
+        cli_values = (self.circle_cli_wallet_address, self.circle_cli_network)
+        has_dcw = any(dcw_values)
+        has_cli = any(cli_values)
         if self.role == "seller":
             if not self.seller_address:
                 raise BuyerConfigurationError("seller role requires seller_address")
-            if self.buyer_backend is not None or has_buyer_credentials:
+            if self.buyer_backend is not None or has_dcw or has_cli:
                 raise BuyerConfigurationError(
-                    "seller role must not include buyer backend or credentials"
+                    "seller role must not include buyer backend or buyer credentials"
                 )
             return
         if self.role == "dual" and not self.seller_address:
             raise BuyerConfigurationError("dual role requires seller_address")
         if self.buyer_backend is None:
             raise BuyerConfigurationError(f"{self.role} role requires buyer_backend")
+        if self.buyer_backend == "dcw":
+            if has_cli:
+                raise BuyerConfigurationError("DCW buyer must not include Circle CLI configuration")
+            if not all((self.wallet_id, self.wallet_address, self.entity_secret)):
+                raise BuyerConfigurationError(
+                    "DCW buyer requires wallet_id, wallet_address, and entity_secret"
+                )
+            return
         if self.buyer_backend == "cli":
-            raise UnsupportedBuyerBackendError("buyer backend 'cli' is not implemented")
-        if self.buyer_backend != "dcw":
-            raise UnsupportedBuyerBackendError(f"Unsupported buyer backend: {self.buyer_backend}")
-        if not all((self.wallet_id, self.wallet_address, self.entity_secret)):
-            raise BuyerConfigurationError(
-                "DCW buyer requires wallet_id, wallet_address, and entity_secret"
-            )
+            if has_dcw:
+                raise BuyerConfigurationError("Circle CLI buyer must not include DCW credentials")
+            if not all((self.circle_cli_wallet_address, self.circle_cli_network)):
+                raise BuyerConfigurationError(
+                    "Circle CLI buyer requires circle_cli_wallet_address and circle_cli_network"
+                )
+            if self.max_usdc_per_payment is None:
+                raise BuyerConfigurationError("Circle CLI buyer requires max_usdc_per_payment")
+            if self.circle_cli_executable != "circle":
+                raise BuyerConfigurationError(
+                    "Circle CLI buyer only permits the official 'circle' executable"
+                )
+            if self.circle_cli_cwd is not None:
+                raise BuyerConfigurationError(
+                    "Circle CLI buyer does not permit a custom working directory"
+                )
+            return
+        raise UnsupportedBuyerBackendError(f"Unsupported buyer backend: {self.buyer_backend}")
 
     @classmethod
     def from_env(cls) -> X402Config:
@@ -97,6 +121,10 @@ class X402Config:
             entity_secret=os.environ.get("CIRCLE_ENTITY_SECRET", ""),
             api_key=os.environ.get("CIRCLE_API_KEY") or None,
             blockchain=os.environ.get("CIRCLE_DCW_BLOCKCHAIN", "ARC-TESTNET"),
+            circle_cli_executable=os.environ.get("CIRCLE_CLI_EXECUTABLE", "circle"),
+            circle_cli_cwd=os.environ.get("CIRCLE_CLI_CWD") or None,
+            circle_cli_wallet_address=os.environ.get("CIRCLE_AGENT_WALLET_ADDRESS", ""),
+            circle_cli_network=os.environ.get("CIRCLE_AGENT_WALLET_NETWORK", ""),
             max_usdc_per_payment=os.environ.get("X402_MAX_USDC_PER_PAYMENT") or None,
             daily_budget_usdc=os.environ.get("X402_DAILY_BUDGET_USDC") or None,
             host_allowlist=[item.strip() for item in host_raw.split(",") if item.strip()],
