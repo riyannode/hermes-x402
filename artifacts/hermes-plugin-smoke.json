@@ -1,6 +1,6 @@
 {
-  "final_sha": "db4c27699da535872ea292227971dab0570f9810",
-  "test_count": 657,
+  "final_sha": "3063082e9dc6347cec02cf9d2d45dd888715e031",
+  "test_count": 662,
   "ci": {
     "run_url": "https://github.com/riyannode/hermes-x402/actions",
     "conclusion": "success",
@@ -75,7 +75,7 @@
   "paylabs_evidence": {
     "endpoint": "https://paylabs.vercel.app/api/paylabs/brain/run",
     "method": "POST",
-    "discovery_run_id": "dce42a90-aa0c-4cd0-90eb-10bb94e7f3a7",
+    "discovery_run_id": "3572da41-a94e-4bf2-85c6-dfa7ff6090cb",
     "unpaid_http_status": 402,
     "x402_version": 2,
     "network": "eip155:5042002",
@@ -87,21 +87,25 @@
     "payto_masked": "0x03e9...132c",
     "payment_submission_count": 1,
     "payment_result": "successful",
-    "payment_amount_cli": "$0.000003 USDC",
-    "payment_chain": "eip155:5042002",
-    "payment_seller_match": "yes",
+    "payment_via_plugin": true,
+    "payment_via_direct_cli": false,
     "transaction_id": null,
     "protected_http_status": 200,
     "protected_response_captured": true,
     "protected_response_ok": false,
     "protected_response_settled": true,
     "protected_response_summary": "Brain planning response with normalized goal, route tier, discovery strategy, and service execution plan",
-    "balance_before_usdc": "0.998953",
-    "balance_after_usdc": "0.998950",
+    "balance_before_usdc": "0.99895",
+    "balance_after_usdc": "0.998947",
     "balance_delta_usdc": "0.000003",
     "ambiguous_outcome": false,
     "automatic_retry_used": false,
     "manual_circle_cli_payment_used": false
+  },
+  "chain_comparison_fix": {
+    "description": "Post-payment validation now normalizes network identity through the centralized registry. ARC-TESTNET, arcTestnet, and eip155:5042002 all resolve to the same canonical CAIP-2 during _ensure_ready().",
+    "tests_added": 5,
+    "test_class": "TestChainIdentityComparison"
   },
   "seller_regression_scope": {
     "description": "Focused protocol regression tests covering: 402 challenge generation, authorization payload acceptance, no requirement for authorization.asset or authorization.payTo, server-authoritative network/asset/seller/amount, failed settlement does not execute handler, successful settlement executes handler once, canonical base64 JSON PAYMENT-RESPONSE",
@@ -112,10 +116,9 @@
     ]
   },
   "limitations": {
-    "hermes_buyer_plugin_tools": "Live validated against PayLabs",
+    "hermes_buyer_plugin_tools": "Live validated against PayLabs via x402_pay plugin tool",
     "hermes_seller_middleware": "Covered by focused protocol regression tests",
     "public_hermes_seller_deployment": "Deferred to new Hermes-powered web application",
-    "buyer_backend_validation": "Known chain-name comparison issue (eip155:5042002 vs ARC-TESTNET) in CircleCliBuyerBackend post-payment validation; payment succeeds but validation rejects. Direct CLI pay works correctly.",
     "pr5_scope": "Gateway deposits, wallet deployment, daily budgets deferred"
   }
 }
