@@ -63,11 +63,3 @@ class CircleCliPaymentOutcomeUnknownError(CircleCliError):
 
 class CircleCliTermsRequiredError(CircleCliError):
     """Circle Terms of Use must be accepted manually before proceeding."""
-
-
-class CircleCliDeploymentTimeoutError(CircleCliError):
-    """SCA deployment timed out before reaching a terminal state."""
-
-
-class CircleCliDeploymentAmbiguousError(CircleCliError):
-    """SCA deployment outcome is ambiguous; do not retry automatically."""

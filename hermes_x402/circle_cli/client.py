@@ -8,8 +8,6 @@ from typing import Any
 
 from hermes_x402.circle_cli.errors import (
     CircleCliAuthenticationRequiredError,
-    CircleCliDeploymentAmbiguousError,
-    CircleCliDeploymentTimeoutError,
     CircleCliError,
     CircleCliOutputError,
     CircleCliPaymentFailedError,
@@ -30,9 +28,7 @@ from hermes_x402.circle_cli.models import (
     GatewayBalanceResult,
     GatewayDepositResult,
     LoginStartResult,
-    SessionStatus,
     WalletBalance,
-    WalletDeployResult,
 )
 from hermes_x402.circle_cli.runner import CircleCliRunner
 
@@ -134,10 +130,17 @@ class CircleCliClient:
         if not isinstance(mainnet, dict) or not isinstance(testnet, dict):
             raise CircleCliOutputError("Circle CLI wallet status JSON is malformed")
         email = mainnet.get("email") or testnet.get("email")
+        # Determine terms_accepted from whichever section is valid
+        terms_accepted = True
+        if isinstance(mainnet, dict) and mainnet.get("tokenStatus") != "NOT_VALID":
+            terms_accepted = bool(mainnet.get("termsAccepted", True))
+        elif isinstance(testnet, dict) and testnet.get("tokenStatus") != "NOT_VALID":
+            terms_accepted = bool(testnet.get("termsAccepted", True))
         return AgentWalletStatus(
             mainnet_status=str(mainnet.get("tokenStatus", "NOT_LOGGED_IN")),
             testnet_status=str(testnet.get("tokenStatus", "NOT_LOGGED_IN")),
             email=str(email) if email else None,
+            terms_accepted=terms_accepted,
         )
 
     async def list_wallets(self, *, network: str) -> tuple[AgentWallet, ...]:
@@ -327,55 +330,13 @@ class CircleCliClient:
             ) from exc
 
     # ------------------------------------------------------------------
-    # Session management
+    # Session management (v0.0.6 wallet-scoped commands)
     # ------------------------------------------------------------------
 
-    async def session_status(self) -> SessionStatus:
-        """Check Circle CLI session status."""
-        result = await self.runner.run_json(
-            ("session", "status", "--output", "json"),
-            timeout_seconds=self.runner.read_timeout_seconds,
-            operation="auth",
-        )
-        # Session status may return non-zero for expired/not-logged-in
-        diagnostic = self._diagnostic(result)
-        if result.exit_code != 0:
-            if "terms" in diagnostic:
-                return SessionStatus(
-                    authenticated=False,
-                    environment="unknown",
-                    terms_accepted=False,
-                    status_code="TERMS_REQUIRED",
-                )
-            if "not logged in" in diagnostic or "expired" in diagnostic:
-                return SessionStatus(
-                    authenticated=False,
-                    environment="unknown",
-                    status_code="NOT_LOGGED_IN",
-                )
-            raise CircleCliReadError(
-                f"Circle CLI session status failed (exit code {result.exit_code})"
-            )
-
-        data = self._data(result)
-        authenticated = bool(data.get("authenticated", False))
-        environment = str(data.get("environment", "unknown"))
-        email = data.get("email")
-        terms_accepted = bool(data.get("termsAccepted", True))
-        status_code = str(data.get("status", "VALID"))
-
-        return SessionStatus(
-            authenticated=authenticated,
-            environment=environment,
-            email=str(email) if email else None,
-            terms_accepted=terms_accepted,
-            status_code=status_code,
-        )
-
     async def login_start(self, *, email: str) -> LoginStartResult:
-        """Start email OTP login flow."""
+        """Start email OTP login using Circle CLI v0.0.6 wallet-scoped command."""
         result = await self.runner.run_json(
-            ("login", "--email", email, "--output", "json"),
+            ("wallet", "login", email, "--type", "agent", "--init", "--output", "json"),
             timeout_seconds=self.runner.read_timeout_seconds,
             operation="auth",
         )
@@ -403,10 +364,10 @@ class CircleCliClient:
             otp_required=True,
         )
 
-    async def login_complete(self, *, request_id: str, otp: str) -> SessionStatus:
-        """Submit OTP to complete login."""
+    async def login_complete(self, *, request_id: str, otp: str) -> AgentWalletStatus:
+        """Submit OTP to complete login using Circle CLI v0.0.6 wallet-scoped command."""
         result = await self.runner.run_json(
-            ("login", "otp", "--request-id", request_id, "--otp", otp, "--output", "json"),
+            ("wallet", "login", "--request", request_id, "--otp", otp, "--output", "json"),
             timeout_seconds=self.runner.read_timeout_seconds,
             operation="auth",
         )
@@ -425,89 +386,7 @@ class CircleCliClient:
             )
 
         # Verify session after completion
-        return await self.session_status()
-
-    async def logout(self) -> None:
-        """Clear Circle CLI session. Idempotent."""
-        import contextlib
-
-        with contextlib.suppress(CircleCliError, CircleCliTimeoutError):
-            await self.runner.run_json(
-                ("logout", "--output", "json"),
-                timeout_seconds=self.runner.read_timeout_seconds,
-                operation="auth",
-            )
-
-    # ------------------------------------------------------------------
-    # Wallet management
-    # ------------------------------------------------------------------
-
-    async def wallet_create(self, *, network: str) -> AgentWallet:
-        """Create a new Agent Wallet."""
-        result = await self.runner.run_json(
-            ("wallet", "create", "--chain", network, "--type", "agent", "--output", "json"),
-            timeout_seconds=self.runner.read_timeout_seconds,
-            operation="auth",
-        )
-        self._require_read_success(result)
-        data = self._data(result)
-        wallet_data = data.get("wallet")
-        if not isinstance(wallet_data, dict) or not isinstance(wallet_data.get("address"), str):
-            raise CircleCliOutputError("Circle CLI wallet create response is malformed")
-        return AgentWallet(
-            address=wallet_data["address"],
-            blockchain=str(wallet_data.get("blockchain", network)),
-            created_at=str(wallet_data["createDate"]) if wallet_data.get("createDate") else None,
-        )
-
-    async def wallet_deploy(self, *, wallet_address: str, network: str) -> WalletDeployResult:
-        """Deploy Agent Wallet SCA on-chain."""
-        try:
-            result = await self.runner.run_json(
-                (
-                    "wallet",
-                    "deploy",
-                    "--address",
-                    wallet_address,
-                    "--chain",
-                    network,
-                    "--output",
-                    "json",
-                ),
-                timeout_seconds=self.runner.payment_timeout_seconds,
-                operation="payment",
-            )
-        except CircleCliTimeoutError as exc:
-            raise CircleCliDeploymentTimeoutError(
-                "SCA deployment timed out; check status before retrying"
-            ) from exc
-        except CircleCliError as exc:
-            raise CircleCliDeploymentAmbiguousError(
-                "SCA deployment outcome is ambiguous; do not retry automatically"
-            ) from exc
-
-        if result.exit_code != 0:
-            diagnostic = self._diagnostic(result)
-            if "already" in diagnostic and "deployed" in diagnostic:
-                return WalletDeployResult(
-                    wallet_address=wallet_address,
-                    status="already_deployed",
-                )
-            raise CircleCliReadError(
-                f"Circle CLI wallet deploy failed (exit code {result.exit_code})"
-            )
-
-        data = self._data(result)
-        operation_id = data.get("operationId")
-        tx_hash = data.get("transactionHash")
-        status = str(data.get("status", "submitted"))
-
-        return WalletDeployResult(
-            wallet_address=wallet_address,
-            operation_id=str(operation_id) if operation_id else None,
-            transaction_hash=str(tx_hash) if tx_hash else None,
-            status=status,
-        )
+        return await self.agent_wallet_status()
 
     # ------------------------------------------------------------------
     # Gateway operations
@@ -531,7 +410,25 @@ class CircleCliClient:
         )
         self._require_read_success(result)
         data = self._data(result)
-        balance = data.get("balance", data.get("totalBalance", "0"))
+        # v0.0.6 may return "total" or "balances" array — prefer total
+        balance = data.get("total")
+        if balance is None:
+            balances = data.get("balances")
+            if isinstance(balances, list):
+                # Sum USDC entries
+                from decimal import Decimal
+
+                total = Decimal("0")
+                for entry in balances:
+                    if (
+                        isinstance(entry, dict)
+                        and entry.get("symbol") == "USDC"
+                        and isinstance(entry.get("amount"), str)
+                    ):
+                        total += Decimal(entry["amount"])
+                balance = str(total)
+            else:
+                balance = data.get("totalBalance", "0")
         domain = data.get("domain")
         return GatewayBalanceResult(
             total_usdc=str(balance),
@@ -546,7 +443,7 @@ class CircleCliClient:
         network: str,
         amount: str,
     ) -> GatewayDepositResult:
-        """Execute a Gateway deposit."""
+        """Execute a Gateway deposit using Circle CLI v0.0.6 --method direct."""
         try:
             result = await self.runner.run_json(
                 (
@@ -558,6 +455,8 @@ class CircleCliClient:
                     network,
                     "--amount",
                     amount,
+                    "--method",
+                    "direct",
                     "--output",
                     "json",
                 ),

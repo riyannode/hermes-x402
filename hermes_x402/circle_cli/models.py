@@ -25,6 +25,7 @@ class AgentWalletStatus:
     mainnet_status: str
     testnet_status: str
     email: str | None = None
+    terms_accepted: bool = True
 
     @property
     def authenticated(self) -> bool:
@@ -57,27 +58,10 @@ class CircleServicePayment:
 
 
 @dataclass(frozen=True)
-class SessionStatus:
-    authenticated: bool
-    environment: str
-    email: str | None = None
-    terms_accepted: bool = True
-    status_code: str = "VALID"
-
-
-@dataclass(frozen=True)
 class LoginStartResult:
     request_id: str
     email_masked: str
     otp_required: bool = True
-
-
-@dataclass(frozen=True)
-class WalletDeployResult:
-    wallet_address: str
-    operation_id: str | None = None
-    transaction_hash: str | None = None
-    status: str = "pending"
 
 
 @dataclass(frozen=True)

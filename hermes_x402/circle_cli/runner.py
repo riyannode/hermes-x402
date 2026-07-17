@@ -54,16 +54,12 @@ class CircleCliRunner:
             ("wallet", "status"),
             ("wallet", "list"),
             ("wallet", "balance"),
-            ("wallet", "create"),
+            ("wallet", "login"),
             ("services", "search"),
             ("services", "inspect"),
             ("services", "pay"),
             ("gateway", "balance"),
             ("gateway", "deposit"),
-            ("session", "status"),
-            ("login",),
-            ("login", "otp"),
-            ("logout",),
         )
         if not argv or not any(argv[: len(prefix)] == prefix for prefix in allowed):
             raise CircleCliUnsupportedCapabilityError("Circle CLI operation is not allowlisted")
