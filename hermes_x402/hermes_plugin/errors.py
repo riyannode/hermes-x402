@@ -1,4 +1,9 @@
-"""Centralized error mapping from core exceptions to stable JSON error codes."""
+"""Centralized error mapping from core exceptions to stable JSON error codes.
+
+Uses an ordered tuple to ensure subclass mappings are checked before base
+class mappings, preventing shadowing (e.g. UnsupportedBuyerBackendError
+before BuyerConfigurationError).
+"""
 
 from __future__ import annotations
 
@@ -9,8 +14,10 @@ from hermes_x402.buyer.errors import (
     BuyerConfigurationError,
     DcwApiError,
     DcwSigningError,
+    HostPolicyError,
     InvalidPaymentChallengeError,
     PaidResourceRequestError,
+    PaymentLimitExceededError,
     PaymentNotSubmittedError,
     PaymentPolicyError,
     PaymentProofError,
@@ -34,37 +41,41 @@ from hermes_x402.circle_cli.errors import (
     CircleCliWalletNotFoundError,
 )
 
-_ERROR_MAP: dict[type[BaseException], tuple[str, bool]] = {
-    # Configuration
-    BuyerConfigurationError: ("configuration_error", False),
-    UnsupportedBuyerBackendError: ("unsupported_backend", False),
+# Ordered tuple: subclasses before base classes. First match wins.
+_ERROR_MAPPINGS: tuple[tuple[type[BaseException], str, bool], ...] = (
+    # Configuration — subclasses first
+    (UnsupportedBuyerBackendError, "unsupported_backend", False),
+    (BuyerConfigurationError, "configuration_error", False),
     # Challenge
-    InvalidPaymentChallengeError: ("invalid_challenge", False),
-    # Policy
-    PaymentPolicyError: ("host_rejected", False),
+    (InvalidPaymentChallengeError, "invalid_challenge", False),
+    # Policy — typed subclasses first, then base
+    (HostPolicyError, "host_rejected", False),
+    (PaymentLimitExceededError, "payment_limit_exceeded", False),
+    (PaymentPolicyError, "payment_policy_rejected", False),
     # Payment
-    PaymentNotSubmittedError: ("payment_rejected", False),
-    PaymentProofError: ("payment_failed", False),
-    DcwSigningError: ("payment_failed", False),
-    DcwApiError: ("payment_failed", False),
-    PaymentSubmissionUnknownError: ("payment_outcome_unknown", False),
-    PaidResourceRequestError: ("resource_failure_after_payment", False),
-    # CLI errors
-    CircleCliNotInstalledError: ("cli_missing", False),
-    CircleCliVersionError: ("cli_version_unsupported", False),
-    CircleCliAuthenticationRequiredError: ("authentication_required", False),
-    CircleCliWalletNotFoundError: ("wallet_missing", False),
-    CircleCliWalletMismatchError: ("wallet_mismatch", False),
-    CircleCliUnsupportedNetworkError: ("network_unsupported", False),
-    CircleCliPaymentRejectedError: ("payment_rejected", False),
-    CircleCliPaymentFailedError: ("payment_failed", False),
-    CircleCliPaymentOutcomeUnknownError: ("payment_outcome_unknown", False),
-    CircleCliUnsupportedCapabilityError: ("unsupported_backend", False),
-    CircleCliOutputError: ("internal_plugin_error", False),
-    CircleCliReadError: ("internal_plugin_error", False),
-    CircleCliTimeoutError: ("internal_plugin_error", False),
-    CircleCliError: ("internal_plugin_error", False),
-}
+    (PaymentNotSubmittedError, "payment_rejected", False),
+    (PaymentProofError, "payment_failed", False),
+    (DcwSigningError, "payment_failed", False),
+    (DcwApiError, "payment_failed", False),
+    (PaymentSubmissionUnknownError, "payment_outcome_unknown", False),
+    (PaidResourceRequestError, "resource_failure_after_payment", False),
+    # CLI errors — subclasses first
+    (CircleCliNotInstalledError, "cli_missing", False),
+    (CircleCliVersionError, "cli_version_unsupported", False),
+    (CircleCliAuthenticationRequiredError, "authentication_required", False),
+    (CircleCliWalletNotFoundError, "wallet_missing", False),
+    (CircleCliWalletMismatchError, "wallet_mismatch", False),
+    (CircleCliUnsupportedNetworkError, "network_unsupported", False),
+    (CircleCliPaymentRejectedError, "payment_rejected", False),
+    (CircleCliPaymentFailedError, "payment_failed", False),
+    (CircleCliPaymentOutcomeUnknownError, "payment_outcome_unknown", False),
+    (CircleCliUnsupportedCapabilityError, "unsupported_backend", False),
+    # Generic CLI errors — base classes last
+    (CircleCliOutputError, "internal_plugin_error", False),
+    (CircleCliReadError, "internal_plugin_error", False),
+    (CircleCliTimeoutError, "internal_plugin_error", False),
+    (CircleCliError, "internal_plugin_error", False),
+)
 
 
 def map_exception(exc: BaseException) -> dict[str, Any]:
@@ -76,7 +87,7 @@ def map_exception(exc: BaseException) -> dict[str, Any]:
     error_code = "internal_plugin_error"
     retry_safe = False
 
-    for exc_type, (code, retry) in _ERROR_MAP.items():
+    for exc_type, code, retry in _ERROR_MAPPINGS:
         if isinstance(exc, exc_type):
             error_code = code
             retry_safe = retry

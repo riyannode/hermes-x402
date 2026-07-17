@@ -14,15 +14,19 @@ Registered tools:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
-from hermes_x402.buyer.errors import BuyerError, PaymentSubmissionUnknownError
+from hermes_x402.buyer.errors import (
+    BuyerError,
+    PaymentSubmissionUnknownError,
+)
 from hermes_x402.circle_cli.errors import CircleCliError
 from hermes_x402.hermes_plugin.errors import format_error_result, format_success_result
 from hermes_x402.hermes_plugin.output import safe_wallet_address
@@ -31,6 +35,7 @@ from hermes_x402.hermes_plugin.schemas import (
     ALLOWED_HTTP_METHODS,
     MAX_BODY_SIZE,
     MAX_HEADER_COUNT,
+    MAX_OUTPUT_BYTES,
     MAX_OUTPUT_SIZE,
     MAX_QUERY_LENGTH,
     MAX_URL_LENGTH,
@@ -47,6 +52,58 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
+
+
+def _parse_usdc_cap(value: str, *, field: str) -> tuple[Decimal | None, str | None]:
+    """Parse a USDC cap string into a Decimal. Returns (parsed, error)."""
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError):
+        return None, f"{field} is not a valid decimal amount."
+
+    if not parsed.is_finite():
+        return None, f"{field} must be finite."
+
+    if parsed < 0:
+        return None, f"{field} must be non-negative."
+
+    return parsed, None
+
+
+def _validate_max_usdc(
+    caller_value: str | None,
+    configured_value: str | None,
+) -> tuple[str | None, str | None]:
+    """Validate caller and configured payment caps.
+
+    Both caps are parsed explicitly. An invalid configured cap always
+    returns an error. Caller cap may reduce but never raise the
+    configured cap. Absent caller cap uses the configured cap.
+    """
+    configured: Decimal | None = None
+
+    if configured_value is not None:
+        configured, error = _parse_usdc_cap(
+            configured_value,
+            field="Configured maximum payment",
+        )
+        if error:
+            return None, error
+
+    if caller_value is None:
+        return configured_value, None
+
+    caller, error = _parse_usdc_cap(
+        caller_value,
+        field="max_usdc",
+    )
+    if error:
+        return None, error
+
+    if configured is not None and caller > configured:
+        return None, ("Caller cap exceeds configured maximum. The configured cap cannot be raised.")
+
+    return caller_value, None
 
 
 def _validate_url(url: str) -> str | None:
@@ -89,42 +146,153 @@ def _validate_body_size(body: Any) -> str | None:
     return None
 
 
-def _validate_max_usdc(
-    max_usdc: str | None, configured_max: str | None
-) -> tuple[str | None, str | None]:
-    """Validate caller cap. Returns (validated_cap, error_message)."""
-    if max_usdc is None:
-        return configured_max, None
-    try:
-        from decimal import Decimal
+# ---------------------------------------------------------------------------
+# Centralized URL and host policy
+# ---------------------------------------------------------------------------
 
-        caller_cap = Decimal(max_usdc)
-        if caller_cap < 0:
-            return None, "max_usdc must be non-negative."
-    except Exception:
-        return None, "max_usdc is invalid."
+# Well-known hosts that should never be fetched (SSRF protection).
+_BLOCKED_HOSTS = frozenset(
+    {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "metadata.google.internal",
+        "169.254.169.254",
+    }
+)
 
-    if configured_max is not None:
+
+def _validate_allowed_url(
+    url: str,
+    host_allowlist: Sequence[str],
+) -> str | None:
+    """Validate URL scheme, length, hostname, and host allowlist.
+
+    Returns error message or None. Centralizes all URL/host policy
+    checks for inspect, fetch, and pay tools.
+    """
+    err = _validate_url(url)
+    if err:
+        return err
+
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+
+    # Block well-known SSRF targets
+    if hostname in _BLOCKED_HOSTS:
+        return f"Host is blocked: {hostname}"
+
+    # Block private/reserved IPs (best-effort; DNS-resolved IPs bypass this)
+    if hostname:
+        import ipaddress
+
         try:
-            from decimal import Decimal
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return f"Host resolves to a private/reserved address: {hostname}"
+            if ip.is_multicast or ip.is_unspecified:
+                return f"Host is multicast or unspecified: {hostname}"
+        except ValueError:
+            pass  # hostname is a domain, not an IP — proceed
 
-            if caller_cap > Decimal(configured_max):
-                return None, (
-                    "Caller cap exceeds configured maximum. The configured cap cannot be raised."
-                )
-        except Exception:
+    # Reject userinfo (credentials in URL)
+    if parsed.username or parsed.password:
+        return "URL must not contain credentials (userinfo)."
+
+    # Enforce host allowlist
+    if host_allowlist:
+        allowed = any(
+            hostname == item.lower() or hostname.endswith(f".{item.lower()}")
+            for item in host_allowlist
+        )
+        if not allowed:
+            return f"Host not in allowlist: {hostname}"
+
+    return None
+
+
+def _check_redirect(
+    response: httpx.Response,
+) -> dict[str, Any] | None:
+    """Check if response is a redirect and return bounded result."""
+    if response.is_redirect:
+        location = response.headers.get("location", "")
+        # Bound location header
+        if len(location) > MAX_URL_LENGTH:
+            location = location[:MAX_URL_LENGTH]
+        return {
+            "success": False,
+            "error": "redirect_not_followed",
+            "status": response.status_code,
+            "location": location,
+            "message": "Redirects are not followed automatically.",
+        }
+    return None
+
+
+def _bounded_response(
+    response: httpx.Response,
+) -> dict[str, Any]:
+    """Read response body in a bounded manner and return structured result."""
+    raw = response.content
+    original_size = len(raw)
+    truncated = original_size > MAX_OUTPUT_BYTES
+    bounded = raw[:MAX_OUTPUT_BYTES]
+
+    content_type = response.headers.get("content-type", "")
+    is_json = "application/json" in content_type
+
+    # Attempt JSON parse only on small enough, non-truncated bodies
+    if is_json and not truncated:
+        try:
+            decoded = bounded.decode(response.encoding or "utf-8", errors="replace")
+            parsed = json.loads(decoded)
+            return {
+                "success": True,
+                "status": response.status_code,
+                "content_type": content_type,
+                "data": parsed,
+                "truncated": False,
+                "original_size": original_size,
+            }
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Malformed JSON — fall through to text
             pass
 
-    return max_usdc, None
-
-
-def _run_async(coro: Any) -> Any:
-    """Run an async coroutine in a new event loop."""
-    loop = asyncio.new_event_loop()
+    # Text/binary fallback
     try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+        decoded = bounded.decode(response.encoding or "utf-8", errors="replace")
+    except Exception:
+        decoded = bounded.decode("latin-1", errors="replace")
+
+    if is_json and truncated:
+        return {
+            "success": True,
+            "status": response.status_code,
+            "content_type": content_type,
+            "data": decoded,
+            "truncated": True,
+            "original_size": original_size,
+            "error": "invalid_json_response",
+            "message": "Response was too large to parse as JSON.",
+        }
+
+    return {
+        "success": True,
+        "status": response.status_code,
+        "content_type": content_type,
+        "data": decoded,
+        "truncated": truncated,
+        "original_size": original_size,
+    }
+
+
+def _bound_header(value: str, limit: int = MAX_URL_LENGTH) -> str:
+    """Bound a header value before inserting into model context."""
+    if len(value) > limit:
+        return value[:limit]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -146,15 +314,20 @@ def register_status_tools(ctx: Any) -> None:
         if runtime.config:
             host_allowlist = runtime.config.host_allowlist
 
+        # Fix #9: configured means role/backend are set, not just plugin loaded
+        role = runtime.role
+        is_configured = role is not None and runtime.is_configured
+
         result: dict[str, Any] = {
             "success": True,
             "plugin": "hermes-x402",
             "version": runtime.version,
-            "role": runtime.role or "unconfigured",
+            "role": role or "unconfigured",
             "backend": runtime.backend_name or "none",
             "network": runtime.network or "none",
             "wallet_address": safe_wallet,
-            "configured": runtime.is_configured,
+            "plugin_loaded": True,
+            "configured": is_configured,
             "available": runtime.is_available,
             "max_usdc_per_payment": (
                 runtime.config.max_usdc_per_payment if runtime.config else None
@@ -223,10 +396,11 @@ def register_wallet_tools(ctx: Any) -> None:
         toolset="x402",
         schema=X402_WALLET_STATUS_SCHEMA,
         handler=lambda args, **kw: wallet_status_handler(**kw),
-        description="Report Circle wallet status. Read-only. Never exposes secrets.",
+        description=("Report Circle wallet status. Read-only. Never exposes secrets."),
     )
 
-    def wallet_balance_handler(**kwargs: Any) -> str:
+    # Fix #2: async handler, no _run_async
+    async def wallet_balance_handler(**kwargs: Any) -> str:
         runtime = get_runtime()
         runtime.ensure_initialized()
 
@@ -258,11 +432,9 @@ def register_wallet_tools(ctx: Any) -> None:
                     }
                 )
             try:
-                balances = _run_async(
-                    runtime.cli_client.get_balance(
-                        wallet_address=runtime.wallet_address,
-                        network=runtime.network,
-                    )
+                balances = await runtime.cli_client.get_balance(
+                    wallet_address=runtime.wallet_address,
+                    network=runtime.network,
                 )
                 usdc_balance = "0"
                 for b in balances:
@@ -295,7 +467,8 @@ def register_wallet_tools(ctx: Any) -> None:
         name="x402_wallet_balance",
         toolset="x402",
         schema=X402_WALLET_BALANCE_SCHEMA,
-        handler=lambda args, **kw: wallet_balance_handler(**kw),
+        handler=wallet_balance_handler,
+        is_async=True,
         description="Report configured wallet USDC balance. Read-only.",
     )
 
@@ -308,49 +481,50 @@ def register_wallet_tools(ctx: Any) -> None:
 def register_service_tools(ctx: Any) -> None:
     """Register x402_service_inspect tool."""
 
-    def service_inspect_handler(args: dict, **kwargs: Any) -> str:
+    # Fix #2: async handler, no _run_async
+    # Fix #4: follow_redirects=False
+    # Fix #3: centralized URL/host policy
+    async def service_inspect_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
-        err = _validate_url(url)
+
+        runtime = get_runtime()
+        runtime.ensure_initialized()
+
+        host_allowlist = runtime.config.host_allowlist if runtime.config else []
+        err = _validate_allowed_url(url, host_allowlist)
         if err:
+            error_code = (
+                "invalid_input" if "required" in err or "exceeds" in err else "host_rejected"
+            )
             return format_success_result(
                 {
                     "success": False,
-                    "error": "invalid_input",
+                    "error": error_code,
                     "message": err,
                 }
             )
 
-        runtime = get_runtime()
-        runtime.ensure_initialized()
-        if runtime.config and runtime.config.host_allowlist:
-            parsed = urlparse(url)
-            host = (parsed.hostname or "").lower()
-            allowed = any(
-                host == item.lower() or host.endswith(f".{item.lower()}")
-                for item in runtime.config.host_allowlist
-            )
-            if not allowed:
-                return format_success_result(
-                    {
-                        "success": False,
-                        "error": "host_rejected",
-                        "message": f"Host not in allowlist: {host}",
-                    }
-                )
-
         try:
-            with httpx.Client(timeout=15) as client:
-                response = client.head(url, follow_redirects=True)
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.head(url, follow_redirects=False)
+
+                # Check redirect
+                redirect = _check_redirect(response)
+                if redirect:
+                    return format_success_result(redirect)
+
                 result_data: dict[str, Any] = {
                     "success": True,
                     "url": url,
                     "status": response.status_code,
-                    "content_type": response.headers.get("content-type", ""),
+                    "content_type": _bound_header(response.headers.get("content-type", "")),
                     "headers": dict(list(response.headers.items())[:MAX_HEADER_COUNT]),
                 }
                 if response.status_code == 402:
                     result_data["payment_required"] = True
-                    result_data["payment_header"] = response.headers.get("Payment-Required", "")
+                    result_data["payment_header"] = _bound_header(
+                        response.headers.get("Payment-Required", "")
+                    )
                 return format_success_result(result_data)
         except httpx.HTTPError as exc:
             return format_success_result(
@@ -366,6 +540,7 @@ def register_service_tools(ctx: Any) -> None:
         toolset="x402",
         schema=X402_SERVICE_INSPECT_SCHEMA,
         handler=service_inspect_handler,
+        is_async=True,
         description="Inspect an x402 service URL without paying.",
     )
 
@@ -378,20 +553,14 @@ def register_service_tools(ctx: Any) -> None:
 def register_payment_tools(ctx: Any) -> None:
     """Register x402_fetch and x402_pay tools."""
 
-    def fetch_handler(args: dict, **kwargs: Any) -> str:
+    # Fix #2: async handler, no _run_async
+    # Fix #4: follow_redirects=False
+    # Fix #5: enforce allowlist in fetch
+    # Fix #6: bound all fetch output including JSON
+    async def fetch_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
         method = (args.get("method") or "GET").upper()
         body = args.get("body")
-
-        err = _validate_url(url)
-        if err:
-            return format_success_result(
-                {
-                    "success": False,
-                    "error": "invalid_input",
-                    "message": err,
-                }
-            )
 
         err = _validate_method(method)
         if err:
@@ -413,17 +582,40 @@ def register_payment_tools(ctx: Any) -> None:
                 }
             )
 
+        # Fix #5: enforce allowlist before any network I/O
+        runtime = get_runtime()
+        runtime.ensure_initialized()
+        host_allowlist = runtime.config.host_allowlist if runtime.config else []
+        err = _validate_allowed_url(url, host_allowlist)
+        if err:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": (
+                        "invalid_input"
+                        if "required" in err or "exceeds" in err
+                        else "host_rejected"
+                    ),
+                    "message": err,
+                }
+            )
+
         try:
-            with httpx.Client(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 kwargs_req: dict[str, Any] = {
                     "method": method,
                     "url": url,
-                    "follow_redirects": True,
+                    "follow_redirects": False,
                 }
                 if body is not None and method in {"POST", "PUT", "PATCH"}:
                     kwargs_req["json"] = body
 
-                response = client.request(**kwargs_req)
+                response = await client.request(**kwargs_req)
+
+                # Check redirect
+                redirect = _check_redirect(response)
+                if redirect:
+                    return format_success_result(redirect)
 
                 if response.status_code == 402:
                     return format_success_result(
@@ -434,25 +626,15 @@ def register_payment_tools(ctx: Any) -> None:
                             "message": (
                                 "This resource requires payment. Use x402_pay to purchase access."
                             ),
-                            "payment_header": response.headers.get("Payment-Required", ""),
+                            "payment_header": _bound_header(
+                                response.headers.get("Payment-Required", "")
+                            ),
                         }
                     )
 
-                content_type = response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    data: Any = response.json()
-                else:
-                    data = response.text
-                    if isinstance(data, str) and len(data) > MAX_OUTPUT_SIZE:
-                        data = data[:MAX_OUTPUT_SIZE] + "\n[... truncated ...]"
-
-                return format_success_result(
-                    {
-                        "success": True,
-                        "status": response.status_code,
-                        "data": data,
-                    }
-                )
+                # Fix #6: bounded response read
+                result = _bounded_response(response)
+                return format_success_result(result)
         except httpx.HTTPError as exc:
             return format_success_result(
                 {
@@ -467,13 +649,15 @@ def register_payment_tools(ctx: Any) -> None:
         toolset="x402",
         schema=X402_FETCH_SCHEMA,
         handler=fetch_handler,
+        is_async=True,
         description=(
             "Fetch a resource URL without paying. When HTTP 402 occurs, "
             "reports that payment is required but does not pay."
         ),
     )
 
-    def pay_handler(args: dict, **kwargs: Any) -> str:
+    # Fix #2: async handler, no _run_async
+    async def pay_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
         method = (args.get("method") or "GET").upper()
         body = args.get("body")
@@ -522,12 +706,13 @@ def register_payment_tools(ctx: Any) -> None:
             )
 
         configured_max = runtime.config.max_usdc_per_payment if runtime.config else None
+        # Fix #1: fail-closed cap validation
         validated_cap, err = _validate_max_usdc(max_usdc, configured_max)
         if err:
             return format_success_result(
                 {
                     "success": False,
-                    "error": "payment_policy_error",
+                    "error": "payment_limit_exceeded",
                     "message": err,
                 }
             )
@@ -543,15 +728,13 @@ def register_payment_tools(ctx: Any) -> None:
             )
 
         try:
-            result = _run_async(
-                buyer.pay(url=url, method=method, body=body, max_usdc=validated_cap)
-            )
+            result = await buyer.pay(url=url, method=method, body=body, max_usdc=validated_cap)
 
             output: dict[str, Any] = {
                 "success": True,
                 "payment_status": result.payment_status,
                 "status": result.status,
-                "payer": safe_wallet_address(result.payer) if result.payer else "",
+                "payer": (safe_wallet_address(result.payer) if result.payer else ""),
                 "amount": result.amount,
                 "network": result.network,
             }
@@ -570,7 +753,7 @@ def register_payment_tools(ctx: Any) -> None:
                 {
                     "success": False,
                     "error": "payment_outcome_unknown",
-                    "message": "Payment may have been submitted. Do not retry automatically.",
+                    "message": ("Payment may have been submitted. Do not retry automatically."),
                     "retry_safe": False,
                 }
             )
@@ -584,6 +767,7 @@ def register_payment_tools(ctx: Any) -> None:
         toolset="x402",
         schema=X402_PAY_SCHEMA,
         handler=pay_handler,
+        is_async=True,
         description=(
             "⚠️ May transfer USDC. Pay for an x402 resource. "
             "Cannot change configured wallet, network, or backend. "

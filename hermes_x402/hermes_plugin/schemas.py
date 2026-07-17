@@ -19,6 +19,7 @@ MAX_RESULT_COUNT = 20
 MAX_HEADER_COUNT = 10
 MAX_HEADER_LENGTH = 1024
 MAX_OUTPUT_SIZE = 100_000  # 100 KB before truncation
+MAX_OUTPUT_BYTES = 65536  # 64 KB body read limit
 
 # ---------------------------------------------------------------------------
 # Tool schemas (OpenAI function-calling format)
