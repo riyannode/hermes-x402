@@ -145,6 +145,8 @@ class CircleCliBuyerBackend:
     def _reported_usdc_atomic(amount: str) -> int:
         try:
             decimal, unit = amount.strip().split()
+            # Strip $ prefix (CLI 0.0.6+ returns "$0.000003 USDC")
+            decimal = decimal.lstrip("$")
             value = Decimal(decimal)
             exponent = value.as_tuple().exponent
             if (
@@ -211,10 +213,15 @@ class CircleCliBuyerBackend:
             raise
         reported_atomic = self._reported_usdc_atomic(paid.amount)
         cap_atomic = int(Decimal(max_usdc) * Decimal(1_000_000)) if max_usdc else None
+        # CLI 0.0.6+ may report the payment mechanism name ("GatewayWalletBatched")
+        # as the scheme instead of the x402 scheme ("exact").  Normalize for
+        # comparison — the actual x402 scheme is always "exact".
+        _CLI_SCHEME_NORMALIZE = {"GatewayWalletBatched": "exact"}
+        cli_scheme = _CLI_SCHEME_NORMALIZE.get(paid.scheme, paid.scheme)
         if (
             paid.seller.lower() != selected["payTo"].lower()
             or paid.chain.lower() != self.network.lower()
-            or paid.scheme != selected["scheme"]
+            or cli_scheme != selected["scheme"]
             or reported_atomic != selected_atomic
             or (cap_atomic is not None and reported_atomic > cap_atomic)
         ):

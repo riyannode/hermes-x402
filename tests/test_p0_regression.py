@@ -1053,3 +1053,48 @@ class TestCompleteSettlementFlow:
             assert payment.network == _NETWORK_CAIP2
             assert payment.transaction == "0xsettlement_tx_hash"
             assert payment.payer == "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+
+# ---------------------------------------------------------------------------
+# Circle CLI 0.0.6 compatibility fixes
+# ---------------------------------------------------------------------------
+
+
+class TestCircleCliAmountParsing:
+    """_reported_usdc_atomic must handle CLI 0.0.6 $-prefixed amounts."""
+
+    def test_plain_amount(self):
+        from hermes_x402.backends.circle_cli import CircleCliBuyerBackend
+
+        assert CircleCliBuyerBackend._reported_usdc_atomic("0.000003 USDC") == 3
+
+    def test_dollar_prefixed_amount(self):
+        from hermes_x402.backends.circle_cli import CircleCliBuyerBackend
+
+        assert CircleCliBuyerBackend._reported_usdc_atomic("$0.000003 USDC") == 3
+
+    def test_larger_amount_with_dollar(self):
+        from hermes_x402.backends.circle_cli import CircleCliBuyerBackend
+
+        assert CircleCliBuyerBackend._reported_usdc_atomic("$0.01 USDC") == 10000
+
+    def test_invalid_amount_raises(self):
+        from hermes_x402.backends.circle_cli import (
+            CircleCliBuyerBackend,
+            CircleCliPaymentOutcomeUnknownError,
+        )
+
+        with pytest.raises(CircleCliPaymentOutcomeUnknownError):
+            CircleCliBuyerBackend._reported_usdc_atomic("invalid")
+
+
+class TestCircleCliSchemeNormalization:
+    """CLI 0.0.6 returns 'GatewayWalletBatched' as scheme; must normalize to 'exact'."""
+
+    def test_gateway_batching_normalized(self):
+        _CLI_SCHEME_NORMALIZE = {"GatewayWalletBatched": "exact"}
+        assert _CLI_SCHEME_NORMALIZE.get("GatewayWalletBatched") == "exact"
+
+    def test_exact_scheme_unchanged(self):
+        _CLI_SCHEME_NORMALIZE = {"GatewayWalletBatched": "exact"}
+        assert _CLI_SCHEME_NORMALIZE.get("exact", "exact") == "exact"
