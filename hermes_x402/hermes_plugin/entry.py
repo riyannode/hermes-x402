@@ -23,11 +23,15 @@ def register(ctx: Any) -> None:
     """
     from hermes_x402.hermes_plugin.tools import (
         register_discovery_tools,
+        register_gateway_tools,
         register_network_tools,
         register_payment_tools,
+        register_readiness_tools,
         register_service_tools,
+        register_session_tools,
         register_status_tools,
         register_supports_tools,
+        register_wallet_management_tools,
         register_wallet_tools,
     )
 
@@ -38,5 +42,9 @@ def register(ctx: Any) -> None:
     register_supports_tools(ctx)
     register_service_tools(ctx)
     register_payment_tools(ctx)
+    register_session_tools(ctx)
+    register_wallet_management_tools(ctx)
+    register_gateway_tools(ctx)
+    register_readiness_tools(ctx)
 
     logger.debug("hermes-x402 plugin: registered x402 tools")

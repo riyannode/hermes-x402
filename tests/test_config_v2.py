@@ -15,7 +15,7 @@ from hermes_x402.config import X402Config
 class TestConfigDefaults:
     def test_default_network_policy(self):
         config = X402Config()
-        assert config.network_policy == "strict_allowlist"
+        assert config.network_policy == "public"
 
     def test_default_discovery_providers(self):
         config = X402Config()
@@ -268,7 +268,7 @@ class TestLegacyConfig:
         config = X402Config.from_env()
         assert config.role is None
         # PR #4 fields have sensible defaults
-        assert config.network_policy == "strict_allowlist"
+        assert config.network_policy == "public"
         assert config.allow_http is False
 
 

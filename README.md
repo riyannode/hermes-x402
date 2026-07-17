@@ -24,11 +24,14 @@
 | **Dual-role agent** | Single process acts as seller and buyer simultaneously |
 | **Service discovery** | Search Circle Marketplace for x402-enabled services at runtime |
 | **Supports preflight** | Check if a URL supports x402 before committing to a payment |
-| **Network policy** | `strict_allowlist` or `public` mode with SSRF protection |
+| **Network policy** | `public` mode (default) or `strict_allowlist` with SSRF protection |
 | **Multi-network** | 11 mainnets + 12 testnets from a single centralized registry |
-| **Host approval** | Optional approval gate for never-before-seen hosts |
+| **Session management** | Two-step OTP login, session status, logout |
+| **Wallet readiness** | Wallet list, create, and Smart Contract Account deployment |
+| **Gateway readiness** | Gateway balance, deposit preview, deposit execution |
+| **Aggregate readiness** | Single readiness check across all subsystems |
 | **Daily budget** | Optional per-day USDC spending cap |
-| **Hermes plugin** | Auto-registers 9 tools into Hermes Agent on startup |
+| **Hermes plugin** | Auto-registers 20 tools into Hermes Agent on startup |
 
 ## Installation
 
@@ -133,29 +136,31 @@ hermes-x402 is a Hermes Agent plugin. Once installed, it auto-registers at start
 hermes-x402 = "hermes_x402.hermes_plugin.entry"
 ```
 
-No manual registration is needed — just `pip install hermes-x402` and the 9 tools become available in your Hermes session.
+No manual registration is needed — just `pip install hermes-x402` and all tools become available in your Hermes session.
 
 ## Hermes Tools
 
-All 9 tools are registered under the `x402` toolset.
+All 20 tools are registered under the `x402` toolset.
 
 ### `x402_status`
 
 Report plugin status and configuration. Shows version, role, backend, network, wallet address (safe form), max payment, and host allowlist.
 
-```
-→ x402_status
-{
-  "plugin": "hermes-x402",
-  "version": "0.1.0",
-  "role": "buyer",
-  "backend": "dcw",
-  "network": "base",
-  "wallet_address": "0x1234...abcd",
-  "configured": true,
-  "available": true
-}
-```
+### `x402_session_status`
+
+Report Circle Agent Wallet CLI session status: authenticated, expired/not logged in, environment, and Terms state. Read-only. Masked email. Never exposes tokens or credential storage paths.
+
+### `x402_login_start`
+
+Start Circle Agent Wallet email OTP login. Only runs when no valid session exists. Returns an opaque login request ID. Never accepts or stores Circle Terms of Use. Apply expiry to pending login.
+
+### `x402_login_complete`
+
+Complete Circle Agent Wallet login with OTP. OTP exists in memory only for the duration of the call. Never logs or returns OTP. Failed OTP consumes the Circle request — require new login_start.
+
+### `x402_logout`
+
+Clear Circle Agent Wallet CLI session. Idempotent. Does not modify wallet or x402 configuration.
 
 ### `x402_wallet_status`
 
@@ -164,6 +169,18 @@ Read-only Circle wallet status. Shows CLI installation, authentication, selected
 ### `x402_wallet_balance`
 
 Report configured wallet USDC balance. CLI backend uses the existing typed balance client. DCW backend returns structured `unsupported` capability. Read-only.
+
+### `x402_wallet_list`
+
+List Agent Wallets using Circle CLI. Read-only. Normalizes address and blockchain metadata. Never exposes secrets.
+
+### `x402_wallet_create`
+
+Create an Agent Wallet using Circle CLI. Does not silently replace the configured wallet. Return the new address and require explicit activation/configuration before use.
+
+### `x402_wallet_deploy`
+
+Deploy the configured Agent Wallet Smart Contract Account on-chain. Check deployment status first. Idempotent when already deployed. Never runs automatically as a side effect of `x402_pay`. Fail closed on unsupported networks.
 
 ### `x402_networks`
 
@@ -179,7 +196,7 @@ Check if a specific URL supports x402 payments. Sends a preflight request and re
 
 ### `x402_service_inspect`
 
-Inspect a service URL without paying. Enforces URL scheme validation, host allowlist, and URL length limits. Returns normalized service metadata.
+Inspect a service URL without paying. Enforces URL scheme validation, host policy, and URL length limits. Returns normalized service metadata.
 
 ### `x402_fetch`
 
@@ -187,44 +204,43 @@ Fetch a resource URL without paying. When HTTP 402 occurs, reports that payment 
 
 ### `x402_pay`
 
-Pay for an x402 resource. **This tool may transfer USDC.** Accepts an optional `max_usdc` caller cap that can reduce but never raise the configured cap. Returns the fetched resource data after successful payment. Ambiguous outcomes return `retry_safe=false` and must not be retried automatically.
+Pay for an x402 resource. **This tool may transfer USDC.** Accepts an optional `max_usdc` caller cap that can reduce but never raise the configured cap. Returns the fetched resource data after successful payment. Ambiguous outcomes return `retry_safe=false` and must not be retried automatically. Must obtain a fresh 402 challenge from the server — never reuse a stale one.
 
-## Autonomous Discovery Workflow
+### `x402_gateway_balance`
 
-When an agent discovers new services at runtime:
+Report Circle Gateway balance for the active wallet and configured network. Distinguishes Gateway balance from on-chain wallet USDC balance. Read-only.
 
-```
-search → supports → inspect → approval → pay
-```
+### `x402_gateway_deposit_preview`
 
-1. **`x402_service_search`** — Search Circle Marketplace for services matching a query
-2. **`x402_supports`** — Confirm the discovered URL supports x402 payments
-3. **`x402_service_inspect`** — Inspect service metadata (price, description, networks)
-4. **Approval** — If `X402_REQUIRE_APPROVAL_FOR_NEW_HOST=true`, the agent asks the user before paying a never-before-seen host
-5. **`x402_pay`** — Execute the payment and retrieve the resource
+Preview a Gateway deposit without moving USDC. Accepts amount and optional service URL. Verifies wallet, session, deployment, and network support. Returns a short-lived preview ID bound to config. Read-only — must not move USDC.
 
-## Known URL Workflow
+### `x402_gateway_deposit_execute`
 
-When the agent already knows the service URL:
+Execute a Gateway deposit using a preview ID from `x402_gateway_deposit_preview`. Do not accept replacement amount, wallet, network, or method. Revalidates session, config, wallet, and preview expiry. Execute exactly once. `retry_safe=false` for ambiguous outcomes.
 
-```
-supports → inspect → approval → pay
-```
+### `x402_readiness`
 
-1. **`x402_supports`** — Verify the URL supports x402
-2. **`x402_service_inspect`** — Inspect metadata and pricing
-3. **Approval** — Gate check for new hosts (if enabled)
-4. **`x402_pay`** — Pay and fetch
+Aggregate readiness check: plugin configuration, network support, Circle CLI availability, session status, wallet existence, SCA deployment, on-chain balance, Gateway balance, payment cap, and public network policy. Returns `ready=true/false` with blockers and next recommended tool. Read-only — never performs login, wallet creation, deployment, deposit, or payment.
 
-## Free Endpoint Workflow
-
-For endpoints that don't require payment:
+## Intended Workflow
 
 ```
-fetch
+x402_readiness
+→ x402_login_start / x402_login_complete (when session required)
+→ x402_wallet_list / x402_wallet_create (when wallet required)
+→ x402_wallet_deploy (when SCA deployment required)
+→ x402_service_search
+→ x402_service_inspect
+→ x402_supports
+→ x402_gateway_balance
+→ x402_gateway_deposit_preview (when Gateway deposit required)
+→ explicit user approval
+→ x402_gateway_deposit_execute
+→ explicit user approval
+→ x402_pay with a fresh challenge
 ```
 
-Use **`x402_fetch`** directly. If the resource is free, you get the data. If it returns 402, the challenge is reported without any payment attempt.
+Human approval applies only to fund-moving operations: `x402_pay` and `x402_gateway_deposit_execute`. Discovery and read operations are free.
 
 ## Seller API
 
@@ -313,7 +329,7 @@ All configuration is via environment variables. No config files required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `X402_NETWORK_POLICY` | `strict_allowlist` | URL validation mode: `strict_allowlist` or `public` |
+| `X402_NETWORK_POLICY` | `public` | URL validation mode: `public` (default) or `strict_allowlist` |
 | `X402_HOST_ALLOWLIST` | `""` | Comma-separated allowed hostnames |
 | `X402_ALLOW_HTTP` | `false` | Allow HTTP (non-HTTPS) URLs — dev mode only |
 
@@ -401,18 +417,9 @@ The `x402_networks` tool automatically filters the network list based on your ac
 
 hermes-x402 enforces a network policy on every outbound URL request (supports, inspect, fetch, pay).
 
-### `strict_allowlist` Mode (Default)
+### `public` Mode (Default)
 
-Only hosts listed in `X402_HOST_ALLOWLIST` are permitted. An empty allowlist means **nothing** is allowed. This is the safest mode for production.
-
-```bash
-export X402_NETWORK_POLICY=strict_allowlist
-export X402_HOST_ALLOWLIST=api.example.com,data.service.io
-```
-
-### `public` Mode
-
-Any public HTTPS destination may be inspected or paid, but the following remain **always blocked**:
+Any public HTTPS destination may be inspected or paid. The following are **always blocked**:
 
 - Private/reserved IP addresses (`10.*`, `172.16-31.*`, `192.168.*`)
 - Loopback addresses (`localhost`, `127.0.0.1`, `::1`)
@@ -422,10 +429,19 @@ Any public HTTPS destination may be inspected or paid, but the following remain 
 - HTTP URLs (unless `X402_ALLOW_HTTP=true`)
 
 ```bash
-export X402_NETWORK_POLICY=public
+export X402_NETWORK_POLICY=public  # default — no allowlist needed
 ```
 
-> **Note**: `public` mode is not unrestricted. SSRF targets, private IPs, and credential-bearing URLs are always rejected regardless of mode.
+> **Note**: `public` mode is not unrestricted. SSRF targets, private IPs, and credential-bearing URLs are always rejected regardless of mode. DNS destination validation is always enforced.
+
+### `strict_allowlist` Mode (Opt-in)
+
+Only hosts listed in `X402_HOST_ALLOWLIST` are permitted. An empty allowlist means **nothing** is allowed. This is the safest mode for locked-down deployments.
+
+```bash
+export X402_NETWORK_POLICY=strict_allowlist
+export X402_HOST_ALLOWLIST=api.example.com,data.service.io
+```
 
 ### DNS Validation
 
@@ -441,14 +457,38 @@ Redirects (3xx responses) are **never followed automatically**. The tool returns
 
 hermes-x402 is designed with agent-safety principles:
 
-- **No payment on import/registration**: Tool registration performs no network calls, subprocess calls, or payment operations. All 9 tools are registered as pure functions.
-- **Host approval for new hosts**: When `X402_REQUIRE_APPROVAL_FOR_NEW_HOST=true`, the agent must get explicit user approval before paying a never-before-seen host.
+- **No payment on import/registration**: Tool registration performs no network calls, subprocess calls, or payment operations. All tools are registered as pure functions.
+- **Public mode by default**: Any public HTTPS host is reachable without configuring an allowlist. Host approval is not required in the normal workflow.
 - **Bounded responses**: All tool responses are size-limited (`MAX_OUTPUT_BYTES`) to prevent context overflow. Large responses are truncated with metadata.
 - **No secret leakage**: Wallet status and balance tools use `safe_wallet_address()` to redact addresses. Entity secrets, API keys, and signing operations are never exposed in tool output.
-- **SSRF protection**: Well-known internal hosts and private IP ranges are blocked in all modes.
+- **SSRF protection**: Well-known internal hosts, private IP ranges, and DNS-resolved private destinations are blocked in all modes.
 - **Redirect prevention**: Redirects are never followed, preventing redirect-based SSRF.
 - **Payment cap enforcement**: The `max_usdc` caller cap can only reduce, never raise, the configured cap.
 - **No credentials in URLs**: URLs containing userinfo (username/password) are rejected.
+- **Terms never auto-accepted**: Circle Terms of Use are never automatically accepted. If Terms are required, the tool returns `terms_action_required` and stops.
+- **OTP in memory only**: OTP values exist only in memory for the duration of the login call. They are never logged, returned, or persisted.
+- **Fund-move approval**: Only `x402_pay` and `x402_gateway_deposit_execute` may transfer funds. All other tools are read-only.
+
+## State and Restart Behavior
+
+### Pending Login State
+
+- Pending login state (request IDs, expiry) is **memory-only** — stored in a Python dict inside the tool handler closure.
+- After process restart, all pending logins are lost. A fresh `x402_login_start` is required.
+- The request ID is the Circle CLI's own opaque request ID — not wrapped in a plugin-generated ID.
+- A failed OTP consumes the Circle request; the pending login is removed and a new `x402_login_start` is required.
+
+### Gateway Deposit Previews
+
+- Deposit previews are **memory-only** — stored in a Python dict inside the tool handler closure.
+- After process restart, all previews are lost. A fresh `x402_gateway_deposit_preview` is required.
+- Preview protection (consumed-once, expiry, config fingerprint) is not restart-safe.
+- Ambiguous deposit outcomes return `retry_safe=false` and must not be retried automatically.
+
+### Session Persistence
+
+- Circle CLI session state is managed by the CLI itself (on-disk), not by hermes-x402.
+- Session persists across Hermes process restarts as long as the Circle CLI's credential storage is intact.
 
 ## Development
 

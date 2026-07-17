@@ -8,12 +8,15 @@ from typing import Any
 
 from hermes_x402.circle_cli.errors import (
     CircleCliAuthenticationRequiredError,
+    CircleCliDeploymentAmbiguousError,
+    CircleCliDeploymentTimeoutError,
     CircleCliError,
     CircleCliOutputError,
     CircleCliPaymentFailedError,
     CircleCliPaymentOutcomeUnknownError,
     CircleCliPaymentRejectedError,
     CircleCliReadError,
+    CircleCliTermsRequiredError,
     CircleCliTimeoutError,
     CircleCliVersionError,
     CircleCliWalletNotFoundError,
@@ -24,7 +27,12 @@ from hermes_x402.circle_cli.models import (
     CircleCliResult,
     CircleCliVersion,
     CircleServicePayment,
+    GatewayBalanceResult,
+    GatewayDepositResult,
+    LoginStartResult,
+    SessionStatus,
     WalletBalance,
+    WalletDeployResult,
 )
 from hermes_x402.circle_cli.runner import CircleCliRunner
 
@@ -317,3 +325,268 @@ class CircleCliClient:
                 "Circle CLI payment did not produce a definite pre-submission rejection; "
                 "do not retry automatically"
             ) from exc
+
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
+
+    async def session_status(self) -> SessionStatus:
+        """Check Circle CLI session status."""
+        result = await self.runner.run_json(
+            ("session", "status", "--output", "json"),
+            timeout_seconds=self.runner.read_timeout_seconds,
+            operation="auth",
+        )
+        # Session status may return non-zero for expired/not-logged-in
+        diagnostic = self._diagnostic(result)
+        if result.exit_code != 0:
+            if "terms" in diagnostic:
+                return SessionStatus(
+                    authenticated=False,
+                    environment="unknown",
+                    terms_accepted=False,
+                    status_code="TERMS_REQUIRED",
+                )
+            if "not logged in" in diagnostic or "expired" in diagnostic:
+                return SessionStatus(
+                    authenticated=False,
+                    environment="unknown",
+                    status_code="NOT_LOGGED_IN",
+                )
+            raise CircleCliReadError(
+                f"Circle CLI session status failed (exit code {result.exit_code})"
+            )
+
+        data = self._data(result)
+        authenticated = bool(data.get("authenticated", False))
+        environment = str(data.get("environment", "unknown"))
+        email = data.get("email")
+        terms_accepted = bool(data.get("termsAccepted", True))
+        status_code = str(data.get("status", "VALID"))
+
+        return SessionStatus(
+            authenticated=authenticated,
+            environment=environment,
+            email=str(email) if email else None,
+            terms_accepted=terms_accepted,
+            status_code=status_code,
+        )
+
+    async def login_start(self, *, email: str) -> LoginStartResult:
+        """Start email OTP login flow."""
+        result = await self.runner.run_json(
+            ("login", "--email", email, "--output", "json"),
+            timeout_seconds=self.runner.read_timeout_seconds,
+            operation="auth",
+        )
+        diagnostic = self._diagnostic(result)
+        if result.exit_code != 0:
+            if "terms" in diagnostic:
+                raise CircleCliTermsRequiredError(
+                    "Circle Terms of Use must be accepted before login"
+                )
+            if "invalid" in diagnostic or "not found" in diagnostic:
+                raise CircleCliReadError("Circle CLI rejected the email for login")
+            raise CircleCliReadError(
+                f"Circle CLI login start failed (exit code {result.exit_code})"
+            )
+
+        data = self._data(result)
+        request_id = str(data.get("requestId", ""))
+        masked_email = str(data.get("email", email))
+        if not request_id:
+            raise CircleCliOutputError("Circle CLI login response is missing requestId")
+
+        return LoginStartResult(
+            request_id=request_id,
+            email_masked=masked_email,
+            otp_required=True,
+        )
+
+    async def login_complete(self, *, request_id: str, otp: str) -> SessionStatus:
+        """Submit OTP to complete login."""
+        result = await self.runner.run_json(
+            ("login", "otp", "--request-id", request_id, "--otp", otp, "--output", "json"),
+            timeout_seconds=self.runner.read_timeout_seconds,
+            operation="auth",
+        )
+        diagnostic = self._diagnostic(result)
+        if result.exit_code != 0:
+            if "terms" in diagnostic:
+                raise CircleCliTermsRequiredError(
+                    "Circle Terms of Use must be accepted after OTP verification"
+                )
+            if "invalid" in diagnostic or "expired" in diagnostic or "rejected" in diagnostic:
+                raise CircleCliReadError(
+                    "Circle CLI OTP verification failed (invalid, expired, or rejected)"
+                )
+            raise CircleCliReadError(
+                f"Circle CLI OTP submission failed (exit code {result.exit_code})"
+            )
+
+        # Verify session after completion
+        return await self.session_status()
+
+    async def logout(self) -> None:
+        """Clear Circle CLI session. Idempotent."""
+        import contextlib
+
+        with contextlib.suppress(CircleCliError, CircleCliTimeoutError):
+            await self.runner.run_json(
+                ("logout", "--output", "json"),
+                timeout_seconds=self.runner.read_timeout_seconds,
+                operation="auth",
+            )
+
+    # ------------------------------------------------------------------
+    # Wallet management
+    # ------------------------------------------------------------------
+
+    async def wallet_create(self, *, network: str) -> AgentWallet:
+        """Create a new Agent Wallet."""
+        result = await self.runner.run_json(
+            ("wallet", "create", "--chain", network, "--type", "agent", "--output", "json"),
+            timeout_seconds=self.runner.read_timeout_seconds,
+            operation="auth",
+        )
+        self._require_read_success(result)
+        data = self._data(result)
+        wallet_data = data.get("wallet")
+        if not isinstance(wallet_data, dict) or not isinstance(wallet_data.get("address"), str):
+            raise CircleCliOutputError("Circle CLI wallet create response is malformed")
+        return AgentWallet(
+            address=wallet_data["address"],
+            blockchain=str(wallet_data.get("blockchain", network)),
+            created_at=str(wallet_data["createDate"]) if wallet_data.get("createDate") else None,
+        )
+
+    async def wallet_deploy(self, *, wallet_address: str, network: str) -> WalletDeployResult:
+        """Deploy Agent Wallet SCA on-chain."""
+        try:
+            result = await self.runner.run_json(
+                (
+                    "wallet",
+                    "deploy",
+                    "--address",
+                    wallet_address,
+                    "--chain",
+                    network,
+                    "--output",
+                    "json",
+                ),
+                timeout_seconds=self.runner.payment_timeout_seconds,
+                operation="payment",
+            )
+        except CircleCliTimeoutError as exc:
+            raise CircleCliDeploymentTimeoutError(
+                "SCA deployment timed out; check status before retrying"
+            ) from exc
+        except CircleCliError as exc:
+            raise CircleCliDeploymentAmbiguousError(
+                "SCA deployment outcome is ambiguous; do not retry automatically"
+            ) from exc
+
+        if result.exit_code != 0:
+            diagnostic = self._diagnostic(result)
+            if "already" in diagnostic and "deployed" in diagnostic:
+                return WalletDeployResult(
+                    wallet_address=wallet_address,
+                    status="already_deployed",
+                )
+            raise CircleCliReadError(
+                f"Circle CLI wallet deploy failed (exit code {result.exit_code})"
+            )
+
+        data = self._data(result)
+        operation_id = data.get("operationId")
+        tx_hash = data.get("transactionHash")
+        status = str(data.get("status", "submitted"))
+
+        return WalletDeployResult(
+            wallet_address=wallet_address,
+            operation_id=str(operation_id) if operation_id else None,
+            transaction_hash=str(tx_hash) if tx_hash else None,
+            status=status,
+        )
+
+    # ------------------------------------------------------------------
+    # Gateway operations
+    # ------------------------------------------------------------------
+
+    async def gateway_balance(self, *, wallet_address: str, network: str) -> GatewayBalanceResult:
+        """Get Circle Gateway balance for the configured wallet."""
+        result = await self.runner.run_json(
+            (
+                "gateway",
+                "balance",
+                "--address",
+                wallet_address,
+                "--chain",
+                network,
+                "--output",
+                "json",
+            ),
+            timeout_seconds=self.runner.read_timeout_seconds,
+            operation="read",
+        )
+        self._require_read_success(result)
+        data = self._data(result)
+        balance = data.get("balance", data.get("totalBalance", "0"))
+        domain = data.get("domain")
+        return GatewayBalanceResult(
+            total_usdc=str(balance),
+            network=network,
+            domain=int(domain) if isinstance(domain, int) else None,
+        )
+
+    async def gateway_deposit(
+        self,
+        *,
+        wallet_address: str,
+        network: str,
+        amount: str,
+    ) -> GatewayDepositResult:
+        """Execute a Gateway deposit."""
+        try:
+            result = await self.runner.run_json(
+                (
+                    "gateway",
+                    "deposit",
+                    "--address",
+                    wallet_address,
+                    "--chain",
+                    network,
+                    "--amount",
+                    amount,
+                    "--output",
+                    "json",
+                ),
+                timeout_seconds=self.runner.payment_timeout_seconds,
+                operation="payment",
+            )
+        except CircleCliTimeoutError as exc:
+            raise CircleCliPaymentOutcomeUnknownError(
+                "Gateway deposit timed out; do not retry automatically"
+            ) from exc
+
+        if result.exit_code != 0:
+            diagnostic = self._diagnostic(result)
+            if any(m in diagnostic for m in _PAYMENT_SUBMITTED_MARKERS):
+                raise CircleCliPaymentOutcomeUnknownError(
+                    "Gateway deposit may have been submitted; do not retry automatically"
+                )
+            raise CircleCliReadError(
+                f"Circle CLI gateway deposit failed (exit code {result.exit_code})"
+            )
+
+        data = self._data(result)
+        operation_id = data.get("operationId")
+        tx_hash = data.get("transactionHash")
+        status = str(data.get("status", "submitted"))
+
+        return GatewayDepositResult(
+            operation_id=str(operation_id) if operation_id else None,
+            transaction_hash=str(tx_hash) if tx_hash else None,
+            status=status,
+            network=network,
+        )

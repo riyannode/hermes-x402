@@ -74,7 +74,7 @@ class X402Config:
     max_usdc_per_payment: str | None = None
     host_allowlist: list[str] = field(default_factory=list)
     # PR #4 extensions
-    network_policy: Literal["strict_allowlist", "public"] = "strict_allowlist"
+    network_policy: Literal["strict_allowlist", "public"] = "public"
     discovery_providers: tuple[str, ...] = ("circle_marketplace",)
     discovery_host_allowlist: tuple[str, ...] = ()
     network_preference: tuple[str, ...] = ("base",)
@@ -162,9 +162,7 @@ class X402Config:
         backend = os.environ.get("X402_BUYER_BACKEND") or None
 
         # PR #4 env vars
-        network_policy_raw = (
-            os.environ.get("X402_NETWORK_POLICY", "strict_allowlist").strip().lower()
-        )
+        network_policy_raw = os.environ.get("X402_NETWORK_POLICY", "public").strip().lower()
         if network_policy_raw not in {"strict_allowlist", "public"}:
             network_policy_raw = "strict_allowlist"
 

@@ -221,3 +221,192 @@ X402_PAY_SCHEMA: dict[str, Any] = {
         "required": ["url"],
     },
 }
+
+X402_SESSION_STATUS_SCHEMA: dict[str, Any] = {
+    "name": "x402_session_status",
+    "description": (
+        "Report Circle Agent Wallet CLI session status: authenticated, "
+        "expired/not logged in, environment, and Terms state. Read-only. "
+        "Masked email. Never exposes tokens or credential storage paths. "
+        "Returns actionable remediation steps."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+X402_LOGIN_START_SCHEMA: dict[str, Any] = {
+    "name": "x402_login_start",
+    "description": (
+        "Start Circle Agent Wallet email OTP login. Only runs when no valid "
+        "session exists. Returns an opaque login request ID. Never accepts "
+        "or stores Circle Terms of Use. Apply expiry to pending login."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "email": {
+                "type": "string",
+                "description": "Email address for Circle Agent Wallet login.",
+            },
+        },
+        "required": ["email"],
+    },
+}
+
+X402_LOGIN_COMPLETE_SCHEMA: dict[str, Any] = {
+    "name": "x402_login_complete",
+    "description": (
+        "Complete Circle Agent Wallet login with OTP. OTP exists in memory "
+        "only for the duration of the call. Never logs or returns OTP. "
+        "Failed OTP consumes the Circle request — require new login_start."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "request_id": {
+                "type": "string",
+                "description": "Opaque request ID from x402_login_start.",
+            },
+            "otp": {
+                "type": "string",
+                "description": "One-time password from email.",
+            },
+        },
+        "required": ["request_id", "otp"],
+    },
+}
+
+X402_LOGOUT_SCHEMA: dict[str, Any] = {
+    "name": "x402_logout",
+    "description": (
+        "Clear Circle Agent Wallet CLI session. Idempotent. "
+        "Does not modify wallet or x402 configuration."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+X402_WALLET_LIST_SCHEMA: dict[str, Any] = {
+    "name": "x402_wallet_list",
+    "description": (
+        "List Agent Wallets using Circle CLI. Read-only. "
+        "Normalizes address and blockchain metadata. Never exposes secrets."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+X402_WALLET_CREATE_SCHEMA: dict[str, Any] = {
+    "name": "x402_wallet_create",
+    "description": (
+        "Create an Agent Wallet using Circle CLI. Does not silently "
+        "replace the configured wallet. Return the new address and require "
+        "explicit activation/configuration before use."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+X402_WALLET_DEPLOY_SCHEMA: dict[str, Any] = {
+    "name": "x402_wallet_deploy",
+    "description": (
+        "Deploy the configured Agent Wallet Smart Contract Account on-chain. "
+        "Check deployment status first. Idempotent when already deployed. "
+        "Never runs automatically as a side effect of x402_pay. "
+        "Fail closed on unsupported networks."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+X402_GATEWAY_BALANCE_SCHEMA: dict[str, Any] = {
+    "name": "x402_gateway_balance",
+    "description": (
+        "Report Circle Gateway balance for the active wallet and configured "
+        "network. Distinguishes Gateway balance from on-chain wallet USDC "
+        "balance. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+X402_GATEWAY_DEPOSIT_PREVIEW_SCHEMA: dict[str, Any] = {
+    "name": "x402_gateway_deposit_preview",
+    "description": (
+        "Preview a Gateway deposit without moving USDC. Accepts amount and "
+        "optional service URL. Verifies wallet, session, deployment, and "
+        "network support. Returns a short-lived preview ID bound to config. "
+        "Read-only — must not move USDC."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "amount": {
+                "type": "string",
+                "description": "USDC amount to preview depositing.",
+            },
+            "service_url": {
+                "type": "string",
+                "description": "Optional service URL to verify Gateway support.",
+            },
+        },
+        "required": ["amount"],
+    },
+}
+
+X402_GATEWAY_DEPOSIT_EXECUTE_SCHEMA: dict[str, Any] = {
+    "name": "x402_gateway_deposit_execute",
+    "description": (
+        "Execute a Gateway deposit using a preview ID from "
+        "x402_gateway_deposit_preview. Do not accept replacement amount, "
+        "wallet, network, or method. Revalidates session, config, wallet, "
+        "and preview expiry. Execute exactly once. "
+        "Mark preview consumed before or atomically with submission. "
+        "retry_safe=false for ambiguous outcomes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "preview_id": {
+                "type": "string",
+                "description": "Preview ID from x402_gateway_deposit_preview.",
+            },
+        },
+        "required": ["preview_id"],
+    },
+}
+
+X402_READINESS_SCHEMA: dict[str, Any] = {
+    "name": "x402_readiness",
+    "description": (
+        "Aggregate readiness check: plugin configuration, network support, "
+        "Circle CLI availability, session status, wallet existence, "
+        "SCA deployment, on-chain balance, Gateway balance, payment cap, "
+        "and public network policy. Returns ready=true/false with blockers "
+        "and next recommended tool. Read-only — never performs login, "
+        "wallet creation, deployment, deposit, or payment."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
