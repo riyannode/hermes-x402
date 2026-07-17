@@ -655,7 +655,9 @@ def register_discovery_tools(ctx: Any) -> None:
         is_async=True,
         description=(
             "Search the Circle service marketplace for x402-enabled services. "
-            "Returns bounded results without payment. Read-only."
+            "Returns bounded results without payment. Read-only. "
+            "Step 1 of marketplace discovery: x402_service_search -> "
+            "x402_service_inspect -> x402_supports -> x402_pay."
         ),
     )
 
@@ -769,7 +771,10 @@ def register_supports_tools(ctx: Any) -> None:
         is_async=True,
         description=(
             "Check whether a URL supports x402 payments. Read-only preflight. "
-            "Never signs, settles, deposits, or pays."
+            "Never signs, settles, deposits, or pays. This is a preflight check "
+            "only — use x402_service_inspect to discover the URL first, then "
+            "x402_supports to check payment compatibility, then x402_pay to pay. "
+            "Preserve the HTTP method and payload format from inspection."
         ),
     )
 
@@ -859,7 +864,13 @@ def register_service_tools(ctx: Any) -> None:
         schema=X402_SERVICE_INSPECT_SCHEMA,
         handler=service_inspect_handler,
         is_async=True,
-        description="Inspect an x402 service URL without paying.",
+        description=(
+            "Inspect an x402 service URL without paying. "
+            "Issue an HTTP HEAD request to discover status, headers, and "
+            "payment-required challenges. Always inspect BEFORE payment. "
+            "Preserve the HTTP method and URL for subsequent x402_supports "
+            "and x402_pay calls."
+        ),
     )
 
 
@@ -1035,7 +1046,10 @@ def register_payment_tools(ctx: Any) -> None:
         is_async=True,
         description=(
             "Fetch a resource URL without paying. When HTTP 402 occurs, "
-            "reports that payment is required but does not pay."
+            "reports that payment is required but does not pay. "
+            "For direct URL access: x402_fetch -> if 402, "
+            "x402_service_inspect -> x402_supports -> x402_pay. "
+            "Preserve the HTTP method for subsequent calls."
         ),
     )
 
@@ -1191,6 +1205,12 @@ def register_payment_tools(ctx: Any) -> None:
         description=(
             "⚠️ This tool may transfer USDC. Pay for an x402 resource. "
             "Cannot change configured wallet, network, or backend. "
-            "Capped by local configuration."
+            "Capped by local configuration. x402_pay must obtain a fresh "
+            "402 challenge from the server — never reuse a stale one. "
+            "Never retry when retry_safe is false or the outcome is "
+            "ambiguous. Authentication-required errors must be resolved "
+            "before retrying. Insufficient Gateway balance must be "
+            "reported as an actionable readiness failure, not handled by "
+            "inventing a deposit flow."
         ),
     )

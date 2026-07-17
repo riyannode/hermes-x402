@@ -303,9 +303,12 @@ class TestCreateGateway:
 class TestSettleRequirements:
     def test_requirements_structure(self):
         gateway = _make_gateway()
-        reqs = gateway._build_settle_requirements("10000", "base", gateway._networks)
+        # _build_settle_requirements expects CAIP-2 network identifiers
+        reqs = gateway._build_settle_requirements(
+            "10000", "eip155:8453", gateway._networks
+        )
         assert reqs["scheme"] == "exact"
-        assert reqs["network"] == "base"
+        assert reqs["network"] == "eip155:8453"
         assert reqs["amount"] == "10000"
         assert reqs["payTo"] == _VALID_SELLER
         assert reqs["extra"]["name"] == "GatewayWalletBatched"
@@ -314,6 +317,12 @@ class TestSettleRequirements:
         gateway = _make_gateway()
         with pytest.raises(ValueError, match="not in accepted networks"):
             gateway._build_settle_requirements("10000", "nonexistent", gateway._networks)
+
+    def test_registry_key_not_accepted(self):
+        """Registry keys like 'base' must not be accepted — only CAIP-2."""
+        gateway = _make_gateway()
+        with pytest.raises(ValueError, match="not in accepted networks"):
+            gateway._build_settle_requirements("10000", "base", gateway._networks)
 
 
 # ---------------------------------------------------------------------------

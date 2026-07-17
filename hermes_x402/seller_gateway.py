@@ -16,6 +16,7 @@ delegates settlement to X402SellerMiddleware._settle() via Circle Gateway.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import logging
 import re
@@ -33,6 +34,7 @@ from hermes_x402.middleware import (
     CIRCLE_BATCHING_VERSION,
     DEFAULT_MAX_TIMEOUT_SECONDS,
     PAYMENT_REQUIRED_HEADER,
+    PAYMENT_RESPONSE_HEADER,
     PAYMENT_SIGNATURE_HEADER,
     X402_VERSION,
     PaymentResult,
@@ -506,11 +508,11 @@ class X402Gateway:
                 headers={PAYMENT_REQUIRED_HEADER: encoded},
             )
 
-        # Payment succeeded
+        # Payment succeeded — use server-computed amount in result
         transaction = settle_result.get("transaction", "")
         result = PaymentResult(
             payer=payer,
-            amount=client_value,
+            amount=amount,
             network=payload_network,
             transaction=transaction,
         )
@@ -519,15 +521,21 @@ class X402Gateway:
         request["x402_payment"] = result
         set_payment_context(
             payer=payer,
-            amount=client_value,
+            amount=amount,
             network=payload_network,
             transaction=transaction,
         )
 
-        logger.info("Payment settled: %s USDC by %s tx=%s", client_value, payer, transaction)
+        logger.info("Payment settled: %s USDC by %s tx=%s", amount, payer, transaction)
 
         # Forward to the original handler
-        return await handler_call(request)
+        response = await handler_call(request)
+        # Add Payment-Response header after successful settlement
+        if isinstance(response, web.Response):
+            response.headers[PAYMENT_RESPONSE_HEADER] = json.dumps(
+                {"transaction": transaction, "network": payload_network}
+            )
+        return response
 
     def _build_accepts(
         self,
@@ -565,7 +573,8 @@ class X402Gateway:
         if accepts is None:
             accepts = self._build_accepts(networks, amount)
         else:
-            # Patch amount into each accept entry
+            # Deep copy accepts to avoid mutating shared dicts between requests
+            accepts = copy.deepcopy(accepts)
             for entry in accepts:
                 entry["amount"] = amount
 
@@ -586,10 +595,10 @@ class X402Gateway:
         networks: list[NetworkConfig],
     ) -> dict[str, Any]:
         """Build payment requirements for Circle Gateway settle()."""
-        # Find the NetworkConfig for this network
+        # Find the NetworkConfig for this network (CAIP-2 matching)
         nc = None
         for n in networks:
-            if n.key == network:
+            if n.caip2 == network:
                 nc = n
                 break
         if nc is None:
@@ -672,12 +681,26 @@ def create_aiohttp_gateway(
         networks = ["base"]
 
     resolved: list[NetworkConfig] = []
+    environments: set[str] = set()
     for net in networks:
         try:
             nc = get_network(net)
         except (NetworkNotFoundError, Exception) as e:
             raise ValueError(f"Unknown network: {net!r}") from e
+        if not nc.seller_supported:
+            raise ValueError(
+                f"Network {net!r} is not supported for seller mode "
+                f"(seller_supported=False). Use an Arc Testnet network."
+            )
+        environments.add(nc.environment)
         resolved.append(nc)
+
+    # Reject mixed mainnet/testnet configurations
+    if len(environments) > 1:
+        raise ValueError(
+            f"Cannot mix networks from different environments: {environments}. "
+            "Use either all mainnets or all testnets."
+        )
 
     # Resolve facilitator URL from first network if not provided
     if facilitator_url is None:

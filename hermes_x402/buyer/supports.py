@@ -390,7 +390,13 @@ async def check_supports(
     wallet_network: str | None = None
     if config:
         configured_backend = getattr(config, "buyer_backend", None)
-        wallet_network = getattr(config, "blockchain", None) or getattr(config, "network", None)
+        # CLI backend: use circle_cli_network (not DCW blockchain)
+        if configured_backend == "cli":
+            wallet_network = getattr(config, "circle_cli_network", None)
+        else:
+            wallet_network = getattr(config, "blockchain", None) or getattr(
+                config, "network", None
+            )
 
     # --- Issue unpaid HTTP request ---
     try:
