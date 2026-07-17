@@ -530,26 +530,27 @@ class TestGatewayDepositPreview:
             return_value=(WalletBalance(symbol="USDC", amount="1.0"),)
         )
 
-        # Mock 402 response with Gateway option
-        mock_response = MagicMock()
-        mock_response.status_code = 402
-        mock_response.headers = {"content-type": "application/json"}
-        mock_response.text = json.dumps(
-            {
-                "paymentOptions": [
-                    {"paymentSystem": "circle_gateway", "network": "ARC-TESTNET", "domain": 26}
-                ]
-            }
+        # Mock check_supports to return a Gateway option
+        mock_support = MagicMock()
+        mock_support.x402 = True
+        mock_support.gateway_batching = True
+        mock_support.reason = None
+        mock_support.options = (
+            MagicMock(
+                payment_system="gateway_batching",
+                network="arcTestnet",
+                network_id="eip155:5042002",
+                supported_by_backend=True,
+            ),
         )
-
-        mock_client = AsyncMock()
-        mock_client.request = AsyncMock(return_value=mock_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
 
         with (
             patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt),
-            patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient", return_value=mock_client),
+            patch(
+                "hermes_x402.buyer.supports.check_supports",
+                new_callable=AsyncMock,
+                return_value=mock_support,
+            ),
         ):
             result = await handler(
                 {
@@ -576,26 +577,27 @@ class TestGatewayDepositPreview:
         status.terms_accepted = True
         rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
 
-        # Mock 402 response with Gateway option
-        mock_response = MagicMock()
-        mock_response.status_code = 402
-        mock_response.headers = {"content-type": "application/json"}
-        mock_response.text = json.dumps(
-            {
-                "paymentOptions": [
-                    {"paymentSystem": "circle_gateway", "network": "ARC-TESTNET", "domain": 26}
-                ]
-            }
+        # Mock check_supports to return a Gateway option
+        mock_support = MagicMock()
+        mock_support.x402 = True
+        mock_support.gateway_batching = True
+        mock_support.reason = None
+        mock_support.options = (
+            MagicMock(
+                payment_system="gateway_batching",
+                network="arcTestnet",
+                network_id="eip155:5042002",
+                supported_by_backend=True,
+            ),
         )
-
-        mock_client = AsyncMock()
-        mock_client.request = AsyncMock(return_value=mock_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
 
         with (
             patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt),
-            patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient", return_value=mock_client),
+            patch(
+                "hermes_x402.buyer.supports.check_supports",
+                new_callable=AsyncMock,
+                return_value=mock_support,
+            ),
         ):
             result = await handler(
                 {

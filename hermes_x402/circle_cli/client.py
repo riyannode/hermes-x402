@@ -442,8 +442,17 @@ class CircleCliClient:
         wallet_address: str,
         network: str,
         amount: str,
+        method: str = "direct",
     ) -> GatewayDepositResult:
-        """Execute a Gateway deposit using Circle CLI v0.0.6 --method direct."""
+        """Execute a Gateway deposit using Circle CLI v0.0.6.
+
+        Args:
+            wallet_address: Wallet address for the deposit.
+            network: CLI chain code (e.g., "ARC-TESTNET").
+            amount: USDC amount to deposit.
+            method: Deposit method — "direct" for same-chain, "eco" for
+                    cross-chain (Base/Base Sepolia only).
+        """
         try:
             result = await self.runner.run_json(
                 (
@@ -456,7 +465,7 @@ class CircleCliClient:
                     "--amount",
                     amount,
                     "--method",
-                    "direct",
+                    method,
                     "--output",
                     "json",
                 ),

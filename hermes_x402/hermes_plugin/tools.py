@@ -444,6 +444,7 @@ def register_wallet_tools(ctx: Any) -> None:
             session_valid = False
             session_environment = "unknown"
             terms_accepted = False
+            session_check_error = None
             try:
                 status = await runtime.cli_client.agent_wallet_status()
                 session_valid = status.authenticated
@@ -452,12 +453,19 @@ def register_wallet_tools(ctx: Any) -> None:
                 if status.email and "@" in status.email:
                     local, domain = status.email.split("@", 1)
                     result["email_masked"] = f"{local[0]}{'*' * max(len(local) - 1, 0)}@{domain}"
-            except Exception:
-                pass
+            except CircleCliError as exc:
+                # Distinguish check-failed from false/not-present
+                session_check_error = str(exc)
+                if "terms" in str(exc).lower():
+                    terms_accepted = False
+            except Exception as exc:
+                session_check_error = str(exc)
 
             result["session_valid"] = session_valid
             result["session_environment"] = session_environment
             result["terms_accepted"] = terms_accepted
+            if session_check_error:
+                result["session_check_error"] = session_check_error
 
             if not session_valid:
                 blockers.append({"code": "session_invalid", "next_tool": "x402_login_start"})
@@ -1538,6 +1546,26 @@ def register_login_tools(ctx: Any) -> None:
             # Determine if chat OTP is available
             allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
 
+            # Resolve network for correct login command
+            network_code = (
+                runtime.config.circle_cli_network or runtime.config.blockchain
+                if runtime.config
+                else runtime.network
+            )
+            try:
+                from hermes_x402.networks import get_network
+
+                net = get_network(network_code)
+                is_testnet = net.environment == "testnet"
+                cli_chain = net.cli_chain or network_code
+            except Exception:
+                is_testnet = "testnet" in network_code.lower()
+                cli_chain = network_code
+
+            # Build manual login command with correct --testnet flag
+            testnet_flag = " --testnet" if is_testnet else ""
+            manual_command = f"circle wallet login --type agent --chain {cli_chain}{testnet_flag}"
+
             next_actions = [
                 {
                     "action": "manual_cli_login",
@@ -1545,7 +1573,7 @@ def register_login_tools(ctx: Any) -> None:
                         "Recommended: Complete login through Circle CLI in your terminal. "
                         "The OTP never enters Hermes chat."
                     ),
-                    "command": "circle wallet login --type agent",
+                    "command": manual_command,
                 }
             ]
 
@@ -1749,8 +1777,12 @@ def register_gateway_tools(ctx: Any) -> None:
             # Use Decimal for safe comparison
             try:
                 gw_decimal = Decimal(gw.total_usdc)
-            except (InvalidOperation, ValueError):
-                gw_decimal = Decimal("0")
+                if not gw_decimal.is_finite():
+                    raise InvalidOperation("Non-finite Gateway balance")
+            except (InvalidOperation, ValueError) as exc:
+                from hermes_x402.circle_cli.errors import CircleCliOutputError
+
+                raise CircleCliOutputError(f"Malformed Gateway balance: {gw.total_usdc!r}") from exc
             return format_success_result(
                 {
                     "success": True,
@@ -1761,6 +1793,8 @@ def register_gateway_tools(ctx: Any) -> None:
                     "ready_for_payment": gw_decimal > Decimal("0"),
                 }
             )
+        except CircleCliError as exc:
+            return format_error_result(exc)
         except Exception as exc:
             return format_error_result(exc)
 
@@ -1875,86 +1909,87 @@ def register_gateway_tools(ctx: Any) -> None:
                 {"success": False, "error": "destination_rejected", "message": str(exc)}
             )
 
-        network = runtime.config.circle_cli_network or runtime.config.blockchain
+        # Use the existing x402 challenge parser (check_supports)
+        # This handles v2 header, v1 body, GatewayWalletBatched detection,
+        # canonical networks, and backend compatibility
+        from hermes_x402.buyer.supports import check_supports
 
-        # Fetch fresh unpaid response to verify Gateway option
-        gateway_option_found = False
-        gateway_network = None
-        gateway_domain = None
+        network = (
+            runtime.config.circle_cli_network or runtime.config.blockchain
+            if runtime.config
+            else runtime.network
+        )
+
+        body = args.get("body") if method in {"POST", "PUT", "PATCH"} else None
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                kwargs_req: dict[str, Any] = {
-                    "method": method,
-                    "url": service_url,
-                    "follow_redirects": False,
-                }
-                response = await client.request(**kwargs_req)
-
-                if response.status_code != 402:
-                    return format_success_result(
-                        {
-                            "success": False,
-                            "error": "not_payment_required",
-                            "message": (
-                                f"Service returned {response.status_code}, "
-                                "not 402. No deposit needed."
-                            ),
-                            "next_tool": "x402_pay",
-                        }
-                    )
-
-                # Parse 402 payment options
-                content_type = response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    try:
-                        body = json.loads(response.text)
-                        payment_options = (
-                            body if isinstance(body, list) else body.get("paymentOptions", [])
-                        )
-                        for opt in payment_options:
-                            if isinstance(opt, dict):
-                                payment_system = opt.get("paymentSystem", "")
-                                if (
-                                    "circle" in payment_system.lower()
-                                    or "gateway" in payment_system.lower()
-                                ):
-                                    gateway_option_found = True
-                                    gateway_network = opt.get("network", "")
-                                    gateway_domain = opt.get("domain")
-                                    break
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-        except httpx.HTTPError:
+            support = await check_supports(
+                service_url,
+                method=method,
+                body=body,
+                config=runtime.config,
+            )
+        except Exception as exc:
             return format_success_result(
                 {
                     "success": False,
-                    "error": "service_unreachable",
-                    "message": "Could not reach the service to verify Gateway support.",
+                    "error": "challenge_parse_failed",
+                    "message": f"Failed to parse x402 challenge: {exc}",
                 }
             )
 
-        if not gateway_option_found:
+        if not support.x402:
             return format_success_result(
                 {
                     "success": False,
-                    "error": "gateway_not_required",
-                    "message": "The service does not require Gateway funding.",
+                    "error": "not_payment_required",
+                    "message": (
+                        f"Service returned non-402 status. {support.reason or 'No x402 challenge.'}"
+                    ),
                     "next_tool": "x402_pay",
                 }
             )
 
-        # Verify Gateway network is compatible with configured network
-        if gateway_network and gateway_network.lower() != network.lower():
+        if not support.gateway_batching:
             return format_success_result(
                 {
                     "success": False,
-                    "error": "network_mismatch",
+                    "error": "gateway_not_required",
                     "message": (
-                        f"Service Gateway network ({gateway_network}) "
-                        f"does not match configured network ({network})."
+                        "The service does not require Gateway funding "
+                        "(no GatewayWalletBatched payment option found)."
+                    ),
+                    "next_tool": "x402_pay",
+                }
+            )
+
+        # Find the gateway_batching option for our network
+        gateway_option = None
+        for opt in support.options:
+            if opt.payment_system == "gateway_batching" and opt.supported_by_backend:
+                gateway_option = opt
+                break
+
+        if not gateway_option:
+            # Get network from the first gateway option (even if not supported)
+            fallback_net = next(
+                (o.network for o in support.options if o.payment_system == "gateway_batching"),
+                network,
+            )
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "gateway_network_mismatch",
+                    "message": (
+                        "Gateway payment option found but not compatible "
+                        f"with configured network ({fallback_net})."
                     ),
                 }
             )
+
+        # Extract details from the gateway option
+        network = gateway_option.network
+        gateway_network = gateway_option.network_id
+        gateway_domain = None
 
         # Verify session validity
         try:
@@ -2233,6 +2268,68 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
+        # Enforce minimum deposit of 0.5 USDC
+        preview_amount = Decimal(preview["amount"])
+        if preview_amount < Decimal("0.5"):
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "minimum_deposit_not_met",
+                    "message": (
+                        f"Minimum Gateway deposit is 0.5 USDC. Requested: {preview['amount']}."
+                    ),
+                }
+            )
+
+        # Resolve network through get_network()
+        try:
+            from hermes_x402.networks import get_network
+
+            net = get_network(current_network)
+        except Exception:
+            pass
+
+        # Verify deposit method is valid for this network
+        deposit_method = preview.get("deposit_method", "direct")
+        if deposit_method == "direct":
+            # direct requires a verified Gateway-supported network
+            try:
+                from hermes_x402.networks import get_network
+
+                net = get_network(current_network)
+                if not net.gateway_supported:
+                    return format_success_result(
+                        {
+                            "success": False,
+                            "error": "unsupported_deposit_method",
+                            "message": f"Direct deposit not supported for {current_network}.",
+                        }
+                    )
+            except Exception:
+                pass
+        elif deposit_method == "eco":
+            # eco is allowed only for Base/Base Sepolia
+            allowed_eco = {"base", "baseSepolia", "BASE-SEPOLIA", "BASE"}
+            if current_network not in allowed_eco:
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "unsupported_deposit_method",
+                        "message": (
+                            f"Eco deposit only supported for Base networks. "
+                            f"Current network: {current_network}."
+                        ),
+                    }
+                )
+        else:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "unsupported_deposit_method",
+                    "message": f"Unknown deposit method: {deposit_method}.",
+                }
+            )
+
         # Reverify wallet has sufficient USDC
         try:
             balances = await runtime.cli_client.get_balance(
@@ -2243,7 +2340,7 @@ def register_gateway_tools(ctx: Any) -> None:
                 if b.symbol == "USDC":
                     usdc_balance = b.amount
                     break
-            if Decimal(usdc_balance) < Decimal(preview["amount"]):
+            if Decimal(usdc_balance) < preview_amount:
                 return format_success_result(
                     {
                         "success": False,
@@ -2263,56 +2360,102 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Re-verify service still advertises Gateway option (fresh challenge)
+        # Re-fetch challenge and recompute payment-option fingerprint
+        from hermes_x402.buyer.supports import check_supports
+
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                fresh_response = await client.request(
-                    method=preview["method"],
-                    url=preview["service_url"],
-                    follow_redirects=False,
-                )
-                if fresh_response.status_code != 402:
-                    return format_success_result(
-                        {
-                            "success": False,
-                            "error": "service_changed",
-                            "message": "Service no longer returns 402. Create a new preview.",
-                        }
-                    )
-                content_type = fresh_response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    try:
-                        body = json.loads(fresh_response.text)
-                        payment_options = (
-                            body if isinstance(body, list) else body.get("paymentOptions", [])
-                        )
-                        still_has_gateway = False
-                        for opt in payment_options:
-                            if isinstance(opt, dict):
-                                ps = opt.get("paymentSystem", "")
-                                if "circle" in ps.lower() or "gateway" in ps.lower():
-                                    still_has_gateway = True
-                                    break
-                        if not still_has_gateway:
-                            return format_success_result(
-                                {
-                                    "success": False,
-                                    "error": "service_changed",
-                                    "message": (
-                                        "Service no longer advertises Gateway "
-                                        "payment. Create a new preview."
-                                    ),
-                                }
-                            )
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-        except httpx.HTTPError:
+            fresh_support = await check_supports(
+                preview["service_url"],
+                method=preview["method"],
+                config=runtime.config,
+            )
+        except Exception as exc:
             return format_success_result(
                 {
                     "success": False,
-                    "error": "service_unreachable",
-                    "message": "Could not reach service for revalidation. Do not proceed.",
+                    "error": "challenge_revalidation_failed",
+                    "message": f"Could not re-fetch x402 challenge: {exc}",
                     "retry_safe": False,
+                }
+            )
+
+        if not fresh_support.x402 or not fresh_support.gateway_batching:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "service_changed",
+                    "message": "Service no longer offers Gateway payment. Create a new preview.",
+                }
+            )
+
+        # Find the matching gateway option and compare fingerprint
+        fresh_gateway_option = None
+        for opt in fresh_support.options:
+            if opt.payment_system == "gateway_batching" and opt.supported_by_backend:
+                fresh_gateway_option = opt
+                break
+
+        if not fresh_gateway_option:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "service_changed",
+                    "message": "Gateway option no longer compatible. Create a new preview.",
+                }
+            )
+
+        # Recompute and compare payment-option fingerprint
+        new_fingerprint = hashlib.sha256(
+            json.dumps(
+                {"network": fresh_gateway_option.network_id, "domain": None},
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+
+        if preview.get("payment_option_fingerprint") != new_fingerprint:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "payment_option_changed",
+                    "message": (
+                        "Payment option changed since preview. "
+                        "Network, scheme, or amount may have changed. "
+                        "Create a new preview."
+                    ),
+                }
+            )
+
+        # Reject if key fields changed
+        if fresh_gateway_option.network_id != preview.get("gateway_destination_network"):
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "payment_option_changed",
+                    "message": "Gateway network changed since preview. Create a new preview.",
+                }
+            )
+        if fresh_gateway_option.asset != preview.get("gateway_asset"):
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "payment_option_changed",
+                    "message": "Payment asset changed since preview. Create a new preview.",
+                }
+            )
+        if fresh_gateway_option.pay_to != preview.get("gateway_pay_to"):
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "payment_option_changed",
+                    "message": "PayTo address changed since preview. Create a new preview.",
+                }
+            )
+        if fresh_gateway_option.amount_usdc != preview.get("amount"):
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "payment_option_changed",
+                    "message": "Payment amount changed since preview. Create a new preview.",
                 }
             )
 
@@ -2324,6 +2467,7 @@ def register_gateway_tools(ctx: Any) -> None:
                 wallet_address=preview["wallet"],
                 network=preview["network"],
                 amount=preview["amount"],
+                method=deposit_method,
             )
             output: dict[str, Any] = {
                 "success": True,
