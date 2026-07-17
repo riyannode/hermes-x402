@@ -23,6 +23,15 @@ _APPROVAL_REQUIRED_TOOLS = frozenset(
     }
 )
 
+# Human-readable descriptions for approval prompts
+_APPROVAL_DESCRIPTIONS: dict[str, str] = {
+    "x402_pay": "Pay for an x402 resource (may transfer USDC)",
+    "x402_gateway_deposit_execute": "Execute Gateway deposit (may transfer USDC)",
+    "x402_login_complete": (
+        "Complete Circle login with OTP via chat (OTP exposed in conversation)"
+    ),
+}
+
 
 def register(ctx: Any) -> None:
     """Register x402 tools with the Hermes plugin context.
@@ -60,7 +69,7 @@ def register(ctx: Any) -> None:
     register_login_tools(ctx)
     register_gateway_tools(ctx)
 
-    # Register native approval hook
+    # Register native approval hook (synchronous callback)
     _register_approval_hook(ctx)
 
     logger.debug("hermes-x402 plugin: registered x402 tools and approval hook")
@@ -69,12 +78,9 @@ def register(ctx: Any) -> None:
 def _register_approval_hook(ctx: Any) -> None:
     """Register a pre_tool_call hook for native Hermes approval.
 
-    Requires user approval before executing:
-    - x402_pay (may transfer USDC)
-    - x402_gateway_deposit_execute (may transfer USDC)
-    - x402_login_complete (OTP exposure when chat OTP is used)
+    Synchronous callback that returns action=approve for financial tools
+    and None for unaffected tools. Uses tool_call_id as unique identity.
 
-    Uses unique per-tool-call rule keys for Hermes approval tracking.
     Fails closed when the Hermes approval API is unavailable.
     """
     if not hasattr(ctx, "register_hook"):
@@ -84,14 +90,19 @@ def _register_approval_hook(ctx: Any) -> None:
         )
         return
 
-    async def _approval_hook(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
-        """Pre-tool-call hook that requests native Hermes approval.
+    def approval_hook(
+        tool_name: str,
+        args: dict[str, Any],
+        tool_call_id: str = "",
+        turn_id: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        """Synchronous pre_tool_call hook for native Hermes approval.
 
-        Returns {"allow": True} to proceed or {"allow": False, "reason": "..."}
-        to block execution.
+        Returns action=approve for financial tools, None for unaffected tools.
         """
         if tool_name not in _APPROVAL_REQUIRED_TOOLS:
-            return {"allow": True}
+            return None
 
         # x402_login_complete: only require approval when chat OTP is used
         if tool_name == "x402_login_complete":
@@ -102,49 +113,28 @@ def _register_approval_hook(ctx: Any) -> None:
             allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
             if not allow_chat_otp:
                 # Chat OTP is disabled — tool will return chat_otp_disabled error
-                return {"allow": True}
+                return None
 
-        # Build human-readable description for each tool
-        descriptions = {
-            "x402_pay": "Pay for an x402 resource (may transfer USDC)",
-            "x402_gateway_deposit_execute": "Execute Gateway deposit (may transfer USDC)",
-            "x402_login_complete": (
-                "Complete Circle login with OTP via chat (OTP exposed in conversation)"
-            ),
+        # Build unique identity from tool_call_id, then turn_id
+        unique_id = tool_call_id or turn_id
+        if not unique_id:
+            # No unique identity available — block execution
+            return {
+                "action": "block",
+                "message": f"No unique identity for {tool_name} approval",
+            }
+
+        rule_key = f"hermes-x402:{tool_name}:{unique_id}"
+        description = _APPROVAL_DESCRIPTIONS.get(tool_name, f"Execute {tool_name}")
+
+        return {
+            "action": "approve",
+            "message": description,
+            "rule_key": rule_key,
         }
 
-        rule_key = f"x402_approval:{tool_name}"
-        description = descriptions.get(tool_name, f"Execute {tool_name}")
-
-        try:
-            result = await ctx.request_approval(
-                rule_key=rule_key,
-                tool_name=tool_name,
-                description=description,
-                tool_args=tool_args,
-            )
-            if result and result.get("approved"):
-                return {"allow": True}
-            return {
-                "allow": False,
-                "reason": f"User denied {tool_name} execution",
-            }
-        except Exception:
-            # Fail closed when approval API is unavailable
-            logger.warning(
-                "hermes-x402: Approval API unavailable for %s — blocking execution",
-                tool_name,
-            )
-            return {
-                "allow": False,
-                "reason": f"Approval API unavailable for {tool_name}",
-            }
-
     try:
-        ctx.register_hook(
-            hook_type="pre_tool_call",
-            handler=_approval_hook,
-        )
+        ctx.register_hook("pre_tool_call", approval_hook)
         logger.debug("hermes-x402: registered pre_tool_call approval hook")
     except Exception as exc:
         logger.warning("hermes-x402: failed to register approval hook: %s", exc)

@@ -393,7 +393,13 @@ class CircleCliClient:
     # ------------------------------------------------------------------
 
     async def gateway_balance(self, *, wallet_address: str, network: str) -> GatewayBalanceResult:
-        """Get Circle Gateway balance for the configured wallet."""
+        """Get Circle Gateway balance for the configured wallet.
+
+        Raises CircleCliOutputError for malformed balance responses.
+        Never fabricates zero from malformed data.
+        """
+        from decimal import Decimal, InvalidOperation
+
         result = await self.runner.run_json(
             (
                 "gateway",
@@ -410,28 +416,85 @@ class CircleCliClient:
         )
         self._require_read_success(result)
         data = self._data(result)
-        # v0.0.6 may return "total" or "balances" array — prefer total
-        balance = data.get("total")
-        if balance is None:
-            balances = data.get("balances")
-            if isinstance(balances, list):
-                # Sum USDC entries
-                from decimal import Decimal
 
-                total = Decimal("0")
-                for entry in balances:
-                    if (
-                        isinstance(entry, dict)
-                        and entry.get("symbol") == "USDC"
-                        and isinstance(entry.get("amount"), str)
-                    ):
-                        total += Decimal(entry["amount"])
-                balance = str(total)
-            else:
-                balance = data.get("totalBalance", "0")
+        # Parse balance — fail closed on any malformed response
+        balance_str: str | None = None
+
+        if "total" in data:
+            raw = data["total"]
+            if not isinstance(raw, str):
+                raise CircleCliOutputError(
+                    f"Gateway balance 'total' is not a string: {type(raw).__name__}"
+                )
+            if not raw.strip():
+                raise CircleCliOutputError("Gateway balance 'total' is empty")
+            try:
+                Decimal(raw)
+            except (InvalidOperation, ValueError) as exc:
+                raise CircleCliOutputError(
+                    f"Gateway balance 'total' is not a valid decimal: {raw!r}"
+                ) from exc
+            balance_str = raw
+        elif "balances" in data:
+            balances = data["balances"]
+            if not isinstance(balances, list):
+                raise CircleCliOutputError(
+                    f"Gateway balance 'balances' is not a list: {type(balances).__name__}"
+                )
+            total = Decimal("0")
+            found_usdc = False
+            for entry in balances:
+                if not isinstance(entry, dict):
+                    raise CircleCliOutputError(
+                        f"Gateway balance entry is not an object: {type(entry).__name__}"
+                    )
+                symbol = entry.get("symbol")
+                amount = entry.get("amount")
+                if not isinstance(symbol, str):
+                    raise CircleCliOutputError(f"Gateway balance entry missing 'symbol': {entry!r}")
+                if not isinstance(amount, str):
+                    raise CircleCliOutputError(
+                        f"Gateway balance entry 'amount' is not a string: {amount!r}"
+                    )
+                if not amount.strip():
+                    raise CircleCliOutputError(
+                        f"Gateway balance entry 'amount' is empty for {symbol}"
+                    )
+                try:
+                    parsed = Decimal(amount)
+                except (InvalidOperation, ValueError) as exc:
+                    raise CircleCliOutputError(
+                        f"Gateway balance entry 'amount' is not a valid decimal: {amount!r}"
+                    ) from exc
+                if symbol == "USDC":
+                    total += parsed
+                    found_usdc = True
+            if not found_usdc:
+                raise CircleCliOutputError("Gateway balance response has no USDC entry")
+            balance_str = str(total)
+        elif "totalBalance" in data:
+            raw = data["totalBalance"]
+            if not isinstance(raw, str):
+                raise CircleCliOutputError(
+                    f"Gateway balance 'totalBalance' is not a string: {type(raw).__name__}"
+                )
+            if not raw.strip():
+                raise CircleCliOutputError("Gateway balance 'totalBalance' is empty")
+            try:
+                Decimal(raw)
+            except (InvalidOperation, ValueError) as exc:
+                raise CircleCliOutputError(
+                    f"Gateway balance 'totalBalance' is not a valid decimal: {raw!r}"
+                ) from exc
+            balance_str = raw
+        else:
+            raise CircleCliOutputError(
+                "Gateway balance response is missing 'total', 'balances', and 'totalBalance'"
+            )
+
         domain = data.get("domain")
         return GatewayBalanceResult(
-            total_usdc=str(balance),
+            total_usdc=balance_str,
             network=network,
             domain=int(domain) if isinstance(domain, int) else None,
         )
