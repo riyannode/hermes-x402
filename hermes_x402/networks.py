@@ -366,13 +366,17 @@ _NETWORKS: list[NetworkConfig] = [
         cli_chain="ARC-TESTNET",
         usdc_address="0x3600000000000000000000000000000000000000",
         gateway_supported=True,
-        buyer_cli_supported=False,
+        buyer_cli_supported=True,
         buyer_dcw_supported=True,
         seller_supported=True,
         gateway_wallet="0x0077777d7EBA4688BDeF3E311b846F25870A19B9",
         facilitator_url="https://gateway-api-testnet.circle.com",
         gateway_api="https://gateway-api-testnet.circle.com/v1",
-        provenance="npm @circle-fin/x402-batching; hermes-x402 existing config",
+        provenance=(
+            "npm @circle-fin/x402-batching; "
+            "Circle CLI 0.0.5 blockchain list (ARC-TESTNET, chain_id=5042002); "
+            "live GatewayWalletBatched payment verified 2026-07-17"
+        ),
     ),
     NetworkConfig(
         key="arcMainnet",

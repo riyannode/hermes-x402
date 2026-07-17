@@ -206,3 +206,63 @@ class TestListNetworks:
     def test_combined_filter(self):
         nets = list_networks(environment="mainnet", gateway_supported=True)
         assert all(n.environment == "mainnet" and n.gateway_supported for n in nets)
+
+
+# ---------------------------------------------------------------------------
+# Arc Testnet CLI support (verified 2026-07-17: Circle CLI 0.0.5)
+# ---------------------------------------------------------------------------
+
+
+class TestArcTestnetCliSupport:
+    """Arc Testnet buyer_cli_supported verified by live payment on 2026-07-17."""
+
+    def test_arc_testnet_buyer_cli_supported(self):
+        net = get_network("arcTestnet")
+        assert net.buyer_cli_supported is True
+
+    def test_arc_testnet_cli_chain_value(self):
+        net = get_network("arcTestnet")
+        assert net.cli_chain == "ARC-TESTNET"
+
+    def test_arc_testnet_alias_arctestnet(self):
+        net = get_network("arctestnet")
+        assert net.key == "arcTestnet"
+        assert net.chain_id == 5042002
+
+    def test_arc_testnet_alias_hyphenated(self):
+        net = get_network("arc-testnet")
+        assert net.key == "arcTestnet"
+
+    def test_arc_testnet_alias_spaced(self):
+        net = get_network("arc testnet")
+        assert net.key == "arcTestnet"
+
+    def test_arc_testnet_caip2_resolution(self):
+        net = network_for_caip2("eip155:5042002")
+        assert net is not None
+        assert net.key == "arcTestnet"
+        assert net.buyer_cli_supported is True
+
+    def test_arc_testnet_chain_id_resolution(self):
+        net = network_for_chain_id(5042002)
+        assert net is not None
+        assert net.key == "arcTestnet"
+        assert net.cli_chain == "ARC-TESTNET"
+
+    def test_arc_testnet_usdc_address(self):
+        net = get_network("arcTestnet")
+        assert net.usdc_address == "0x3600000000000000000000000000000000000000"
+
+    def test_arc_testnet_gateway_supported(self):
+        net = get_network("arcTestnet")
+        assert net.gateway_supported is True
+
+    def test_arc_testnet_dcw_still_supported(self):
+        """DCW support was True before; verify it remains True."""
+        net = get_network("arcTestnet")
+        assert net.buyer_dcw_supported is True
+
+    def test_arc_testnet_in_cli_supported_list(self):
+        cli_nets = list_networks(buyer_cli_supported=True)
+        keys = [n.key for n in cli_nets]
+        assert "arcTestnet" in keys

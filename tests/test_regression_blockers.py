@@ -557,10 +557,10 @@ class TestDailyBudgetClaim:
 class TestCapabilityOutput:
     """buyer_backend_supported must not leak through seller flag."""
 
-    def test_arc_testnet_cli_not_supported(self):
-        """arcTestnet buyer_cli_supported must be False."""
+    def test_arc_testnet_cli_supported(self):
+        """arcTestnet buyer_cli_supported verified by live payment 2026-07-17."""
         net = get_network("arcTestnet")
-        assert net.buyer_cli_supported is False
+        assert net.buyer_cli_supported is True
 
     def test_arc_testnet_dcw_supported(self):
         """arcTestnet buyer_dcw_supported must be True."""

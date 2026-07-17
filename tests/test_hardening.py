@@ -743,10 +743,14 @@ class TestUnverifiedNetworks:
         assert "UNVERIFIED" in net.provenance.upper()
 
     def test_arc_testnet_is_verified(self):
-        """Arc Testnet IS verified — contrast with Mainnet."""
+        """Arc Testnet IS verified — contrast with Mainnet.
+        
+        buyer_cli_supported verified by live GatewayWalletBatched payment
+        on Circle CLI 0.0.5, 2026-07-17.
+        """
         net = get_network("arcTestnet")
         assert net.gateway_supported is True
-        assert net.buyer_cli_supported is False
+        assert net.buyer_cli_supported is True
         assert net.buyer_dcw_supported is True
         assert net.seller_supported is True
 
