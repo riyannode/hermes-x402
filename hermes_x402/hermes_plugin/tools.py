@@ -1607,6 +1607,7 @@ def register_login_tools(ctx: Any) -> None:
                 "active": True,
                 "circle_request_id": result.request_id,
                 "email": email,
+                "is_testnet": is_testnet,  # Store for verification
                 "created_at": now,
                 "expires_at": now + 300,
             }
@@ -1720,6 +1721,7 @@ def register_login_tools(ctx: Any) -> None:
 
         # Resolve the raw Circle request ID internally
         circle_request_id = pending["circle_request_id"]
+        is_testnet = pending.get("is_testnet", False)
 
         # Mark consumed before OTP submission (OTP never logged or returned)
         pending["active"] = False
@@ -1728,14 +1730,23 @@ def register_login_tools(ctx: Any) -> None:
         try:
             # OTP exists in memory only for this call
             session = await runtime.cli_client.login_complete(request_id=circle_request_id, otp=otp)
+
+            # Verify the session is valid for the expected environment
+            if is_testnet:
+                env_valid = session.testnet_status == "VALID"
+            else:
+                env_valid = session.mainnet_status == "VALID"
+
             return format_success_result(
                 {
                     "success": True,
                     "authenticated": session.authenticated,
-                    "environment": ("testnet" if session.testnet_status == "VALID" else "mainnet"),
+                    "environment_valid": env_valid,
+                    "environment": ("testnet" if is_testnet else "mainnet"),
                     "message": "Login successful."
-                    if session.authenticated
-                    else "Login incomplete.",
+                    if env_valid
+                    else f"Login incomplete: session not valid for "
+                    f"{'testnet' if is_testnet else 'mainnet'} environment.",
                 }
             )
         except Exception as exc:
@@ -1827,8 +1838,12 @@ def register_gateway_tools(ctx: Any) -> None:
         ),
     )
 
-    # Preview store (in-memory)
-    _previews: dict[str, dict[str, Any]] = {}
+    # Preview store — delegated to shared module
+    from hermes_x402.hermes_plugin.gateway_state import (
+        get_preview,
+        pop_preview,
+        store_preview,
+    )
 
     async def deposit_preview_handler(args: dict, **kwargs: Any) -> str:
         runtime = get_runtime()
@@ -1906,6 +1921,34 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
+        # Validate and canonicalize body BEFORE any network calls
+        body = args.get("body") if method in {"POST", "PUT", "PATCH"} else None
+        canonical_body = None
+        body_hash = None
+        if body is not None:
+            import json as _json
+
+            try:
+                canonical_body = json.loads(_json.dumps(body, sort_keys=True, default=str))
+            except (TypeError, ValueError) as exc:
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "invalid_input",
+                        "message": f"Request body is not valid JSON: {exc}",
+                    }
+                )
+            body_bytes = _json.dumps(canonical_body, sort_keys=True, default=str).encode()
+            if len(body_bytes) > 65536:  # 64KB
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "invalid_input",
+                        "message": "Request body exceeds 64KB limit.",
+                    }
+                )
+            body_hash = hashlib.sha256(body_bytes).hexdigest()[:16]
+
         # Validate URL with public network policy
         policy_mode = runtime.config.network_policy if runtime.config else "public"
         policy_allowlist = runtime.config.host_allowlist if runtime.config else []
@@ -1951,7 +1994,7 @@ def register_gateway_tools(ctx: Any) -> None:
             support = await check_supports(
                 service_url,
                 method=method,
-                body=body,
+                body=canonical_body,
                 config=runtime.config,
             )
         except Exception as exc:
@@ -2016,10 +2059,26 @@ def register_gateway_tools(ctx: Any) -> None:
         network = gateway_option.network
         gateway_network = gateway_option.network_id
 
-        # Verify session validity
+        # Resolve configured environment for session check
+        try:
+            from hermes_x402.networks import get_network
+
+            resolved_net = get_network(network)
+            is_testnet = resolved_net.environment == "testnet"
+        except Exception:
+            is_testnet = "testnet" in network.lower()
+
+        # Verify session validity for configured environment
         try:
             status = await runtime.cli_client.agent_wallet_status()
-            if not status.authenticated:
+
+            # Check session for the configured environment
+            if is_testnet:
+                session_valid = status.testnet_status == "VALID"
+            else:
+                session_valid = status.mainnet_status == "VALID"
+
+            if not session_valid:
                 return format_success_result(
                     {
                         "success": False,
@@ -2113,26 +2172,8 @@ def register_gateway_tools(ctx: Any) -> None:
             f"{runtime.wallet_address}:{network}".encode()
         ).hexdigest()[:16]
 
-        # Body hash for deterministic body comparison
-        body = args.get("body") if method in {"POST", "PUT", "PATCH"} else None
-        # Bound body size to 64KB for storage
-        if body is not None:
-            import json as _json
-
-            body_bytes = _json.dumps(body, sort_keys=True, default=str).encode()
-            if len(body_bytes) > 65536:  # 64KB
-                return format_success_result(
-                    {
-                        "success": False,
-                        "error": "invalid_input",
-                        "message": "Request body exceeds 64KB limit.",
-                    }
-                )
-        body_hash = (
-            hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:16]
-            if body is not None
-            else None
-        )
+        # Body hash already computed during input validation
+        # Store canonical body for revalidation (never in output)
 
         # Service payment-option fingerprint from all option fields
         service_option_fingerprint = hashlib.sha256(
@@ -2154,7 +2195,7 @@ def register_gateway_tools(ctx: Any) -> None:
 
         # Generate preview ID with full state
         preview_id = secrets.token_urlsafe(16)
-        _previews[preview_id] = {
+        preview_data = {
             # Deposit parameters
             "deposit_amount": amount,
             # Service payment-option fields (for fingerprint)
@@ -2171,7 +2212,7 @@ def register_gateway_tools(ctx: Any) -> None:
             "service_url": service_url,
             "method": method,
             "body_hash": body_hash,
-            "body": body,  # Stored for revalidation, never in output
+            "body": canonical_body,  # Stored for revalidation, never in output
             # Wallet and config
             "wallet": runtime.wallet_address,
             "wallet_network": network,
@@ -2182,6 +2223,7 @@ def register_gateway_tools(ctx: Any) -> None:
             "expires_at": time.time() + 300,
             "consumed": False,
         }
+        store_preview(preview_id, preview_data)
 
         return format_success_result(
             {
@@ -2196,7 +2238,7 @@ def register_gateway_tools(ctx: Any) -> None:
                 "gateway_destination": gateway_network,
                 "wallet_usdc_balance": usdc_balance,
                 "gateway_usdc_balance": gw_balance,
-                "expires_at": _previews[preview_id]["expires_at"],
+                "expires_at": preview_data["expires_at"],
                 "approval_required": True,
                 "message": (
                     "Preview created. Present deposit details to user for approval. "
@@ -2243,7 +2285,7 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        preview = _previews.get(preview_id)
+        preview = get_preview(preview_id)
         if not preview:
             return format_success_result(
                 {
@@ -2254,7 +2296,7 @@ def register_gateway_tools(ctx: Any) -> None:
             )
 
         if time.time() > preview.get("expires_at", 0):
-            _previews.pop(preview_id, None)
+            pop_preview(preview_id)
             return format_success_result(
                 {
                     "success": False,
@@ -2272,10 +2314,26 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Revalidate session
+        # Resolve configured environment for session check
+        preview_network = preview.get("wallet_network", "")
+        try:
+            from hermes_x402.networks import get_network
+
+            resolved_net = get_network(preview_network)
+            is_testnet = resolved_net.environment == "testnet"
+        except Exception:
+            is_testnet = "testnet" in preview_network.lower()
+
+        # Revalidate session for configured environment
         try:
             status = await runtime.cli_client.agent_wallet_status()
-            if not status.authenticated:
+
+            if is_testnet:
+                session_valid = status.testnet_status == "VALID"
+            else:
+                session_valid = status.mainnet_status == "VALID"
+
+            if not session_valid:
                 return format_success_result(
                     {
                         "success": False,

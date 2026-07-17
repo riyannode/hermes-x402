@@ -539,6 +539,8 @@ class TestGatewayDepositPreview:
         status = MagicMock()
         status.authenticated = True
         status.terms_accepted = True
+        status.testnet_status = "VALID"  # For ARC-TESTNET
+        status.mainnet_status = "NOT_LOGGED_IN"
         rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
 
         # Mock insufficient wallet balance

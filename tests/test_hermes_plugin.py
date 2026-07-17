@@ -1162,17 +1162,18 @@ class TestPackaging:
 
 
 # ---------------------------------------------------------------------------
-# Hermes integration smoke — actual plugin load + approval flow
+# Approval hook unit tests
 # ---------------------------------------------------------------------------
 
 
-class TestHermesIntegrationSmoke:
-    """Actual Hermes integration smoke using installed runtime and fake backend.
+class TestApprovalHookUnitTests:
+    """Unit tests for the approval hook logic using FakeHermesContext.
 
-    - Plugin loads 14 tools + one pre_tool_call hook
-    - Denied approval runs fake payment backend zero times
-    - Approved approval runs it exactly once
-    - No real USDC, deposit, or OTP
+    These tests verify the hook's decision logic but do NOT execute
+    Hermes' native approval gate. They use mocks, not real Hermes runtime.
+
+    Actual Hermes runtime/install smoke is explicitly deferred until
+    the installer work.
     """
 
     def test_plugin_loads_14_tools_and_hook(self):

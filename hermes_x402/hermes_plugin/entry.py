@@ -10,7 +10,10 @@ no wallet operations, no payment, no secret logging.
 from __future__ import annotations
 
 import logging
+import re
+import time
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +26,11 @@ _APPROVAL_REQUIRED_TOOLS = frozenset(
     }
 )
 
-# Human-readable descriptions for approval prompts
-_APPROVAL_DESCRIPTIONS: dict[str, str] = {
-    "x402_pay": "Pay for an x402 resource (may transfer USDC)",
-    "x402_gateway_deposit_execute": "Execute Gateway deposit (may transfer USDC)",
-    "x402_login_complete": (
-        "Complete Circle login with OTP via chat (OTP exposed in conversation)"
-    ),
-}
+# Maximum displayed URL length in approval messages
+_MAX_DISPLAY_URL_LENGTH = 120
+
+# Control characters pattern for stripping
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 
 
 def register(ctx: Any) -> None:
@@ -105,16 +105,6 @@ def _register_approval_hook(ctx: Any) -> None:
         if tool_name not in _APPROVAL_REQUIRED_TOOLS:
             return None
 
-        # x402_login_complete: only require approval when chat OTP is used
-        if tool_name == "x402_login_complete":
-            from hermes_x402.hermes_plugin.runtime import get_runtime
-
-            runtime = get_runtime()
-            runtime.ensure_initialized()
-            allow_chat_otp = runtime.config.allow_chat_otp if runtime.config else False
-            if not allow_chat_otp:
-                return None
-
         # Financial operations MUST require tool_call_id for unique identity.
         if not tool_call_id:
             return {
@@ -138,47 +128,100 @@ def _register_approval_hook(ctx: Any) -> None:
     logger.debug("hermes-x402: registered pre_tool_call approval hook")
 
 
+def _sanitize_url_for_display(raw_url: str) -> str:
+    """Sanitize URL for approval display.
+
+    - removes userinfo (username:password)
+    - removes fragment
+    - redacts query string
+    - strips control characters
+    - limits displayed length
+    """
+    # Strip control characters
+    cleaned = _CONTROL_CHARS.sub("", raw_url)
+
+    try:
+        parsed = urlparse(cleaned)
+    except Exception:
+        # If URL parsing fails, return truncated cleaned version
+        return cleaned[:_MAX_DISPLAY_URL_LENGTH]
+
+    # Rebuild without userinfo, fragment, or query
+    sanitized = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            "",  # params
+            "",  # query — redacted
+            "",  # fragment — removed
+        )
+    )
+
+    # Limit length
+    if len(sanitized) > _MAX_DISPLAY_URL_LENGTH:
+        sanitized = sanitized[:_MAX_DISPLAY_URL_LENGTH] + "..."
+
+    return sanitized
+
+
 def _build_approval_message(tool_name: str, args: dict[str, Any]) -> str:
     """Build informative sanitized approval message.
 
-    Includes: URL, method, caller max, configured cap, amount, network,
-    method, expiry.
-    Never includes: body, OTP, credentials, payment headers.
+    Includes: sanitized URL, method, caller max, configured cap.
+    For Gateway: service URL, amount, wallet, network, method, expiry.
+    Never includes: body, OTP, credentials, payment headers, raw query.
     """
     if tool_name == "x402_pay":
-        url = args.get("url", "unknown")
-        method = args.get("method", "GET")
-        max_usdc = args.get("max_usdc", "no cap")
+        raw_url = args.get("url", "unknown")
+        display_url = _sanitize_url_for_display(raw_url)
+        method = str(args.get("method", "GET"))[:10]  # Bound length
+        max_usdc = str(args.get("max_usdc", "no cap"))[:20]  # Bound length
+
         # Get configured cap from runtime
+        configured_cap = "default"
         try:
             from hermes_x402.hermes_plugin.runtime import get_runtime
 
             runtime = get_runtime()
             runtime.ensure_initialized()
-            configured_cap = (
-                runtime.config.max_usdc_per_payment
-                if runtime.config and runtime.config.max_usdc_per_payment
-                else "default"
-            )
+            if runtime.config and runtime.config.max_usdc_per_payment:
+                configured_cap = str(runtime.config.max_usdc_per_payment)[:20]
         except Exception:
-            configured_cap = "default"
+            pass
+
         return (
-            f"Pay for {url} via {method}. "
-            f"Caller max: {max_usdc} USDC. Configured cap: {configured_cap} USDC."
+            f"Pay for {display_url} via {method}. "
+            f"Caller max: {max_usdc} USDC. "
+            f"Configured cap: {configured_cap} USDC."
         )
 
     if tool_name == "x402_gateway_deposit_execute":
-        preview_id = args.get("preview_id", "unknown")
-        # Try to load preview details for informative message
-        try:
-            from hermes_x402.hermes_plugin.runtime import get_runtime
+        from hermes_x402.hermes_plugin.gateway_state import (
+            get_gateway_preview_approval_summary,
+        )
 
-            runtime = get_runtime()
-            runtime.ensure_initialized()
-            # Preview is not available here, but we can provide basic info
-        except Exception:
-            pass
-        return f"Execute Gateway deposit via preview {preview_id}. This may transfer USDC."
+        preview_id = args.get("preview_id", "")
+        summary = get_gateway_preview_approval_summary(preview_id)
+
+        if summary is None:
+            return (
+                f"Execute Gateway deposit via preview {preview_id}. "
+                "Preview is missing, expired, or consumed."
+            )
+
+        display_url = _sanitize_url_for_display(summary["service_url"])
+        expires_at = summary.get("expires_at", 0)
+        remaining = max(0, int(expires_at - time.time()))
+
+        return (
+            f"Gateway deposit: {summary['deposit_amount']} USDC "
+            f"to {display_url}. "
+            f"Wallet: {summary['masked_wallet']}. "
+            f"Network: {summary['network']}. "
+            f"Method: {summary['deposit_method']}. "
+            f"Expires in {remaining}s."
+        )
 
     if tool_name == "x402_login_complete":
         return "Complete Circle login with OTP via chat (OTP exposed in conversation)."
