@@ -418,3 +418,169 @@ class TestSupportsUrlPolicy:
         assert result.supported is False
         assert result.reason is not None
         assert "blocked" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# POST body propagation in check_supports
+# ---------------------------------------------------------------------------
+
+
+class TestCheckSupportsBodyPropagation:
+    @pytest.mark.asyncio
+    async def test_post_body_sent_as_json(self):
+        """POST request includes body as JSON payload."""
+        mock_resp = _mock_response(
+            status=402,
+            headers={"Payment-Required": _make_v2_challenge([_make_accept_entry()])},
+        )
+        client = AsyncMock()
+        client.request = AsyncMock(return_value=mock_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        body = {"query": "test", "filters": {"limit": 10}}
+
+        with patch("hermes_x402.buyer.supports.parse_network_policy") as mock_pol:
+            mock_pol.return_value = MagicMock()
+            mock_pol.return_value.validate_url = MagicMock()
+            with patch("hermes_x402.buyer.supports.httpx.AsyncClient", return_value=client):
+                await check_supports(
+                    "https://example.com/api",
+                    method="POST",
+                    body=body,
+                )
+
+        call_kwargs = client.request.call_args.kwargs
+        assert call_kwargs.get("json") == body
+        assert call_kwargs.get("method") == "POST"
+
+    @pytest.mark.asyncio
+    async def test_put_body_sent_as_json(self):
+        """PUT request includes body as JSON payload."""
+        mock_resp = _mock_response(
+            status=402,
+            headers={"Payment-Required": _make_v2_challenge([_make_accept_entry()])},
+        )
+        client = AsyncMock()
+        client.request = AsyncMock(return_value=mock_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        body = {"id": 1, "value": "updated"}
+
+        with patch("hermes_x402.buyer.supports.parse_network_policy") as mock_pol:
+            mock_pol.return_value = MagicMock()
+            mock_pol.return_value.validate_url = MagicMock()
+            with patch("hermes_x402.buyer.supports.httpx.AsyncClient", return_value=client):
+                await check_supports(
+                    "https://example.com/api",
+                    method="PUT",
+                    body=body,
+                )
+
+        call_kwargs = client.request.call_args.kwargs
+        assert call_kwargs.get("json") == body
+
+    @pytest.mark.asyncio
+    async def test_patch_body_sent_as_json(self):
+        """PATCH request includes body as JSON payload."""
+        mock_resp = _mock_response(
+            status=402,
+            headers={"Payment-Required": _make_v2_challenge([_make_accept_entry()])},
+        )
+        client = AsyncMock()
+        client.request = AsyncMock(return_value=mock_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        body = {"field": "new_value"}
+
+        with patch("hermes_x402.buyer.supports.parse_network_policy") as mock_pol:
+            mock_pol.return_value = MagicMock()
+            mock_pol.return_value.validate_url = MagicMock()
+            with patch("hermes_x402.buyer.supports.httpx.AsyncClient", return_value=client):
+                await check_supports(
+                    "https://example.com/api",
+                    method="PATCH",
+                    body=body,
+                )
+
+        call_kwargs = client.request.call_args.kwargs
+        assert call_kwargs.get("json") == body
+
+    @pytest.mark.asyncio
+    async def test_get_ignores_body(self):
+        """GET request does not include body even if body is provided."""
+        mock_resp = _mock_response(
+            status=402,
+            headers={"Payment-Required": _make_v2_challenge([_make_accept_entry()])},
+        )
+        client = AsyncMock()
+        client.request = AsyncMock(return_value=mock_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("hermes_x402.buyer.supports.parse_network_policy") as mock_pol:
+            mock_pol.return_value = MagicMock()
+            mock_pol.return_value.validate_url = MagicMock()
+            with patch("hermes_x402.buyer.supports.httpx.AsyncClient", return_value=client):
+                await check_supports(
+                    "https://example.com/api",
+                    method="GET",
+                    body={"ignored": True},
+                )
+
+        call_kwargs = client.request.call_args.kwargs
+        assert "json" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_method_normalized_to_uppercase(self):
+        """Lowercase method is normalized to uppercase."""
+        mock_resp = _mock_response(
+            status=402,
+            headers={"Payment-Required": _make_v2_challenge([_make_accept_entry()])},
+        )
+        client = AsyncMock()
+        client.request = AsyncMock(return_value=mock_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("hermes_x402.buyer.supports.parse_network_policy") as mock_pol:
+            mock_pol.return_value = MagicMock()
+            mock_pol.return_value.validate_url = MagicMock()
+            with patch("hermes_x402.buyer.supports.httpx.AsyncClient", return_value=client):
+                result = await check_supports(
+                    "https://example.com/api",
+                    method="post",
+                )
+
+        assert result.method == "POST"
+        call_kwargs = client.request.call_args.kwargs
+        assert call_kwargs.get("method") == "POST"
+
+    @pytest.mark.asyncio
+    async def test_body_not_mutated(self):
+        """Original body dict is not modified by check_supports."""
+        mock_resp = _mock_response(
+            status=402,
+            headers={"Payment-Required": _make_v2_challenge([_make_accept_entry()])},
+        )
+        client = AsyncMock()
+        client.request = AsyncMock(return_value=mock_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        body = {"original": "value"}
+        original_keys = set(body.keys())
+
+        with patch("hermes_x402.buyer.supports.parse_network_policy") as mock_pol:
+            mock_pol.return_value = MagicMock()
+            mock_pol.return_value.validate_url = MagicMock()
+            with patch("hermes_x402.buyer.supports.httpx.AsyncClient", return_value=client):
+                await check_supports(
+                    "https://example.com/api",
+                    method="POST",
+                    body=body,
+                )
+
+        assert set(body.keys()) == original_keys

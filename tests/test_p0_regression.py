@@ -45,22 +45,74 @@ def _make_middleware(
 def _build_auth_header(
     *,
     value: str = "10000",
-    asset: str = _VALID_ASSET,
-    pay_to: str = _VALID_SELLER,
     from_addr: str = "0x" + "cd" * 20,
+    to_addr: str = "0x" + "ab" * 20,  # Gateway wallet
     network: str = "eip155:5042002",
 ) -> str:
-    """Build a base64 payment header with official x402 nested payload."""
+    """Build a base64 payment header with official x402 nested payload.
+
+    Official Circle x402 payload has:
+    - authorization: {from, to, value, validAfter, validBefore, nonce}
+    - accepted: {scheme, network, asset, amount, payTo, maxTimeoutSeconds, extra}
+    """
     auth = {
         "from": from_addr,
+        "to": to_addr,
         "value": value,
-        "asset": asset,
-        "payTo": pay_to,
+        "validAfter": "0",
+        "validBefore": "9999999999",
+        "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001",
     }
     payload = {
         "x402Version": 2,
         "payload": {"authorization": auth, "signature": "0xsig"},
-        "accepted": {"network": network},
+        "accepted": {
+            "scheme": "exact",
+            "network": network,
+            "asset": "0x3600000000000000000000000000000000000000",
+            "amount": value,
+            "payTo": "0x" + "ab" * 20,
+            "maxTimeoutSeconds": 604900,
+            "extra": {
+                "name": "GatewayWalletBatched",
+                "version": "1",
+                "verifyingContract": "0x0077777d7EBA4688BDeF3E311b846F25870A19B9",
+            },
+        },
+    }
+    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+def _build_minimal_auth_header(
+    *,
+    value: str = "10000",
+    from_addr: str = "0x" + "cd" * 20,
+) -> str:
+    """Build a minimal base64 payment header (for negative tests)."""
+    auth = {
+        "from": from_addr,
+        "to": "0x" + "ab" * 20,
+        "value": value,
+        "validAfter": "0",
+        "validBefore": "9999999999",
+        "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001",
+    }
+    payload = {
+        "x402Version": 2,
+        "payload": {"authorization": auth, "signature": "0xsig"},
+        "accepted": {
+            "scheme": "exact",
+            "network": "eip155:5042002",
+            "asset": "0x3600000000000000000000000000000000000000",
+            "amount": value,
+            "payTo": "0x" + "ab" * 20,
+            "maxTimeoutSeconds": 604900,
+            "extra": {
+                "name": "GatewayWalletBatched",
+                "version": "1",
+                "verifyingContract": "0x0077777d7EBA4688BDeF3E311b846F25870A19B9",
+            },
+        },
     }
     return base64.b64encode(json.dumps(payload).encode()).decode()
 
@@ -188,16 +240,12 @@ class TestGatewayPaymentResponseHeader:
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
         )
-        net = get_network("arcTestnet")
-        expected_asset = net.usdc_address
 
         mock_request = AsyncMock()
         mock_request.path = "/test"
         mock_request.headers = {
             PAYMENT_SIGNATURE_HEADER: _build_auth_header(
                 value="10000",
-                asset=expected_asset,
-                pay_to=_VALID_SELLER,
                 network="eip155:5042002",
             )
         }
@@ -226,15 +274,12 @@ class TestGatewayServerAmountInResult:
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
         )
-        net = get_network("arcTestnet")
 
         mock_request = AsyncMock()
         mock_request.path = "/test"
         mock_request.headers = {
             PAYMENT_SIGNATURE_HEADER: _build_auth_header(
                 value="10000",
-                asset=net.usdc_address,
-                pay_to=_VALID_SELLER,
                 network="eip155:5042002",
             )
         }
@@ -332,6 +377,896 @@ class TestSupportsCLIBackendNetwork:
 
 
 # ---------------------------------------------------------------------------
+# TestOfficialPayloadCompatibility — proves official Circle payloads work
+# ---------------------------------------------------------------------------
+
+
+class TestOfficialPayloadCompatibility:
+    """Official Circle x402 payloads have authorization WITHOUT asset, payTo, or network.
+    These fields live in the 'accepted' section, not inside the signed authorization.
+    This class proves the middleware/gateway correctly handles such payloads.
+    """
+
+    @pytest.mark.asyncio
+    async def test_official_payload_reaches_settle_middleware(self):
+        """Official payload must pass all validation and reach _settle."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            result = await mw.process_request(mock_request, price="$0.01")
+            assert result is not None
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_authorization_asset_does_not_reject(self):
+        """authorization.asset is NOT in official payloads — must NOT cause rejection."""
+        mw = _make_middleware()
+        # Official payload has no asset in authorization
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            result = await mw.process_request(mock_request, price="$0.01")
+            # Must NOT be None (402) — should succeed
+            assert result is not None
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_authorization_payTo_does_not_reject(self):
+        """authorization.payTo is NOT in official payloads — must NOT cause rejection."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            result = await mw.process_request(mock_request, price="$0.01")
+            assert result is not None
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_authorization_network_does_not_reject(self):
+        """authorization.network is NOT in official payloads — must NOT cause rejection."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            result = await mw.process_request(mock_request, price="$0.01")
+            assert result is not None
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_full_decoded_payload_passed_to_settlement(self):
+        """The complete decoded payload (with nested structure) is passed to _settle."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            call_args = mock_settle.call_args
+            payload = call_args[0][0]  # first positional arg = decoded payload
+            # Must contain the nested structure from official format
+            assert "x402Version" in payload
+            assert "payload" in payload
+            assert "authorization" in payload["payload"]
+            assert "accepted" in payload
+
+    @pytest.mark.asyncio
+    async def test_server_requirements_passed_separately(self):
+        """Server-generated requirements are passed as second arg to _settle."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]  # second positional arg = requirements
+            assert "scheme" in requirements
+            assert "network" in requirements
+            assert "asset" in requirements
+            assert "amount" in requirements
+            assert "payTo" in requirements
+
+    @pytest.mark.asyncio
+    async def test_official_payload_gateway_settle(self):
+        """Official payload passes validation in seller_gateway and reaches _settle."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 200
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_gateway_missing_auth_asset_no_rejection(self):
+        """seller_gateway must not reject when authorization has no asset field."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            # Must NOT be 402 — should succeed
+            assert resp.status == 200
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_gateway_missing_auth_payTo_no_rejection(self):
+        """seller_gateway must not reject when authorization has no payTo field."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 200
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_gateway_missing_auth_network_no_rejection(self):
+        """seller_gateway must not reject when authorization has no network field."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 200
+            mock_settle.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestServerAuthority — proves server controls requirements, not client
+# ---------------------------------------------------------------------------
+
+
+class TestServerAuthority:
+    """Server requirements must use server-configured values, never client-provided ones.
+    Client's accepted fields cannot override amount, asset, seller address, network,
+    or verifying contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_server_requirements_contain_configured_asset(self):
+        """Server requirements must contain the server-configured USDC asset."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            assert requirements["asset"] == _VALID_ASSET
+
+    @pytest.mark.asyncio
+    async def test_server_requirements_contain_seller_address(self):
+        """Server requirements must contain the configured seller address."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            assert requirements["payTo"] == _VALID_SELLER
+
+    @pytest.mark.asyncio
+    async def test_server_requirements_contain_server_computed_amount(self):
+        """Server requirements must contain the server-computed amount, not client's."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="99999")  # client claims wrong amount
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        # Client offers 99999 but server price is $0.01 = 10000
+        # This should be rejected as underpayment
+        result = await mw.process_request(mock_request, price="$0.01")
+        assert result is None  # rejected
+
+    @pytest.mark.asyncio
+    async def test_server_requirements_contain_caip2_network(self):
+        """Server requirements must contain CAIP-2 network, not registry key."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000", network="eip155:5042002")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            assert requirements["network"] == "eip155:5042002"
+
+    @pytest.mark.asyncio
+    async def test_server_requirements_contain_gateway_verifying_contract(self):
+        """Server requirements must contain the gateway verifying contract."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            assert "verifyingContract" in requirements["extra"]
+            assert requirements["extra"]["name"] == "GatewayWalletBatched"
+
+    @pytest.mark.asyncio
+    async def test_client_accepted_cannot_override_amount(self):
+        """Client's accepted.amount must NOT override server-computed amount."""
+        mw = _make_middleware()
+        # Client claims amount=99999 in accepted, but server price is $0.01 = 10000
+        # Client's value in authorization is also 99999
+        header = _build_auth_header(value="99999")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        # Should be rejected because client value != server amount
+        result = await mw.process_request(mock_request, price="$0.01")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_client_accepted_cannot_override_asset(self):
+        """Client's accepted.asset must NOT override server-configured asset."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+        net = get_network("arcTestnet")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            # Server's asset must match network config, not client's
+            assert requirements["asset"] == net.usdc_address
+
+    @pytest.mark.asyncio
+    async def test_client_accepted_cannot_override_seller_address(self):
+        """Client's accepted.payTo must NOT override server's seller address."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            # payTo must be server's seller address
+            assert requirements["payTo"] == _VALID_SELLER
+
+    @pytest.mark.asyncio
+    async def test_client_accepted_cannot_override_network(self):
+        """Client's accepted.network is used to select the NetworkConfig, not to
+        override server's supported networks."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        # Client claims to pay on arcTestnet
+        mock_request.headers = {
+            PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000", network="eip155:5042002")
+        }
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            assert requirements["network"] == "eip155:5042002"
+
+    @pytest.mark.asyncio
+    async def test_client_accepted_cannot_override_verifying_contract(self):
+        """Server's verifyingContract must come from network config, not client."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+        net = get_network("arcTestnet")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            assert requirements["extra"]["verifyingContract"] == net.gateway_wallet
+
+
+# ---------------------------------------------------------------------------
+# TestPriceProtection — proves amount validation before settlement
+# ---------------------------------------------------------------------------
+
+
+class TestPriceProtection:
+    """Underpayment, overpayment, and malformed values must be rejected
+    before settlement is attempted."""
+
+    @pytest.mark.asyncio
+    async def test_underpayment_rejected_middleware(self):
+        """Middleware rejects underpayment before reaching _settle."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="5000")  # $0.005
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            result = await mw.process_request(mock_request, price="$0.01")
+            assert result is None
+            mock_settle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_overpayment_rejected_middleware(self):
+        """Middleware rejects overpayment before reaching _settle."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="20000")  # $0.02
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            result = await mw.process_request(mock_request, price="$0.01")
+            assert result is None
+            mock_settle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exact_amount_reaches_settlement(self):
+        """Exact server amount reaches settlement."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            result = await mw.process_request(mock_request, price="$0.01")
+            assert result is not None
+            mock_settle.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_malformed_authorization_value_rejected(self):
+        """Non-numeric authorization value is rejected."""
+        mw = _make_middleware()
+        # Build a header with a non-numeric value
+        auth = {
+            "from": "0x" + "cd" * 20,
+            "to": "0x" + "ab" * 20,
+            "value": "not_a_number",
+            "validAfter": "0",
+            "validBefore": "9999999999",
+            "nonce": "0x01",
+        }
+        payload = {
+            "x402Version": 2,
+            "payload": {"authorization": auth, "signature": "0xsig"},
+            "accepted": {"network": "eip155:5042002"},
+        }
+        header = base64.b64encode(json.dumps(payload).encode()).decode()
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        result = await mw.process_request(mock_request, price="$0.01")
+        assert result is None  # rejected
+
+    @pytest.mark.asyncio
+    async def test_settlement_always_receives_server_computed_amount(self):
+        """Settlement requirements always use server-computed amount."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            call_args = mock_settle.call_args
+            requirements = call_args[0][1]
+            # Server-computed amount for $0.01 = 10000
+            assert requirements["amount"] == "10000"
+
+    @pytest.mark.asyncio
+    async def test_gateway_underpayment_rejected(self):
+        """Gateway rejects underpayment before reaching _settle."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="5000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 402
+            mock_settle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gateway_overpayment_rejected(self):
+        """Gateway rejects overpayment before reaching _settle."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="20000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 402
+            mock_settle.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestSettlementFlow — proves correct settlement behavior
+# ---------------------------------------------------------------------------
+
+
+class TestSettlementFlow:
+    """Settlement flow: successful → handler runs, failed → handler skipped."""
+
+    @pytest.mark.asyncio
+    async def test_successful_settlement_executes_handler(self):
+        """Successful settlement must execute the protected handler exactly once."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        handler_called = []
+
+        async def handler(req):
+            handler_called.append(True)
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 200
+            assert len(handler_called) == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_settlement_does_not_execute_handler(self):
+        """Failed settlement must NOT execute the protected handler."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        handler_called = []
+
+        async def handler(req):
+            handler_called.append(True)
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": False, "errorReason": "insufficient"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 402
+            assert len(handler_called) == 0
+
+    @pytest.mark.asyncio
+    async def test_settlement_exception_fails_closed(self):
+        """Settlement exceptions must fail closed (402), not propagate."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.side_effect = RuntimeError("gateway timeout")
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 402
+
+    @pytest.mark.asyncio
+    async def test_payment_result_stores_server_computed_amount(self):
+        """PaymentResult must store server-computed amount, not client value."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        stored = {}
+        original_setitem = mock_request.__setitem__
+
+        def track_setitem(self_or_key, key=None, value=None):
+            if key is None:
+                original_setitem(self_or_key, key)
+            else:
+                stored[key] = value
+                original_setitem(self_or_key, key, value)
+
+        mock_request.__setitem__ = track_setitem
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            payment = stored["x402_payment"]
+            assert payment.amount == "10000"
+
+    @pytest.mark.asyncio
+    async def test_payment_context_stores_server_computed_amount(self):
+        """ContextVar payment context must store server-computed amount."""
+        from hermes_x402.context import get_payment_context
+
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            await mw.process_request(mock_request, price="$0.01")
+
+            ctx = get_payment_context()
+            assert ctx is not None
+            assert ctx.amount == "10000"
+            assert ctx.network == "eip155:5042002"
+
+    @pytest.mark.asyncio
+    async def test_caip2_network_preserved_in_result(self):
+        """CAIP-2 network is preserved through the settlement flow."""
+        mw = _make_middleware()
+        header = _build_auth_header(value="10000", network="eip155:5042002")
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: header}
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            result = await mw.process_request(mock_request, price="$0.01")
+            assert result is not None
+            assert result.network == "eip155:5042002"
+
+
+# ---------------------------------------------------------------------------
+# TestPaymentResponseHeader — proves PAYMENT-RESPONSE header format
+# ---------------------------------------------------------------------------
+
+
+class TestPaymentResponseHeader:
+    """PAYMENT-RESPONSE header must be base64-encoded JSON with transaction and network."""
+
+    @pytest.mark.asyncio
+    async def test_header_exists_after_settlement(self):
+        """Header exists after successful settlement."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx123"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert PAYMENT_RESPONSE_HEADER in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_header_is_base64_encoded(self):
+        """Header value is base64-encoded, not raw JSON."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx123"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            header_val = resp.headers[PAYMENT_RESPONSE_HEADER]
+            # Should NOT start with '{' (not raw JSON)
+            assert not header_val.startswith("{")
+            # Should be valid base64 that decodes to JSON
+            decoded = json.loads(base64.b64decode(header_val))
+            assert isinstance(decoded, dict)
+
+    @pytest.mark.asyncio
+    async def test_decoded_json_has_transaction(self):
+        """Decoded JSON has transaction field."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx123"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            decoded = json.loads(base64.b64decode(resp.headers[PAYMENT_RESPONSE_HEADER]))
+            assert "transaction" in decoded
+            assert decoded["transaction"] == "0xtx123"
+
+    @pytest.mark.asyncio
+    async def test_decoded_json_has_network(self):
+        """Decoded JSON has network field."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx123"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            decoded = json.loads(base64.b64decode(resp.headers[PAYMENT_RESPONSE_HEADER]))
+            assert "network" in decoded
+            assert decoded["network"] == "eip155:5042002"
+
+    @pytest.mark.asyncio
+    async def test_no_header_before_settlement(self):
+        """No payment response header before settlement (no payment header sent)."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {}  # No payment header
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+        assert resp.status == 402
+        assert PAYMENT_RESPONSE_HEADER not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_failed_settlement_no_success_header(self):
+        """Failed settlement does not produce a success payment response header."""
+        from aiohttp import web
+
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+        )
+
+        mock_request = AsyncMock()
+        mock_request.path = "/test"
+        mock_request.headers = {PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")}
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": False, "errorReason": "insufficient"}
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+            assert resp.status == 402
+            assert PAYMENT_RESPONSE_HEADER not in resp.headers
+
+
+# ---------------------------------------------------------------------------
 # Complete settlement flow with official payload
 # ---------------------------------------------------------------------------
 
@@ -354,8 +1289,6 @@ class TestCompleteSettlementFlow:
         mock_request.headers = {
             PAYMENT_SIGNATURE_HEADER: _build_auth_header(
                 value="10000",
-                asset=net.usdc_address,
-                pay_to=_VALID_SELLER,
                 network="eip155:5042002",
                 from_addr="0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             )

@@ -513,7 +513,7 @@ class TestX402ServiceInspect:
                 mc.__aenter__ = AsyncMock(return_value=mc)
                 mc.__aexit__ = AsyncMock(return_value=False)
                 mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.head = AsyncMock(return_value=mock_response)
+                mc.request = AsyncMock(return_value=mock_response)
 
                 result = json.loads(
                     asyncio.run(
@@ -527,8 +527,8 @@ class TestX402ServiceInspect:
                 assert result["success"] is False
                 assert result["error"] == "redirect_not_followed"
                 assert result["status"] == 302
-                # Redirect target is NOT requested (head called once only)
-                assert mock_client.return_value.head.call_count == 1
+                # Redirect target is NOT requested (request called once only)
+                assert mc.request.call_count == 1
 
     # ---------------------------------------------------------------------------
     # Fetch tool tests
