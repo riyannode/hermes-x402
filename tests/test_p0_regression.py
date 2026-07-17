@@ -87,9 +87,7 @@ class TestMiddlewareServerAmount:
         assert result is None  # 402
         # Verify 402 response was stored on request
         assert mock_request.__setitem__.call_count > 0
-        stored_keys = [
-            call.args[0] for call in mock_request.__setitem__.call_args_list
-        ]
+        stored_keys = [call.args[0] for call in mock_request.__setitem__.call_args_list]
         assert "x402_402" in stored_keys
 
     @pytest.mark.asyncio
@@ -104,9 +102,7 @@ class TestMiddlewareServerAmount:
 
         result = await mw.process_request(mock_request, price="$0.01")
         assert result is None
-        stored_keys = [
-            call.args[0] for call in mock_request.__setitem__.call_args_list
-        ]
+        stored_keys = [call.args[0] for call in mock_request.__setitem__.call_args_list]
         assert "x402_402" in stored_keys
 
     @pytest.mark.asyncio
@@ -211,9 +207,7 @@ class TestGatewayPaymentResponseHeader:
 
         with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
             mock_settle.return_value = {"success": True, "transaction": "0xtx123"}
-            resp = await gw._handle_request(
-                mock_request, handler, "$0.01", None, None, "test"
-            )
+            resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
             assert resp.status == 200
             assert PAYMENT_RESPONSE_HEADER in resp.headers
 
@@ -264,9 +258,7 @@ class TestGatewayServerAmountInResult:
 
         with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
             mock_settle.return_value = {"success": True, "transaction": "0xtx"}
-            await gw._handle_request(
-                mock_request, handler, "$0.01", None, None, "test"
-            )
+            await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
             payment = stored["x402_payment"]
             assert payment.amount == "10000"  # server-computed, not client-provided
 

@@ -342,6 +342,7 @@ async def check_supports(
     url: str,
     method: str = "GET",
     *,
+    body: Any = None,
     config: Any = None,
 ) -> SupportResult:
     """Check x402 support for a URL without signing, paying, or depositing.
@@ -394,17 +395,19 @@ async def check_supports(
         if configured_backend == "cli":
             wallet_network = getattr(config, "circle_cli_network", None)
         else:
-            wallet_network = getattr(config, "blockchain", None) or getattr(
-                config, "network", None
-            )
+            wallet_network = getattr(config, "blockchain", None) or getattr(config, "network", None)
 
     # --- Issue unpaid HTTP request ---
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-            response = await client.request(
-                method=normalized_method,
-                url=url,
-            )
+            kwargs_req: dict[str, Any] = {
+                "method": normalized_method,
+                "url": url,
+            }
+            if body is not None and normalized_method in {"POST", "PUT", "PATCH"}:
+                kwargs_req["json"] = body
+
+            response = await client.request(**kwargs_req)
     except httpx.HTTPError as exc:
         return SupportResult(
             supported=False,

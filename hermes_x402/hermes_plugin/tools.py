@@ -673,6 +673,7 @@ def register_supports_tools(ctx: Any) -> None:
     async def supports_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
         method = (args.get("method") or "GET").upper()
+        body = args.get("body")
 
         err = _validate_url(url)
         if err:
@@ -681,6 +682,12 @@ def register_supports_tools(ctx: Any) -> None:
             )
 
         err = _validate_method(method)
+        if err:
+            return format_success_result(
+                {"success": False, "error": "invalid_input", "message": err}
+            )
+
+        err = _validate_body_size(body)
         if err:
             return format_success_result(
                 {"success": False, "error": "invalid_input", "message": err}
@@ -725,7 +732,7 @@ def register_supports_tools(ctx: Any) -> None:
         try:
             from hermes_x402.buyer.supports import check_supports
 
-            result = await check_supports(url, method=method, config=runtime.config)
+            result = await check_supports(url, method=method, body=body, config=runtime.config)
             return format_success_result(
                 {
                     "success": True,
@@ -789,6 +796,20 @@ def register_service_tools(ctx: Any) -> None:
 
     async def service_inspect_handler(args: dict, **kwargs: Any) -> str:
         url = args.get("url", "")
+        method = (args.get("method") or "GET").upper()
+        body = args.get("body")
+
+        err = _validate_method(method)
+        if err:
+            return format_success_result(
+                {"success": False, "error": "invalid_input", "message": err}
+            )
+
+        err = _validate_body_size(body)
+        if err:
+            return format_success_result(
+                {"success": False, "error": "invalid_input", "message": err}
+            )
 
         runtime = get_runtime()
         runtime.ensure_initialized()
@@ -829,7 +850,15 @@ def register_service_tools(ctx: Any) -> None:
 
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.head(url, follow_redirects=False)
+                kwargs_req: dict[str, Any] = {
+                    "method": method,
+                    "url": url,
+                    "follow_redirects": False,
+                }
+                if body is not None and method in {"POST", "PUT", "PATCH"}:
+                    kwargs_req["json"] = body
+
+                response = await client.request(**kwargs_req)
 
                 # Check redirect
                 redirect = _check_redirect(response)
@@ -866,7 +895,7 @@ def register_service_tools(ctx: Any) -> None:
         is_async=True,
         description=(
             "Inspect an x402 service URL without paying. "
-            "Issue an HTTP HEAD request to discover status, headers, and "
+            "Issue an HTTP request to discover status, headers, and "
             "payment-required challenges. Always inspect BEFORE payment. "
             "Preserve the HTTP method and URL for subsequent x402_supports "
             "and x402_pay calls."

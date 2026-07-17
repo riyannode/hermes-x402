@@ -304,9 +304,7 @@ class TestSettleRequirements:
     def test_requirements_structure(self):
         gateway = _make_gateway()
         # _build_settle_requirements expects CAIP-2 network identifiers
-        reqs = gateway._build_settle_requirements(
-            "10000", "eip155:8453", gateway._networks
-        )
+        reqs = gateway._build_settle_requirements("10000", "eip155:8453", gateway._networks)
         assert reqs["scheme"] == "exact"
         assert reqs["network"] == "eip155:8453"
         assert reqs["amount"] == "10000"

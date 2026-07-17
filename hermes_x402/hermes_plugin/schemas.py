@@ -118,6 +118,14 @@ X402_SERVICE_INSPECT_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": "URL of the x402 service to inspect.",
             },
+            "method": {
+                "type": "string",
+                "description": "HTTP method (default: GET).",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+            },
+            "body": {
+                "description": "Request body (for POST/PUT/PATCH).",
+            },
         },
         "required": ["url"],
     },
@@ -140,6 +148,9 @@ X402_SUPPORTS_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": "HTTP method intended for payment (default: GET).",
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+            },
+            "body": {
+                "description": "Request body (for POST/PUT/PATCH).",
             },
         },
         "required": ["url"],

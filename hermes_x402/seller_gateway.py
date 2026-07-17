@@ -369,14 +369,11 @@ class X402Gateway:
 
         payer = authorization.get("from", "")
         client_value = str(authorization.get("value", "0"))
-        auth_network = authorization.get("network", "")
-        auth_asset = authorization.get("asset", "")
-        auth_pay_to = authorization.get("payTo", "")
 
         # Determine which network the client claims to pay on.
         # The accepted-network field in the payload must be CAIP-2.
         accepted = decoded.get("accepted", {})
-        payload_network = accepted.get("network", auth_network)
+        payload_network = accepted.get("network", "")
 
         # Validate network is one we accept (CAIP-2 matching)
         accepted_networks = {n.caip2 for n in route_networks}
@@ -386,25 +383,6 @@ class X402Gateway:
                 payload_network,
                 accepted_networks,
             )
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
-
-        # Resolve the NetworkConfig for the claimed network
-        network_config: NetworkConfig | None = None
-        for net in route_networks:
-            if net.caip2 == payload_network:
-                network_config = net
-                break
-
-        if network_config is None:
-            logger.warning("No NetworkConfig found for network %s", payload_network)
             body = self._build_402_body(
                 amount, request.path, description, route_networks, route_accepts
             )
@@ -433,40 +411,6 @@ class X402Gateway:
 
         if client_atomic != server_atomic:
             logger.warning("Underpayment rejected: client=%s server=%s", client_value, amount)
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
-
-        # Validate asset matches expected USDC contract
-        if not auth_asset or auth_asset.lower() != network_config.usdc_address.lower():
-            logger.warning(
-                "Payment asset mismatch: got %r, expected %r",
-                auth_asset,
-                network_config.usdc_address,
-            )
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
-
-        # Validate payTo matches configured seller address
-        if not auth_pay_to or auth_pay_to.lower() != self._seller_address.lower():
-            logger.warning(
-                "Payment payTo mismatch: got %r, expected %r",
-                auth_pay_to,
-                self._seller_address,
-            )
             body = self._build_402_body(
                 amount, request.path, description, route_networks, route_accepts
             )
@@ -532,9 +476,9 @@ class X402Gateway:
         response = await handler_call(request)
         # Add Payment-Response header after successful settlement
         if isinstance(response, web.Response):
-            response.headers[PAYMENT_RESPONSE_HEADER] = json.dumps(
-                {"transaction": transaction, "network": payload_network}
-            )
+            response.headers[PAYMENT_RESPONSE_HEADER] = base64.b64encode(
+                json.dumps({"transaction": transaction, "network": payload_network}).encode()
+            ).decode()
         return response
 
     def _build_accepts(
