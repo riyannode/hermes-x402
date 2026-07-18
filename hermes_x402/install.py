@@ -962,22 +962,21 @@ def run_install(
         # 4b. Circle CLI bootstrap (only when explicitly requested)
         if with_circle_cli:
             from hermes_x402.circle_cli_installer import run_circle_cli_bootstrap
+
             cli_report = run_circle_cli_bootstrap(with_circle_cli=True)
             report["circle_cli"] = cli_report.to_dict()["circle_cli"]
             if cli_report.errors:
                 for err in cli_report.errors:
                     print(f"[install] Circle CLI: {err}")
             elif cli_report.installed:
-                print(
-                    f"[install] Circle CLI: v{cli_report.version} "
-                    f"at {cli_report.executable}"
-                )
+                print(f"[install] Circle CLI: v{cli_report.version} at {cli_report.executable}")
                 # Write CIRCLE_CLI_EXECUTABLE to .env
                 if cli_report.executable:
                     from hermes_x402.env_writer import (
                         _resolve_hermes_home,
                         update_env_file,
                     )
+
                     hermes_home = _resolve_hermes_home()
                     env_path = hermes_home / ".env"
                     try:
@@ -985,14 +984,10 @@ def run_install(
                             env_path,
                             {"CIRCLE_CLI_EXECUTABLE": cli_report.executable},
                         )
-                        print(
-                            f"[install] Wrote CIRCLE_CLI_EXECUTABLE to {env_path}"
-                        )
+                        print(f"[install] Wrote CIRCLE_CLI_EXECUTABLE to {env_path}")
                     except OSError as exc:
                         cli_report.errors.append(f"env_write_failed: {exc}")
-                        report["circle_cli"]["errors"].append(
-                            f"env_write_failed: {exc}"
-                        )
+                        report["circle_cli"]["errors"].append(f"env_write_failed: {exc}")
 
         if not check_only:
             # 5. Build wheel

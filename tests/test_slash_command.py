@@ -19,21 +19,16 @@ Covers:
 
 from __future__ import annotations
 
-import os
-from decimal import Decimal
-from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hermes_x402.hermes_plugin.slash_command import (
     _handle_configure_apply,
     _handle_configure_preview,
-    _handle_configure_show,
     _validate_configure_args,
     handle_x402_command,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -68,8 +63,6 @@ class TestCommandRegistration:
         """Exactly one command is registered."""
         from hermes_x402.hermes_plugin.entry import register
 
-        commands = []
-
         class FakeCtx:
             def __init__(self):
                 self.tools = []
@@ -92,8 +85,6 @@ class TestCommandRegistration:
     def test_command_name_is_x402(self):
         """The registered command name is exactly 'x402'."""
         from hermes_x402.hermes_plugin.entry import register
-
-        commands = []
 
         class FakeCtx:
             def __init__(self):
@@ -263,10 +254,13 @@ class TestConfigurePreview:
 
 class TestConfigureApply:
     def test_apply_writes_managed_keys(self, tmp_path):
-        with patch(
-            "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-            return_value=tmp_path,
-        ), patch("shutil.which", return_value="/usr/local/bin/hermes"):
+        with (
+            patch(
+                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
+                return_value=tmp_path,
+            ),
+            patch("shutil.which", return_value="/usr/local/bin/hermes"),
+        ):
             result = _handle_configure_apply(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )
@@ -284,10 +278,13 @@ class TestConfigureApply:
             assert "X402_ALLOW_CHAT_OTP=false" in content
 
     def test_apply_masks_wallet_in_output(self, tmp_path):
-        with patch(
-            "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-            return_value=tmp_path,
-        ), patch("shutil.which", return_value="/usr/local/bin/hermes"):
+        with (
+            patch(
+                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
+                return_value=tmp_path,
+            ),
+            patch("shutil.which", return_value="/usr/local/bin/hermes"),
+        ):
             result = _handle_configure_apply(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )
@@ -295,10 +292,13 @@ class TestConfigureApply:
             assert "ab" * 20 not in result  # not full address
 
     def test_apply_restart_required(self, tmp_path):
-        with patch(
-            "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-            return_value=tmp_path,
-        ), patch("shutil.which", return_value="/usr/local/bin/hermes"):
+        with (
+            patch(
+                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
+                return_value=tmp_path,
+            ),
+            patch("shutil.which", return_value="/usr/local/bin/hermes"),
+        ):
             result = _handle_configure_apply(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )
@@ -308,13 +308,14 @@ class TestConfigureApply:
     def test_apply_preserves_unrelated_vars(self, tmp_path):
         env_path = tmp_path / ".env"
         env_path.write_text("# comment\nUNRELATED_VAR=keep\n")
-        with patch(
-            "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-            return_value=tmp_path,
-        ), patch("shutil.which", return_value="/usr/local/bin/hermes"):
-            _handle_configure_apply(
-                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-            )
+        with (
+            patch(
+                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
+                return_value=tmp_path,
+            ),
+            patch("shutil.which", return_value="/usr/local/bin/hermes"),
+        ):
+            _handle_configure_apply(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"])
             content = env_path.read_text()
             assert "# comment" in content
             assert "UNRELATED_VAR=keep" in content
@@ -335,23 +336,17 @@ class TestWalletValidation:
         assert params["wallet"] == "0x" + "ab" * 20
 
     def test_invalid_wallet_short(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0xabc", "ARC-TESTNET", "0.10"]
-        )
+        _, err = _validate_configure_args(["buyer", "cli", "0xabc", "ARC-TESTNET", "0.10"])
         assert err is not None
         assert "wallet" in err.lower()
 
     def test_invalid_wallet_no_prefix(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "ab" * 20, "ARC-TESTNET", "0.10"]
-        )
+        _, err = _validate_configure_args(["buyer", "cli", "ab" * 20, "ARC-TESTNET", "0.10"])
         assert err is not None
         assert "wallet" in err.lower()
 
     def test_invalid_wallet_non_hex(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "zz" * 20, "ARC-TESTNET", "0.10"]
-        )
+        _, err = _validate_configure_args(["buyer", "cli", "0x" + "zz" * 20, "ARC-TESTNET", "0.10"])
         assert err is not None
         assert "wallet" in err.lower()
 
@@ -365,9 +360,7 @@ class TestNetworkValidation:
         assert params is not None
 
     def test_invalid_network(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "BASE", "0.10"]
-        )
+        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "BASE", "0.10"])
         assert err is not None
         assert "network" in err.lower()
 
@@ -382,9 +375,7 @@ class TestDecimalValidation:
         assert params["max_usdc"] == "0.10"
 
     def test_invalid_decimal(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "abc"]
-        )
+        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "abc"])
         assert err is not None
         assert "max_usdc" in err.lower()
 
@@ -396,16 +387,12 @@ class TestDecimalValidation:
         assert "max_usdc" in err.lower()
 
     def test_zero_decimal(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0"]
-        )
+        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0"])
         assert err is not None
         assert "max_usdc" in err.lower()
 
     def test_nan_decimal(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "NaN"]
-        )
+        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "NaN"])
         assert err is not None
 
     def test_infinity_decimal(self):
@@ -424,9 +411,7 @@ class TestRoleBackendValidation:
         assert "role" in err.lower()
 
     def test_only_cli_backend(self):
-        _, err = _validate_configure_args(
-            ["buyer", "dcw", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-        )
+        _, err = _validate_configure_args(["buyer", "dcw", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"])
         assert err is not None
         assert "backend" in err.lower()
 
@@ -446,10 +431,13 @@ class TestEnvContentSafety:
         """Apply output never dumps the full .env file."""
         env_path = tmp_path / ".env"
         env_path.write_text("SECRET_API_KEY=supersecretvalue\n")
-        with patch(
-            "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-            return_value=tmp_path,
-        ), patch("shutil.which", return_value="/usr/local/bin/hermes"):
+        with (
+            patch(
+                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
+                return_value=tmp_path,
+            ),
+            patch("shutil.which", return_value="/usr/local/bin/hermes"),
+        ):
             result = _handle_configure_apply(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )

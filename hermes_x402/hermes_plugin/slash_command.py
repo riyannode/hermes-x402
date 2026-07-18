@@ -274,8 +274,7 @@ def _validate_configure_args(
     # Validate wallet
     if not _WALLET_RE.match(wallet):
         return None, (
-            f"Invalid wallet address: {wallet!r}. "
-            "Must be 0x + 40 hexadecimal characters."
+            f"Invalid wallet address: {wallet!r}. Must be 0x + 40 hexadecimal characters."
         )
 
     # Validate network
@@ -316,11 +315,11 @@ def _handle_configure_preview(parts: list[str]) -> str:
         f"  CIRCLE_AGENT_WALLET_ADDRESS={_mask_wallet(params['wallet'])}",
         f"  CIRCLE_AGENT_WALLET_NETWORK={params['network']}",
         f"  X402_MAX_USDC_PER_PAYMENT={params['max_usdc']}",
-        f"  X402_NETWORK_POLICY=public",
-        f"  X402_HOST_ALLOWLIST=",
-        f"  X402_REQUIRE_GATEWAY_BATCHING=true",
-        f"  X402_ALLOW_HTTP=false",
-        f"  X402_ALLOW_CHAT_OTP=false",
+        "  X402_NETWORK_POLICY=public",
+        "  X402_HOST_ALLOWLIST=",
+        "  X402_REQUIRE_GATEWAY_BATCHING=true",
+        "  X402_ALLOW_HTTP=false",
+        "  X402_ALLOW_CHAT_OTP=false",
         "",
         "No changes written. Use '/x402 configure apply ...' to apply.",
     ]
@@ -354,6 +353,7 @@ def _handle_configure_apply(parts: list[str]) -> str:
 
     # Preserve CIRCLE_CLI_EXECUTABLE if a verified path exists
     import shutil
+
     circle_path = shutil.which("circle")
     if circle_path:
         managed_keys["CIRCLE_CLI_EXECUTABLE"] = circle_path

@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from hermes_x402.circle_cli_installer import (
     SUPPORTED_CLI_VERSION,
@@ -107,38 +103,47 @@ class TestInstallCliViaBun:
 
     def test_bun_add_success_but_no_binary(self):
         bun = Path("/usr/local/bin/bun")
-        with patch("hermes_x402.circle_cli_installer.subprocess.run") as mock_run, \
-             patch("hermes_x402.circle_cli_installer._find_existing_cli", return_value=None):
+        with (
+            patch("hermes_x402.circle_cli_installer.subprocess.run") as mock_run,
+            patch("hermes_x402.circle_cli_installer._find_existing_cli", return_value=None),
+        ):
             mock_run.return_value = MagicMock(returncode=0, stderr="")
             path, err = _install_cli_via_bun(bun)
             assert path is None
             assert err is not None
             assert "not found after" in err
 
-    def test_bun_add_success_wrong_version(self, tmp_path):
+    def test_bun_add_wrong_version(self, tmp_path):
         bun = tmp_path / "bun"
         bun.write_text("#!/bin/sh\n")
         fake_circle = tmp_path / "circle"
         fake_circle.write_text("#!/bin/sh\necho 0.0.5\n")
         fake_circle.chmod(0o755)
-        with patch("hermes_x402.circle_cli_installer.subprocess.run") as mock_run, \
-             patch("hermes_x402.circle_cli_installer._find_existing_cli", return_value=fake_circle), \
-             patch("hermes_x402.circle_cli_installer._query_cli_version", return_value="0.0.5"):
+        with (
+            patch("hermes_x402.circle_cli_installer.subprocess.run") as mock_run,
+            patch("hermes_x402.circle_cli_installer._find_existing_cli", return_value=fake_circle),
+            patch("hermes_x402.circle_cli_installer._query_cli_version", return_value="0.0.5"),
+        ):
             mock_run.return_value = MagicMock(returncode=0, stderr="")
             path, err = _install_cli_via_bun(bun)
             assert path is None
             assert err is not None
             assert "version" in err.lower()
 
-    def test_bun_add_success_correct_version(self, tmp_path):
+    def test_bun_add_correct_version(self, tmp_path):
         bun = tmp_path / "bun"
         bun.write_text("#!/bin/sh\n")
         fake_circle = tmp_path / "circle"
         fake_circle.write_text(f"#!/bin/sh\necho {SUPPORTED_CLI_VERSION}\n")
         fake_circle.chmod(0o755)
-        with patch("hermes_x402.circle_cli_installer.subprocess.run") as mock_run, \
-             patch("hermes_x402.circle_cli_installer._find_existing_cli", return_value=fake_circle), \
-             patch("hermes_x402.circle_cli_installer._query_cli_version", return_value=SUPPORTED_CLI_VERSION):
+        with (
+            patch("hermes_x402.circle_cli_installer.subprocess.run") as mock_run,
+            patch("hermes_x402.circle_cli_installer._find_existing_cli", return_value=fake_circle),
+            patch(
+                "hermes_x402.circle_cli_installer._query_cli_version",
+                return_value=SUPPORTED_CLI_VERSION,
+            ),
+        ):
             mock_run.return_value = MagicMock(returncode=0, stderr="")
             path, err = _install_cli_via_bun(bun)
             assert path is not None
@@ -179,12 +184,15 @@ class TestRunCircleCliBootstrap:
 
     def test_already_installed_supported_version(self):
         fake = Path("/usr/local/bin/circle")
-        with patch(
-            "hermes_x402.circle_cli_installer._find_existing_cli",
-            return_value=fake,
-        ), patch(
-            "hermes_x402.circle_cli_installer._query_cli_version",
-            return_value=SUPPORTED_CLI_VERSION,
+        with (
+            patch(
+                "hermes_x402.circle_cli_installer._find_existing_cli",
+                return_value=fake,
+            ),
+            patch(
+                "hermes_x402.circle_cli_installer._query_cli_version",
+                return_value=SUPPORTED_CLI_VERSION,
+            ),
         ):
             r = run_circle_cli_bootstrap(with_circle_cli=True)
             assert r.installed is True
@@ -194,12 +202,15 @@ class TestRunCircleCliBootstrap:
 
     def test_existing_unsupported_version(self):
         fake = Path("/usr/local/bin/circle")
-        with patch(
-            "hermes_x402.circle_cli_installer._find_existing_cli",
-            return_value=fake,
-        ), patch(
-            "hermes_x402.circle_cli_installer._query_cli_version",
-            return_value="0.0.5",
+        with (
+            patch(
+                "hermes_x402.circle_cli_installer._find_existing_cli",
+                return_value=fake,
+            ),
+            patch(
+                "hermes_x402.circle_cli_installer._query_cli_version",
+                return_value="0.0.5",
+            ),
         ):
             r = run_circle_cli_bootstrap(with_circle_cli=True)
             assert r.installed is False
@@ -207,12 +218,15 @@ class TestRunCircleCliBootstrap:
             assert "circle_cli_version_mismatch" in r.errors[0]
 
     def test_absent_no_bun(self):
-        with patch(
-            "hermes_x402.circle_cli_installer._find_existing_cli",
-            return_value=None,
-        ), patch(
-            "hermes_x402.circle_cli_installer._check_bun_available",
-            return_value=None,
+        with (
+            patch(
+                "hermes_x402.circle_cli_installer._find_existing_cli",
+                return_value=None,
+            ),
+            patch(
+                "hermes_x402.circle_cli_installer._check_bun_available",
+                return_value=None,
+            ),
         ):
             r = run_circle_cli_bootstrap(with_circle_cli=True)
             assert r.installed is False

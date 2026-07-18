@@ -125,8 +125,8 @@ def update_env_file(
                 os.close(dir_fd)
     except BaseException:
         # Clean up temp file on failure
-        try:
+        import contextlib
+
+        with contextlib.suppress(OSError):
             os.unlink(tmp_path)
-        except OSError:
-            pass
         raise

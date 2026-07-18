@@ -19,8 +19,6 @@ Proves:
 
 from __future__ import annotations
 
-import pytest
-
 
 class TestArcCliNetworkCanonicalization:
     """Regression: ARC-TESTNET must resolve correctly through the registry."""

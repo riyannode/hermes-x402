@@ -8,7 +8,6 @@ funds wallets, pays, or deposits. Never prints credentials.
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
@@ -115,8 +114,7 @@ def _install_cli_via_bun(bun: Path) -> tuple[Path | None, str | None]:
     version = _query_cli_version(circle_path)
     if version != SUPPORTED_CLI_VERSION:
         return None, (
-            f"Installed circle version {version} does not match "
-            f"expected {SUPPORTED_CLI_VERSION}"
+            f"Installed circle version {version} does not match expected {SUPPORTED_CLI_VERSION}"
         )
 
     return circle_path, None
