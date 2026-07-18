@@ -59,3 +59,7 @@ class CircleCliPaymentFailedError(CircleCliError):
 
 class CircleCliPaymentOutcomeUnknownError(CircleCliError):
     """Payment submission may have happened; it must never be retried automatically."""
+
+
+class CircleCliTermsRequiredError(CircleCliError):
+    """Circle Terms of Use must be accepted manually before proceeding."""

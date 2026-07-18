@@ -45,7 +45,8 @@ X402_WALLET_STATUS_SCHEMA: dict[str, Any] = {
     "name": "x402_wallet_status",
     "description": (
         "Report Circle wallet status: CLI installation, authentication, "
-        "selected wallet, configured network. Read-only. "
+        "session validity, terms state, wallet existence, on-chain balance, "
+        "Gateway balance, blockers, and recommended next tool. Read-only. "
         "Never exposes entity secret, API key, or signing operations."
     ),
     "parameters": {
@@ -219,5 +220,135 @@ X402_PAY_SCHEMA: dict[str, Any] = {
             },
         },
         "required": ["url"],
+    },
+}
+
+X402_LOGIN_START_SCHEMA: dict[str, Any] = {
+    "name": "x402_login_start",
+    "description": (
+        "Start Circle Agent Wallet login. Supports two modes: "
+        "manual CLI (recommended) where the user runs a CLI command, "
+        "or chat OTP (optional, disabled by default) where the OTP is "
+        "delivered to this chat. Only runs when no valid session exists. "
+        "Returns an opaque login ID. Never accepts or stores Circle Terms "
+        "of Use. Apply expiry to pending login."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "email": {
+                "type": "string",
+                "description": "Email address for Circle Agent Wallet login.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["manual_cli", "chat_otp"],
+                "description": (
+                    "Login mode. manual_cli (default): user runs CLI command. "
+                    "chat_otp: OTP sent through chat (requires X402_ALLOW_CHAT_OTP=true)."
+                ),
+            },
+        },
+        "required": ["email"],
+    },
+}
+
+X402_LOGIN_COMPLETE_SCHEMA: dict[str, Any] = {
+    "name": "x402_login_complete",
+    "description": (
+        "Complete Circle Agent Wallet login with OTP via chat. "
+        "Disabled by default — requires X402_ALLOW_CHAT_OTP=true and "
+        "acknowledge_otp_exposure=true. OTP exists in memory only for the "
+        "duration of the call. Never logs or returns OTP. "
+        "Failed OTP consumes the Circle request — require new login_start."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "login_id": {
+                "type": "string",
+                "description": "Opaque login ID from x402_login_start.",
+            },
+            "otp": {
+                "type": "string",
+                "description": "One-time password from email.",
+            },
+            "acknowledge_otp_exposure": {
+                "type": "boolean",
+                "description": (
+                    "Must be true to acknowledge that the OTP will be "
+                    "handled in chat. Required for chat OTP mode."
+                ),
+            },
+        },
+        "required": ["login_id", "otp", "acknowledge_otp_exposure"],
+    },
+}
+
+X402_GATEWAY_BALANCE_SCHEMA: dict[str, Any] = {
+    "name": "x402_gateway_balance",
+    "description": (
+        "Report Circle Gateway balance for the active wallet and configured "
+        "network. Distinguishes Gateway balance from on-chain wallet USDC "
+        "balance. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+X402_GATEWAY_DEPOSIT_PREVIEW_SCHEMA: dict[str, Any] = {
+    "name": "x402_gateway_deposit_preview",
+    "description": (
+        "Preview a service-bound Gateway deposit without moving USDC. "
+        "Accepts service URL, HTTP method, and amount. "
+        "Verifies wallet, session, terms, and network support. "
+        "Returns a short-lived preview ID bound to config. "
+        "Read-only — must not move USDC."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "service_url": {
+                "type": "string",
+                "description": "URL of the x402 service for the deposit preview.",
+            },
+            "method": {
+                "type": "string",
+                "description": "HTTP method for the service request.",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+            },
+            "amount": {
+                "type": "string",
+                "description": "USDC amount to preview depositing.",
+            },
+            "body": {
+                "description": "Request body (for POST/PUT/PATCH).",
+            },
+        },
+        "required": ["service_url", "method", "amount"],
+    },
+}
+
+X402_GATEWAY_DEPOSIT_EXECUTE_SCHEMA: dict[str, Any] = {
+    "name": "x402_gateway_deposit_execute",
+    "description": (
+        "Execute a Gateway deposit using a preview ID from "
+        "x402_gateway_deposit_preview. Do not accept replacement amount, "
+        "wallet, network, or method. Revalidates session, config, wallet, "
+        "and preview expiry. Execute exactly once. "
+        "retry_safe=false for ambiguous outcomes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "preview_id": {
+                "type": "string",
+                "description": "Preview ID from x402_gateway_deposit_preview.",
+            },
+        },
+        "required": ["preview_id"],
     },
 }

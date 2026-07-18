@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 @dataclass(frozen=True)
 class CircleCliResult:
-    argv: tuple[str, ...]
+    argv: tuple[str, ...]  # OTP values are redacted to [REDACTED] for safety
     exit_code: int
     stdout: str
     stderr: str
@@ -25,6 +25,7 @@ class AgentWalletStatus:
     mainnet_status: str
     testnet_status: str
     email: str | None = None
+    terms_accepted: bool = True
 
     @property
     def authenticated(self) -> bool:
@@ -54,6 +55,28 @@ class CircleServicePayment:
     seller: str
     receipt: str | None = None
     transaction_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LoginStartResult:
+    request_id: str
+    email_masked: str
+    otp_required: bool = True
+
+
+@dataclass(frozen=True)
+class GatewayBalanceResult:
+    total_usdc: str
+    network: str | None = None
+    domain: int | None = None
+
+
+@dataclass(frozen=True)
+class GatewayDepositResult:
+    operation_id: str | None = None
+    transaction_hash: str | None = None
+    status: str = "pending"
+    network: str | None = None
 
 
 Operation = Literal["read", "auth", "payment"]

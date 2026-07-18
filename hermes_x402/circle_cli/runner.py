@@ -54,17 +54,38 @@ class CircleCliRunner:
             ("wallet", "status"),
             ("wallet", "list"),
             ("wallet", "balance"),
+            ("wallet", "login"),
             ("services", "search"),
             ("services", "inspect"),
             ("services", "pay"),
+            ("gateway", "balance"),
+            ("gateway", "deposit"),
         )
         if not argv or not any(argv[: len(prefix)] == prefix for prefix in allowed):
             raise CircleCliUnsupportedCapabilityError("Circle CLI operation is not allowlisted")
-        if any(
-            value in {"terms", "login", "logout", "create", "transfer", "execute"} for value in argv
-        ):
+        if any(value in {"terms", "transfer", "execute"} for value in argv):
             raise CircleCliUnsupportedCapabilityError("Circle CLI mutation is not allowlisted")
         return argv
+
+    @staticmethod
+    def _redact_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
+        """Return a copy of *argv* with any ``--otp`` value replaced by [REDACTED].
+
+        The real OTP is still passed to the subprocess; this redacted form is
+        stored in :class:`CircleCliResult` so it never leaks via logs, repr,
+        or exception messages.
+        """
+        redacted: list[str] = []
+        skip_next = False
+        for token in argv:
+            if skip_next:
+                redacted.append("[REDACTED]")
+                skip_next = False
+                continue
+            redacted.append(token)
+            if token == "--otp":
+                skip_next = True
+        return tuple(redacted)
 
     def _environment(self) -> dict[str, str]:
         environment = {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
@@ -100,6 +121,7 @@ class CircleCliRunner:
         parse_json: bool,
     ) -> CircleCliResult:
         argv = self._validate_args(args)
+        _redacted_argv = self._redact_argv(argv)
         try:
             process = await asyncio.create_subprocess_exec(
                 self.executable,
@@ -154,7 +176,7 @@ class CircleCliRunner:
                     raise CircleCliOutputError("Circle CLI JSON output must be an object or array")
                 parsed = candidate
         return CircleCliResult(
-            argv=argv,
+            argv=_redacted_argv,
             exit_code=process.returncode or 0,
             stdout=stdout,
             stderr=stderr,
