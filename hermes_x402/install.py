@@ -430,12 +430,10 @@ def _query_plugins_json(hermes_exe: Path) -> dict:
         raise RuntimeError(
             f"hermes plugins list --json failed (rc={result.returncode}): {result.stderr[:500]}"
         )
-
     try:
         records = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Failed to parse hermes plugins list JSON: {exc}") from exc
-
     for rec in records:
         if rec.get("name") == _PLUGIN_NAME:
             return rec
@@ -449,6 +447,11 @@ def _query_plugins_absent(hermes_exe: Path) -> bool:
     Fail-closed: raises RuntimeError on subprocess failure, invalid JSON,
     or any unexpected exception.  Returns True only when the command
     succeeds and the plugin is genuinely absent.
+
+    Output structure requirements:
+    - top-level JSON is a list
+    - every record is a dict
+    - records used for matching have a string name field
     """
     env = os.environ.copy()
     env[_ENV_DEBUG] = "1"
@@ -466,7 +469,20 @@ def _query_plugins_absent(hermes_exe: Path) -> bool:
         records = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Failed to parse hermes plugins list JSON: {exc}") from exc
-    return not any(r.get("name") == _PLUGIN_NAME for r in records)
+    if not isinstance(records, list):
+        raise RuntimeError(
+            f"hermes plugins list --json returned {type(records).__name__}, expected list"
+        )
+    for rec in records:
+        if not isinstance(rec, dict):
+            raise RuntimeError(
+                f"hermes plugins list --json record is {type(rec).__name__}, expected dict"
+            )
+    return not any(
+        isinstance(rec.get("name"), str) and rec.get("name") == _PLUGIN_NAME
+        for rec in records
+        if isinstance(rec, dict)
+    )
 
 
 def _verify_entrypoint_registration_contract(python: Path) -> dict:
@@ -519,30 +535,44 @@ def _verify_entrypoint_registration_contract(python: Path) -> dict:
 
 
 def _verify_installed_package_path(python: Path, repo_root: Path) -> dict:
-    """Verify hermes_x402 resolves from site-packages, not source checkout.
+    """Verify hermes_x402 belongs to the selected Hermes Python environment.
 
-    Runs with the selected Hermes Python, outside the repository directory,
-    with PYTHONPATH removed, using isolated mode (-I) where supported.
-    Returns dict with verification_type: "installed_package_path".
-    Raises RuntimeError on verification failure.
+    In an isolated subprocess with the selected Hermes Python:
+    - Collects hermes_x402.__file__, importlib.metadata.version,
+      sysconfig purelib/platlib, sys.executable
+    - Resolves all paths with os.path.realpath
+    - Requires sys.executable equals the selected Hermes Python
+    - Requires module path is underneath purelib or platlib
+    - Requires module path is NOT underneath repo_root
+    - Requires version is not missing or unknown
+
+    Returns dict with verification_type, path, version, purelib, platlib.
+    Raises RuntimeError on any verification failure.
     """
     repo_str = str(repo_root.resolve())
+    selected_py = str(python.resolve())
     code = (
-        "import json, sys, os, importlib\n"
-        "# Strip PYTHONPATH to prevent source checkout resolution\n"
-        "for key in list(os.environ):\n"
-        "    if key.upper().startswith('PYTHONPATH'):\n"
-        "        del os.environ[key]\n"
+        "import json, sys, os, sysconfig\n"
         "try:\n"
+        "    import importlib.metadata\n"
+        "    import importlib\n"
         "    mod = importlib.import_module('hermes_x402')\n"
-        "    mod_path = mod.__file__\n"
+        "    mod_path = os.path.realpath(mod.__file__)\n"
+        "    ver = importlib.metadata.version('hermes-x402')\n"
+        "    purelib = os.path.realpath(sysconfig.get_path('purelib'))\n"
+        "    platlib = os.path.realpath(sysconfig.get_path('platlib'))\n"
+        "    print(json.dumps({\n"
+        "        'ok': True,\n"
+        "        'mod_path': mod_path,\n"
+        "        'version': ver,\n"
+        "        'purelib': purelib,\n"
+        "        'platlib': platlib,\n"
+        "        'sys_executable': os.path.realpath(sys.executable),\n"
+        "    }))\n"
         "except Exception as e:\n"
         "    print(json.dumps({'ok': False, 'error': str(e)}))\n"
-        "    sys.exit(0)\n"
-        "print(json.dumps({'ok': True, 'path': mod_path}))\n"
     )
     clean_env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHONPATH")}
-    # Use -I (isolated) to ignore PYTHONPATH and site-packages env vars
     r = subprocess.run(
         [str(python), "-I", "-c", code],
         capture_output=True,
@@ -571,52 +601,52 @@ def _verify_installed_package_path(python: Path, repo_root: Path) -> dict:
         raise RuntimeError(
             f"Cannot import hermes_x402 in isolated mode: {result.get('error', 'unknown')}"
         )
-    mod_path = result.get("path", "")
-    # The installed module must NOT resolve to the source checkout
-    if repo_str in mod_path:
+
+    mod_path = result.get("mod_path", "")
+    ver = result.get("version", "")
+    purelib = result.get("purelib", "")
+    platlib = result.get("platlib", "")
+    sys_exec = result.get("sys_executable", "")
+
+    # 1. sys.executable must equal the selected Hermes Python
+    if sys_exec != selected_py:
+        raise RuntimeError(
+            f"sys.executable ({sys_exec}) does not match selected Hermes Python ({selected_py})"
+        )
+
+    # 2. Module path must be underneath purelib or platlib
+    under_purelib = purelib and mod_path.startswith(purelib + os.sep)
+    under_platlib = platlib and mod_path.startswith(platlib + os.sep)
+    if not under_purelib and not under_platlib:
+        raise RuntimeError(
+            f"hermes_x402 module ({mod_path}) is not under "
+            f"purelib ({purelib}) or platlib ({platlib}). "
+            f"Package may be resolved from source checkout."
+        )
+
+    # 3. Module path must NOT be under repo_root
+    if repo_str and mod_path.startswith(repo_str + os.sep):
         raise RuntimeError(
             f"hermes_x402 resolves to source checkout ({mod_path}) "
-            f"instead of installed site-packages. "
-            f"Ensure the package is installed in the Hermes venv."
+            f"instead of installed site-packages."
         )
+
+    # 4. Version must not be missing or unknown
+    if not ver or ver == "unknown":
+        raise RuntimeError(f"hermes_x402 version is {ver!r} — expected a real version")
+
     return {
         "verification_type": "installed_package_path",
         "path": mod_path,
+        "version": ver,
+        "purelib": purelib,
+        "platlib": platlib,
     }
 
 
 # ---------------------------------------------------------------------------
-# Package info
+# Package info (canonical — uses isolated verification result)
 # ---------------------------------------------------------------------------
-
-
-def _query_package_info(python: Path) -> dict:
-    """Query installed package version (via importlib.metadata) and module path."""
-    code = (
-        "import json\n"
-        "try:\n"
-        "    import importlib.metadata\n"
-        "    ver = importlib.metadata.version('hermes-x402')\n"
-        "except Exception:\n"
-        "    ver = 'unknown'\n"
-        "try:\n"
-        "    import hermes_x402\n"
-        "    mod_path = hermes_x402.__file__\n"
-        "except Exception:\n"
-        "    mod_path = 'unknown'\n"
-        "print(json.dumps({'version': ver, 'path': mod_path}))\n"
-    )
-    result = subprocess.run(
-        [str(python), "-c", code],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return {"version": "unknown", "path": "unknown"}
-    try:
-        return json.loads(result.stdout.strip())
-    except json.JSONDecodeError:
-        return {"version": "unknown", "path": "unknown"}
 
 
 def _get_commit_sha(repo_root: Path) -> str:
@@ -694,7 +724,17 @@ def _run_uninstall(hermes_exe: Path, python: Path, restart_gateway: bool = False
             except json.JSONDecodeError as exc:
                 report["errors"].append(f"Package absence verification: invalid JSON: {exc}")
             else:
-                if not result.get("absent", True):
+                if not isinstance(result, dict) or "absent" not in result:
+                    report["errors"].append(
+                        "Package absence verification: unexpected output "
+                        f"structure: {type(result).__name__}"
+                    )
+                elif not isinstance(result["absent"], bool):
+                    report["errors"].append(
+                        f"Package absence verification: 'absent' is "
+                        f"{type(result['absent']).__name__}, expected bool"
+                    )
+                elif not result["absent"]:
                     ver = result.get("version", "unknown")
                     report["errors"].append(
                         f"Package still importable after uninstall (version={ver})"
@@ -727,8 +767,12 @@ def _run_uninstall(hermes_exe: Path, python: Path, restart_gateway: bool = False
             print("[uninstall] Gateway restart required. Run:")
             print(f"  {hermes_exe} gateway restart")
 
-        report["success"] = True
-        print("[uninstall] ✅ Uninstall complete")
+        report["success"] = not report["errors"]
+        if report["success"]:
+            print("[uninstall] ✅ Uninstall complete")
+        else:
+            for err in report["errors"]:
+                print(f"[uninstall] ❌ {err}")
 
     except Exception as exc:
         report["errors"].append(str(exc))
@@ -959,33 +1003,28 @@ def run_install(
         if verification["hooks"] != _EXPECTED_HOOKS:
             report["errors"].append(f"Expected {_EXPECTED_HOOKS} hook, got {verification['hooks']}")
 
-        # 10. Verify installed package path (not source checkout)
+        # 10. Verify installed package path and version (isolated, canonical)
         if not check_only:
             try:
                 path_verification = _verify_installed_package_path(python_exe, repo_root)
                 report["package_path_verification"] = path_verification
-                print(f"[install] Package path: {path_verification['path']}")
+                report["installed_version"] = path_verification["version"]
+                report["module_path"] = path_verification["path"]
+                print(
+                    f"[install] Package: v{path_verification['version']} "
+                    f"at {path_verification['path']}"
+                )
             except RuntimeError as exc:
                 report["errors"].append(str(exc))
                 print(f"[install] ❌ {exc}")
 
-        # 11. Package info via importlib.metadata
-        pkg_info = _query_package_info(python_exe)
-        report["installed_version"] = pkg_info["version"]
-        report["module_path"] = pkg_info["path"]
-        print(f"[install] Installed: v{pkg_info['version']} at {pkg_info['path']}")
-
-        # Version consistency check
-        if (
-            not check_only
-            and version
-            and pkg_info["version"] != "unknown"
-            and version != pkg_info["version"]
-        ):
-            report["errors"].append(
-                f"Version mismatch: plugins list={version}, "
-                f"importlib.metadata={pkg_info['version']}"
-            )
+        # Version consistency check against plugins list
+        if not check_only and version:
+            installed_ver = report.get("installed_version", "")
+            if installed_ver and installed_ver != "unknown" and version != installed_ver:
+                report["errors"].append(
+                    f"Version mismatch: plugins list={version}, installed={installed_ver}"
+                )
 
         # 12. Gateway restart (only when explicitly requested)
         if not check_only:
