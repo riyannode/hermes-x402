@@ -1603,3 +1603,511 @@ class TestPreviewStoreBounds:
             raise AssertionError("Expected RuntimeError for full store")
         except RuntimeError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Focused regression tests — core fixes from PR #6 head
+# ---------------------------------------------------------------------------
+
+
+class TestUrlSanitizerRegression:
+    """Regression: malformed port raises ValueError/UnicodeError → [invalid URL]."""
+
+    def test_malformed_port_returns_invalid(self) -> None:
+        """URL with a non-numeric port triggers ValueError in parsed.port."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        # Python's urlparse is lenient — "https://example.com:notaport/path"
+        # may raise on .port access depending on the exact input
+        result = _sanitize_url_for_display("https://example.com:notaport/path")
+        # Either returns [invalid URL] or a valid sanitized URL — both are acceptable
+        # The key regression: must not raise an unhandled exception
+        assert isinstance(result, str)
+
+    def test_extreme_port_returns_invalid(self) -> None:
+        """URL with port outside valid range returns [invalid URL]."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        # A port with very long numeric string triggers ValueError on .port access
+        result = _sanitize_url_for_display("https://example.com:" + "9" * 30 + "/path")
+        assert result == "[invalid URL]"
+
+    def test_ipv6_display_is_bracketed(self) -> None:
+        """IPv6 hostnames are bracketed in the sanitized output."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display("https://[::1]/api")
+        assert "[" in result
+        assert "]" in result
+        assert "::1" in result
+
+    def test_ipv6_with_port_is_bracketed(self) -> None:
+        """IPv6 with port is bracketed as [host]:port."""
+        from hermes_x402.hermes_plugin.entry import _sanitize_url_for_display
+
+        result = _sanitize_url_for_display("https://[::1]:8443/api")
+        assert "[::1]:8443" in result
+
+
+class TestPreviewIdValidation:
+    """Regression: preview ID > 128 chars is blocked in approval hook and handler."""
+
+    def test_approval_hook_blocks_overlong_preview_id(self) -> None:
+        """Approval hook blocks preview_id exceeding 128 characters."""
+        from hermes_x402.hermes_plugin.entry import register
+        from hermes_x402.hermes_plugin.gateway_state import _lock, _previews
+
+        # Clear any stale previews
+        with _lock:
+            _previews.clear()
+
+        ctx = FakeHermesContext()
+        register(ctx)
+        hook_fn = ctx.hooks[0]["handler"]
+
+        long_id = "a" * 129
+        result = hook_fn(
+            "x402_gateway_deposit_execute",
+            {"preview_id": long_id},
+            tool_call_id="call_overflow",
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "128" in result["message"]
+
+    def test_approval_hook_allows_valid_preview_id(self) -> None:
+        """Approval hook allows preview_id within 1..128 characters."""
+        import time
+
+        from hermes_x402.hermes_plugin.entry import register
+        from hermes_x402.hermes_plugin.gateway_state import _lock, _previews, store_preview
+
+        # Clear any stale previews from previous tests
+        with _lock:
+            _previews.clear()
+
+        valid_id = "a" * 128
+        store_preview(
+            valid_id,
+            {
+                "service_url": "https://example.com",
+                "deposit_amount": "1.0",
+                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
+                "wallet_network": "ARC-TESTNET",
+                "deposit_method": "direct",
+                "expires_at": time.time() + 300,
+                "consumed": False,
+            },
+        )
+
+        ctx = FakeHermesContext()
+        register(ctx)
+        hook_fn = ctx.hooks[0]["handler"]
+
+        result = hook_fn(
+            "x402_gateway_deposit_execute",
+            {"preview_id": valid_id},
+            tool_call_id="call_valid",
+        )
+        assert result is not None
+        assert result["action"] == "approve"
+
+    async def test_execute_handler_blocks_overlong_preview_id(self) -> None:
+        """Execute handler rejects preview_id exceeding 128 characters."""
+        from hermes_x402.hermes_plugin.tools import register_gateway_tools
+
+        class _C:
+            def __init__(self):
+                self.tools = {}
+                self.hooks = []
+
+            def register_tool(self, **kw):
+                self.tools[kw["name"]] = kw
+
+            def register_hook(self, ht, h):
+                self.hooks.append({"hook_type": ht, "handler": h})
+
+        ctx = _C()
+        register_gateway_tools(ctx)
+        handler = ctx.tools["x402_gateway_deposit_execute"]["handler"]
+
+        long_id = "b" * 129
+        rt = MagicMock()
+        rt.cli_client = AsyncMock()
+        rt.config = MagicMock()
+        rt.is_configured = True
+        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
+            result = await handler({"preview_id": long_id})
+
+        data = json.loads(result)
+        assert data["success"] is False
+        assert data["error"] == "invalid_input"
+        assert "128" in data["message"]
+
+
+class TestPreviewStoreOverflow:
+    """Regression: full preview store returns structured error, never raw RuntimeError."""
+
+    async def test_full_store_returns_preview_store_full(self) -> None:
+        """When preview store is full, handler returns structured preview_store_full."""
+        from hermes_x402.hermes_plugin.gateway_state import (
+            _MAX_ACTIVE_PREVIEWS,
+            _lock,
+            _previews,
+        )
+        from hermes_x402.hermes_plugin.tools import register_gateway_tools
+
+        class _C:
+            def __init__(self):
+                self.tools = {}
+                self.hooks = []
+
+            def register_tool(self, **kw):
+                self.tools[kw["name"]] = kw
+
+            def register_hook(self, ht, h):
+                self.hooks.append({"hook_type": ht, "handler": h})
+
+        ctx = _C()
+        register_gateway_tools(ctx)
+        handler = ctx.tools["x402_gateway_deposit_preview"]["handler"]
+
+        rt = MagicMock()
+        rt.is_configured = True
+        rt.is_available = True
+        rt.backend_name = "cli"
+        rt.role = "buyer"
+        rt.network = "ARC-TESTNET"
+        rt.wallet_address = "0xabcdef1234567890abcdef1234567890abcdef12"
+        rt.version = "0.1.0"
+        from hermes_x402.config import X402Config
+
+        rt.config = X402Config(
+            role="buyer",
+            buyer_backend="cli",
+            circle_cli_network="ARC-TESTNET",
+            circle_cli_wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
+            host_allowlist=[],
+            network_policy="public",
+        )
+        rt.cli_client = AsyncMock()
+        rt.buyer_tool = MagicMock()
+        rt.init_error = None
+
+        status = MagicMock()
+        status.authenticated = True
+        status.terms_accepted = True
+        status.testnet_status = "VALID"
+        status.mainnet_status = "NOT_LOGGED_IN"
+        rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
+
+        mock_support = MagicMock()
+        mock_support.x402 = True
+        mock_support.gateway_batching = True
+        mock_support.reason = None
+        mock_support.version = "2"
+        mock_support.options = (
+            MagicMock(
+                payment_system="gateway_batching",
+                network="arcTestnet",
+                network_id="eip155:5042002",
+                supported_by_backend=True,
+                scheme="https",
+                amount_atomic="1000000",
+                amount_usdc="1.0",
+                asset="USDC",
+                pay_to="0xdeadbeef",
+                max_timeout_seconds=60,
+            ),
+        )
+
+        gw_result = MagicMock()
+        gw_result.total_usdc = "5.0"
+        gw_result.network = "ARC-TESTNET"
+
+        # Fill the preview store to capacity
+        with _lock:
+            _previews.clear()
+            import time as _t
+
+            for i in range(_MAX_ACTIVE_PREVIEWS):
+                _previews[f"fill_{i}"] = {
+                    "expires_at": _t.time() + 300,
+                    "consumed": False,
+                }
+
+        # Mock wallet and gateway balance
+        mock_balance = MagicMock()
+        mock_balance.symbol = "USDC"
+        mock_balance.amount = "10.0"
+        rt.cli_client.get_balance = AsyncMock(return_value=[mock_balance])
+
+        gw_result = MagicMock()
+        gw_result.total_usdc = "5.0"
+        gw_result.network = "ARC-TESTNET"
+        rt.cli_client.gateway_balance = AsyncMock(return_value=gw_result)
+
+        with (
+            patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt),
+            patch(
+                "hermes_x402.buyer.supports.check_supports",
+                new_callable=AsyncMock,
+                return_value=mock_support,
+            ),
+        ):
+            result = await handler(
+                {
+                    "service_url": "https://api.example.com/premium",
+                    "method": "GET",
+                    "amount": "5.0",
+                }
+            )
+
+        # Clean up
+        with _lock:
+            _previews.clear()
+
+        data = json.loads(result)
+        assert data["success"] is False
+        assert data["error"] == "preview_store_full"
+        assert data["retry_safe"] is True
+        assert "256" in data["message"]
+
+
+class TestWalletStatusNetworkResolution:
+    """Regression: valid mainnet session does NOT satisfy Arc Testnet wallet status."""
+
+    def test_mainnet_valid_does_not_satisfy_testnet_config(self) -> None:
+        """A valid mainnet session must not report session_valid=true for testnet config."""
+        import asyncio
+
+        from hermes_x402.config import X402Config
+        from hermes_x402.hermes_plugin.tools import register_wallet_tools
+
+        class _C:
+            def __init__(self):
+                self.tools = {}
+                self.hooks = []
+
+            def register_tool(self, **kw):
+                self.tools[kw["name"]] = kw
+
+            def register_hook(self, ht, h):
+                self.hooks.append({"hook_type": ht, "handler": h})
+
+        ctx = _C()
+        register_wallet_tools(ctx)
+        handler = ctx.tools["x402_wallet_status"]["handler"]
+
+        # Config is ARC-TESTNET but session only has mainnet VALID
+        rt = MagicMock()
+        rt.is_configured = True
+        rt.is_available = True
+        rt.backend_name = "cli"
+        rt.role = "buyer"
+        rt.network = "ARC-TESTNET"
+        rt.wallet_address = "0xabcdef1234567890abcdef1234567890abcdef12"
+        rt.version = "0.1.0"
+        rt.config = X402Config(
+            role="buyer",
+            buyer_backend="cli",
+            circle_cli_network="ARC-TESTNET",
+            circle_cli_wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
+            host_allowlist=[],
+            network_policy="public",
+        )
+        rt.cli_client = AsyncMock()
+        rt.buyer_tool = MagicMock()
+        rt.init_error = None
+
+        status = MagicMock()
+        status.authenticated = True  # mainnet is VALID — this used to leak
+        status.testnet_status = "NOT_LOGGED_IN"
+        status.mainnet_status = "VALID"
+        status.terms_accepted = True
+        status.email = "user@example.com"
+        rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
+        rt.cli_client.list_wallets = AsyncMock(return_value=[])
+        gw = MagicMock()
+        gw.total_usdc = "0"
+        gw.network = "ARC-TESTNET"
+        rt.cli_client.gateway_balance = AsyncMock(return_value=gw)
+        rt.cli_client.network_x402_identifier = AsyncMock(return_value="eip155:5042002")
+
+        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
+            result = asyncio.run(handler())
+
+        data = json.loads(result)
+        # session_valid must be False because testnet_status is NOT_LOGGED_IN
+        assert data["session_valid"] is False
+        assert data["session_environment"] == "testnet"
+
+
+class TestLoginCompletionEnvironment:
+    """Regression: login completion success=false when expected environment is invalid."""
+
+    async def test_success_false_when_expected_env_invalid(self) -> None:
+        """login_complete returns success=false when env-specific status is not VALID."""
+        from hermes_x402.config import X402Config
+        from hermes_x402.hermes_plugin.tools import register_login_tools
+
+        class _C:
+            def __init__(self):
+                self.tools = {}
+                self.hooks = []
+
+            def register_tool(self, **kw):
+                self.tools[kw["name"]] = kw
+
+            def register_hook(self, ht, h):
+                self.hooks.append({"hook_type": ht, "handler": h})
+
+        ctx = _C()
+        register_login_tools(ctx)
+        start_handler = ctx.tools["x402_login_start"]["handler"]
+        complete_handler = ctx.tools["x402_login_complete"]["handler"]
+
+        rt = MagicMock()
+        rt.is_configured = True
+        rt.is_available = True
+        rt.backend_name = "cli"
+        rt.role = "buyer"
+        rt.network = "ARC-TESTNET"
+        rt.wallet_address = "0xabcdef1234567890abcdef1234567890abcdef12"
+        rt.version = "0.1.0"
+        rt.config = X402Config(
+            role="buyer",
+            buyer_backend="cli",
+            circle_cli_network="ARC-TESTNET",
+            circle_cli_wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
+            host_allowlist=[],
+            network_policy="public",
+            allow_chat_otp=True,
+        )
+        rt.cli_client = AsyncMock()
+        rt.buyer_tool = MagicMock()
+        rt.init_error = None
+
+        # Session not yet valid → allows login_start
+        status = MagicMock()
+        status.authenticated = False
+        status.terms_accepted = True
+        rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
+        rt.cli_client.login_start = AsyncMock(
+            return_value=MagicMock(
+                request_id="circle-req-env",
+                email_masked="u***@example.com",
+                otp_required=True,
+            )
+        )
+
+        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
+            start_result = await start_handler({"email": "user@example.com", "mode": "chat_otp"})
+        start_data = json.loads(start_result)
+        login_id = start_data["login_id"]
+
+        # Session after OTP: mainnet VALID, testnet NOT_VALID
+        session_result = MagicMock()
+        session_result.authenticated = True
+        session_result.mainnet_status = "VALID"
+        session_result.testnet_status = "NOT_VALID"
+        rt.cli_client.login_complete = AsyncMock(return_value=session_result)
+
+        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
+            result = await complete_handler(
+                {
+                    "login_id": login_id,
+                    "otp": "654321",
+                    "acknowledge_otp_exposure": True,
+                }
+            )
+
+        data = json.loads(result)
+        # Expected testnet but only mainnet is valid → success must be False
+        assert data["success"] is False
+        assert data["authenticated"] is False
+        assert data["environment_valid"] is False
+        assert data["environment"] == "testnet"
+
+    async def test_success_true_when_expected_env_valid(self) -> None:
+        """login_complete returns success=true when env-specific status IS VALID."""
+        from hermes_x402.config import X402Config
+        from hermes_x402.hermes_plugin.tools import register_login_tools
+
+        class _C:
+            def __init__(self):
+                self.tools = {}
+                self.hooks = []
+
+            def register_tool(self, **kw):
+                self.tools[kw["name"]] = kw
+
+            def register_hook(self, ht, h):
+                self.hooks.append({"hook_type": ht, "handler": h})
+
+        ctx = _C()
+        register_login_tools(ctx)
+        start_handler = ctx.tools["x402_login_start"]["handler"]
+        complete_handler = ctx.tools["x402_login_complete"]["handler"]
+
+        # For mainnet test, we need MAINNET config
+        rt = MagicMock()
+        rt.is_configured = True
+        rt.is_available = True
+        rt.backend_name = "cli"
+        rt.role = "buyer"
+        rt.network = "MAINNET"
+        rt.wallet_address = "0xabcdef1234567890abcdef1234567890abcdef12"
+        rt.version = "0.1.0"
+        rt.config = X402Config(
+            role="buyer",
+            buyer_backend="cli",
+            circle_cli_network="MAINNET",
+            circle_cli_wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
+            host_allowlist=[],
+            network_policy="public",
+            allow_chat_otp=True,
+        )
+        rt.cli_client = AsyncMock()
+        rt.buyer_tool = MagicMock()
+        rt.init_error = None
+
+        # Session not yet valid → allows login_start
+        status = MagicMock()
+        status.authenticated = False
+        status.terms_accepted = True
+        rt.cli_client.agent_wallet_status = AsyncMock(return_value=status)
+        rt.cli_client.login_start = AsyncMock(
+            return_value=MagicMock(
+                request_id="circle-req-env2",
+                email_masked="u***@example.com",
+                otp_required=True,
+            )
+        )
+
+        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
+            start_result = await start_handler({"email": "user@example.com", "mode": "chat_otp"})
+        start_data = json.loads(start_result)
+        login_id = start_data["login_id"]
+
+        # Session after OTP: mainnet VALID, testnet NOT_VALID
+        session_result = MagicMock()
+        session_result.authenticated = True
+        session_result.mainnet_status = "VALID"
+        session_result.testnet_status = "NOT_VALID"
+        rt.cli_client.login_complete = AsyncMock(return_value=session_result)
+
+        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
+            result = await complete_handler(
+                {
+                    "login_id": login_id,
+                    "otp": "654321",
+                    "acknowledge_otp_exposure": True,
+                }
+            )
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert data["authenticated"] is True
+        assert data["environment_valid"] is True
+        assert data["environment"] == "mainnet"

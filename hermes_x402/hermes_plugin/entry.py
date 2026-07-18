@@ -115,16 +115,22 @@ def _register_approval_hook(ctx: Any) -> None:
         # Gateway deposit execute: block if preview is invalid
         if tool_name == "x402_gateway_deposit_execute":
             preview_id = args.get("preview_id", "")
-            if not isinstance(preview_id, str) or not preview_id.strip():
+            if not isinstance(preview_id, str):
                 return {
                     "action": "block",
                     "message": "Gateway preview ID is required.",
+                }
+            preview_id = preview_id.strip()
+            if not preview_id or len(preview_id) > 128:
+                return {
+                    "action": "block",
+                    "message": "Gateway preview ID must be 1..128 characters.",
                 }
             from hermes_x402.hermes_plugin.gateway_state import (
                 get_gateway_preview_approval_summary,
             )
 
-            summary = get_gateway_preview_approval_summary(preview_id.strip())
+            summary = get_gateway_preview_approval_summary(preview_id)
             if summary is None:
                 return {
                     "action": "block",
@@ -172,11 +178,20 @@ def _sanitize_url_for_display(raw_url: Any) -> str:
 
     # Rebuild netloc from hostname and port — never use parsed.netloc
     # which may retain userinfo
-    hostname = parsed.hostname
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except (ValueError, UnicodeError):
+        return "[invalid URL]"
+
     if not hostname:
         return "[invalid URL]"
 
-    netloc = f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
+    # IPv6 addresses must be bracketed in netloc
+    if ":" in hostname:
+        netloc = f"[{hostname}]:{port}" if port is not None else f"[{hostname}]"
+    else:
+        netloc = f"{hostname}:{port}" if port is not None else hostname
 
     # Rebuild without userinfo, fragment, or query
     sanitized = urlunparse(

@@ -440,15 +440,34 @@ def register_wallet_tools(ctx: Any) -> None:
                 result["cli_available"] = True
                 result["cli_version"] = "version_check_failed"
 
-            # Session status via v0.0.6 wallet status
+            # Session status — resolve configured environment first
             session_valid = False
             session_environment = "unknown"
             terms_accepted = False
             session_check_error = None
+
+            # Resolve whether configured network is testnet or mainnet
+            configured_network = (
+                runtime.config.circle_cli_network or runtime.config.blockchain
+                if runtime.config
+                else runtime.network or ""
+            )
+            try:
+                from hermes_x402.networks import get_network
+
+                resolved_net = get_network(configured_network)
+                is_testnet = resolved_net.environment == "testnet"
+            except Exception:
+                is_testnet = "testnet" in configured_network.lower()
+
             try:
                 status = await runtime.cli_client.agent_wallet_status()
-                session_valid = status.authenticated
-                session_environment = "testnet" if status.testnet_status == "VALID" else "mainnet"
+                if is_testnet:
+                    session_valid = status.testnet_status == "VALID"
+                    session_environment = "testnet"
+                else:
+                    session_valid = status.mainnet_status == "VALID"
+                    session_environment = "mainnet"
                 terms_accepted = status.terms_accepted
                 if status.email and "@" in status.email:
                     local, domain = status.email.split("@", 1)
@@ -1739,8 +1758,8 @@ def register_login_tools(ctx: Any) -> None:
 
             return format_success_result(
                 {
-                    "success": True,
-                    "authenticated": session.authenticated,
+                    "success": env_valid,
+                    "authenticated": env_valid,
                     "environment_valid": env_valid,
                     "environment": ("testnet" if is_testnet else "mainnet"),
                     "message": "Login successful."
@@ -2189,11 +2208,11 @@ def register_gateway_tools(ctx: Any) -> None:
                 },
                 sort_keys=True,
             ).encode()
-        ).hexdigest()[:16]
+        )
 
         # Generate preview ID with full state
         preview_id = secrets.token_urlsafe(16)
-        preview_data = {
+        preview_data: dict[str, Any] = {
             # Deposit parameters
             "deposit_amount": amount,
             # Service payment-option fields (for fingerprint)
@@ -2221,7 +2240,17 @@ def register_gateway_tools(ctx: Any) -> None:
             "expires_at": time.time() + 300,
             "consumed": False,
         }
-        store_preview(preview_id, preview_data)
+        try:
+            store_preview(preview_id, preview_data)
+        except RuntimeError as exc:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "preview_store_full",
+                    "retry_safe": True,
+                    "message": str(exc),
+                }
+            )
 
         return format_success_result(
             {
@@ -2273,13 +2302,22 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        preview_id = args.get("preview_id", "").strip()
-        if not preview_id:
+        preview_id_raw = args.get("preview_id", "")
+        if not isinstance(preview_id_raw, str):
             return format_success_result(
                 {
                     "success": False,
                     "error": "invalid_input",
                     "message": "preview_id is required.",
+                }
+            )
+        preview_id = preview_id_raw.strip()
+        if not preview_id or len(preview_id) > 128:
+            return format_success_result(
+                {
+                    "success": False,
+                    "error": "invalid_input",
+                    "message": "preview_id must be 1..128 characters.",
                 }
             )
 
