@@ -321,48 +321,54 @@ hermes-x402 is designed with agent-safety principles:
 
 ## Installation as Hermes Plugin
 
-### Install from Git (recommended)
+### Install from source checkout (recommended)
 
 ```bash
-hermes plugins install riyannode/hermes-x402 --enable
-```
-
-### Install from wheel (manual)
-
-```bash
-python -m hermes_x402.install
+git clone https://github.com/riyannode/hermes-x402.git
+cd hermes-x402
+python3 -m hermes_x402.install
 ```
 
 The installer:
 1. Detects the Hermes executable and Python environment
-2. Builds a wheel from the repository
-3. Installs the wheel into the Hermes Python environment
-4. Runs `hermes plugins enable hermes-x402`
-5. Verifies 14 tools and 1 pre_tool_call hook are registered
+2. Builds a wheel from the repository using pip (no third-party build package required)
+3. Installs the wheel into the Hermes Python environment (--no-deps)
+4. Runs `hermes plugins enable hermes-x402 --no-allow-tool-override`
+5. Verifies 14 tools and 1 pre_tool_call hook via static entry-point contract
 
 ### Verify installation
 
 ```bash
-python -m hermes_x402.install --check
+python3 -m hermes_x402.install --check
 ```
 
 ### Live Arc Testnet acceptance test
 
 ```bash
-python -m hermes_x402.install --live-test
-# or
-python -m hermes_x402.live_test
+python3 -m hermes_x402.install --live-test \
+  --service-url https://seller.example/x402 \
+  --method GET \
+  --max-payment 0.001
 ```
+
+Optional flags:
+- `--hermes-python /path/to/python` — override the Hermes Python interpreter
+- `--body-file /path/to/body.json` — JSON body for POST requests
 
 ⚠️ **Interactive test** — requires manual approval at each step.
 Makes real Arc Testnet transactions. Never runs on mainnet.
 
-### Rollback / Uninstall
+### Uninstall
 
 ```bash
-hermes plugins disable hermes-x402
-hermes plugins remove hermes-x402
+python3 -m hermes_x402.install --uninstall
 ```
+
+The uninstall flow:
+1. Disables the plugin via `hermes plugins disable hermes-x402`
+2. Runs `pip uninstall -y hermes-x402`
+3. Verifies the entry-point record is absent
+4. Restarts the Hermes gateway
 
 Or manually:
 

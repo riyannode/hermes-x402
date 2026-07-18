@@ -17,9 +17,7 @@ covered by live Arc Testnet acceptance test in hermes_x402/live_test.py.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,7 +35,6 @@ def _reset_runtime():
     reset_runtime()
     yield
     reset_runtime()
-
 
 
 class TestImportSmoke:
@@ -97,7 +94,6 @@ class TestImportSmoke:
 # ---------------------------------------------------------------------------
 
 
-
 class TestEntryPoint:
     def test_entry_point_exists_in_metadata(self):
         from importlib.metadata import entry_points
@@ -124,7 +120,6 @@ class TestEntryPoint:
 # ---------------------------------------------------------------------------
 # Registration tests
 # ---------------------------------------------------------------------------
-
 
 
 class TestPaymentCapValidation:
@@ -222,7 +217,6 @@ class TestPaymentCapValidation:
 # ---------------------------------------------------------------------------
 
 
-
 class TestErrorMapping:
     def test_buyer_configuration_error(self):
         from hermes_x402.buyer.errors import BuyerConfigurationError
@@ -306,7 +300,6 @@ class TestErrorMapping:
 # ---------------------------------------------------------------------------
 
 
-
 class TestInputValidation:
     def test_validate_url_rejects_empty(self):
         from hermes_x402.hermes_plugin.tools import _validate_url
@@ -343,7 +336,6 @@ class TestInputValidation:
 # ---------------------------------------------------------------------------
 # URL/host policy tests (Fix #3)
 # ---------------------------------------------------------------------------
-
 
 
 class TestURLHostPolicy:
@@ -401,7 +393,6 @@ class TestURLHostPolicy:
 # ---------------------------------------------------------------------------
 
 
-
 class TestOutput:
     def test_safe_wallet_address_masks(self):
         from hermes_x402.hermes_plugin.output import safe_wallet_address
@@ -421,7 +412,6 @@ class TestOutput:
 # ---------------------------------------------------------------------------
 # Runtime tests
 # ---------------------------------------------------------------------------
-
 
 
 class TestRuntime:
@@ -453,7 +443,6 @@ class TestRuntime:
 # ---------------------------------------------------------------------------
 
 
-
 class TestPackaging:
     def test_entry_point_declaration(self):
         from pathlib import Path
@@ -467,7 +456,6 @@ class TestPackaging:
 # ---------------------------------------------------------------------------
 # Approval hook unit tests
 # ---------------------------------------------------------------------------
-
 
 
 class TestUrlSanitization:
@@ -525,7 +513,6 @@ class TestUrlSanitization:
         assert result == "[invalid URL]"
 
 
-
 class TestPreviewAtomicity:
     """Tests that concurrent preview claims are atomic."""
 
@@ -568,7 +555,6 @@ class TestPreviewAtomicity:
         # Exactly one should succeed
         assert results.count(True) == 1
         assert results.count(False) == 1
-
 
 
 class TestPreviewStoreBounds:
@@ -652,7 +638,6 @@ class TestPreviewStoreBounds:
 # ---------------------------------------------------------------------------
 
 
-
 class TestUrlSanitizerRegression:
     """Regression: malformed port raises ValueError/UnicodeError → [invalid URL]."""
 
@@ -690,7 +675,6 @@ class TestUrlSanitizerRegression:
 
         result = _sanitize_url_for_display("https://[::1]:8443/api")
         assert "[::1]:8443" in result
-
 
 
 class TestPreviewStoreOverflow:
@@ -822,13 +806,11 @@ class TestPreviewStoreOverflow:
         assert "256" in data["message"]
 
 
-
 class TestWalletStatusNetworkResolution:
     """Regression: valid mainnet session does NOT satisfy Arc Testnet wallet status."""
 
     def test_mainnet_valid_does_not_satisfy_testnet_config(self) -> None:
         """A valid mainnet session must not report session_valid=true for testnet config."""
-        import asyncio
 
         from hermes_x402.config import X402Config
         from hermes_x402.hermes_plugin.tools import register_wallet_tools
@@ -890,7 +872,6 @@ class TestWalletStatusNetworkResolution:
         # session_valid must be False because testnet_status is NOT_LOGGED_IN
         assert data["session_valid"] is False
         assert data["session_environment"] == "testnet"
-
 
 
 class TestLoginCompletionEnvironment:
@@ -1068,7 +1049,6 @@ class TestLoginCompletionEnvironment:
 # ---------------------------------------------------------------------------
 
 
-
 class TestServiceOptionFingerprint:
     """Regression: fingerprint must be a stable 64-char hex string."""
 
@@ -1141,4 +1121,3 @@ class TestServiceOptionFingerprint:
         # Cleanup
         with _lock:
             _previews.clear()
-
