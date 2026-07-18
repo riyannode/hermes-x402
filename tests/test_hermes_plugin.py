@@ -866,7 +866,7 @@ class TestWalletStatusNetworkResolution:
         rt.cli_client.network_x402_identifier = AsyncMock(return_value="eip155:5042002")
 
         with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = asyncio.run(handler())
+            result = asyncio.run(handler({}))
 
         data = json.loads(result)
         # session_valid must be False because testnet_status is NOT_LOGGED_IN

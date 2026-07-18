@@ -655,7 +655,7 @@ def register_wallet_tools(ctx: Any) -> None:
         name="x402_wallet_status",
         toolset="x402",
         schema=X402_WALLET_STATUS_SCHEMA,
-        handler=wallet_status_handler,
+        handler=lambda args, **kw: wallet_status_handler(**kw),
         is_async=True,
         description=(
             "Report Circle wallet status: CLI installation, authentication, "
@@ -732,7 +732,7 @@ def register_wallet_tools(ctx: Any) -> None:
         name="x402_wallet_balance",
         toolset="x402",
         schema=X402_WALLET_BALANCE_SCHEMA,
-        handler=wallet_balance_handler,
+        handler=lambda args, **kw: wallet_balance_handler(**kw),
         is_async=True,
         description="Report configured wallet USDC balance. Read-only.",
     )
@@ -1870,7 +1870,7 @@ def register_gateway_tools(ctx: Any) -> None:
         name="x402_gateway_balance",
         toolset="x402",
         schema=X402_GATEWAY_BALANCE_SCHEMA,
-        handler=gateway_balance_handler,
+        handler=lambda args, **kw: gateway_balance_handler(**kw),
         is_async=True,
         description=(
             "Report Circle Gateway balance for the active wallet and configured "
