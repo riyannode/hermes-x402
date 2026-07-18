@@ -18,7 +18,7 @@ from hermes_x402.config import X402Config
 
 logger = logging.getLogger(__name__)
 
-_VERSION = "0.1.0"
+_VERSION = "0.2.0"
 
 
 class X402Runtime:

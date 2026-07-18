@@ -46,7 +46,7 @@ from hermes_x402.network_policy import NetworkPolicy, parse_network_policy
 from hermes_x402.networks import NetworkConfig, get_network, list_networks, normalize_network
 from hermes_x402.seller_gateway import X402Gateway, create_aiohttp_gateway
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "ARC_MAINNET",
     "ARC_TESTNET",
