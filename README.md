@@ -180,6 +180,52 @@ Service-bound Gateway deposit preview. Requires `service_url`, HTTP `method`, an
 
 Execute a Gateway deposit using a preview ID from `x402_gateway_deposit_preview`. Do not accept replacement amount, wallet, network, or method. Revalidates session, config, wallet, service (fresh 402 challenge), and preview expiry. Execute exactly once. `retry_safe=false` for ambiguous outcomes.
 
+## /x402 Slash Command
+
+A single Hermes slash command for read-only status, discovery, and safe configuration.
+
+### Read-only commands
+
+```
+/x402 status        — Plugin status and configuration
+/x402 wallet        — Circle wallet + readiness status
+/x402 balance       — Wallet USDC balance
+/x402 gateway       — Gateway balance
+/x402 networks      — Supported networks
+/x402 supports <url> — Check if URL supports x402
+```
+
+These dispatch to the corresponding `x402_*` tools via `ctx.dispatch_tool` — no duplicated logic.
+
+### Configuration
+
+```
+/x402 configure
+```
+
+Shows current configuration state: Circle CLI availability, configured/unconfigured state, missing managed variables.
+
+```
+/x402 configure preview buyer cli 0xYourWallet... ARC-TESTNET 0.10
+```
+
+Validates arguments and shows proposed managed keys without writing anything.
+
+```
+/x402 configure apply buyer cli 0xYourWallet... ARC-TESTNET 0.10
+```
+
+Writes managed keys to `$HERMES_HOME/.env`. Returns `restart_required=true` with the restart command.
+
+### Constraints
+
+- Only `buyer` role and `cli` backend are supported
+- Only `ARC-TESTNET` network is supported
+- Wallet must be `0x` + 40 hex characters
+- `max_usdc` must be a positive finite Decimal
+- Output masks wallet addresses
+- No `/x402 pay`, `/x402 deposit`, or `/x402 login-complete` commands
+
 ## Intended Workflow
 
 ```
@@ -349,7 +395,25 @@ The installer:
 2. Builds a wheel from the repository using pip (no third-party build package required)
 3. Installs the wheel into the Hermes Python environment (--no-deps)
 4. Runs `hermes plugins enable hermes-x402 --no-allow-tool-override`
-5. Verifies 14 tools and 1 pre_tool_call hook via static entry-point contract
+5. Verifies 14 tools, 1 pre_tool_call hook, and 1 slash command via static entry-point contract
+
+### Optional: integrated Circle CLI bootstrap
+
+```bash
+python3 -m hermes_x402.install --with-circle-cli
+```
+
+When `--with-circle-cli` is passed, the installer:
+1. Detects an existing `circle` binary on PATH and validates its version
+2. If absent, requires [Bun](https://bun.sh/docs/installation) and runs `bun add -g @circle-fin/cli@0.0.6`
+3. Writes `CIRCLE_CLI_EXECUTABLE` to `$HERMES_HOME/.env`
+
+**Requirements:**
+- Bun must already be installed (the installer never installs Bun or Node automatically)
+- Circle CLI remains an external binary dependency — it is not vendored into the Python wheel
+- Circle login and Terms acceptance remain manual steps
+
+If a different Circle CLI version already exists, the installer reports `circle_cli_version_mismatch` and provides a manual remediation command. It never replaces, upgrades, or downgrades an existing installation automatically.
 
 ### Verify installation
 
