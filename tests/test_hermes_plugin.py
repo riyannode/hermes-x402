@@ -428,7 +428,7 @@ class TestRuntime:
         from hermes_x402.hermes_plugin.runtime import get_runtime
 
         r = get_runtime()
-        assert r.version == "0.1.0"
+        assert r.version == "0.2.0"
 
     def test_unconfigured_role(self):
         from hermes_x402.hermes_plugin.runtime import get_runtime
