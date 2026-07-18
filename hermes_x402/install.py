@@ -13,8 +13,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -37,31 +37,27 @@ def _find_hermes_executable() -> Path:
         return Path(candidate)
     raise RuntimeError(
         "Cannot find 'hermes' on PATH. "
-        "Install Hermes Agent first: https://github.com/NousResearch/hermes-agent"
+        "Install Hermes Agent first: "
+        "https://github.com/NousResearch/hermes-agent"
     )
 
 
 def _detect_python_env(hermes_exe: Path) -> Path:
     """Detect the Python interpreter used by the Hermes venv."""
-    # Read the shebang from the hermes script
     first_line = hermes_exe.read_text().splitlines()[0]
     if first_line.startswith("#!"):
         python_path = Path(first_line[2:].strip())
         if python_path.exists():
             return python_path
-    # Fallback: assume venv/bin/python3 relative to hermes_exe
     venv_python = hermes_exe.parent / "python3"
     if venv_python.exists():
         return venv_python
-    raise RuntimeError(
-        f"Cannot detect Python environment for Hermes at {hermes_exe}"
-    )
+    raise RuntimeError(f"Cannot detect Python environment for Hermes at {hermes_exe}")
 
 
 def _build_wheel(repo_root: Path) -> Path:
     """Build a wheel from the repository. Returns the wheel path."""
     dist_dir = repo_root / "dist"
-    # Clean previous builds
     if dist_dir.exists():
         shutil.rmtree(dist_dir)
     dist_dir.mkdir(parents=True, exist_ok=True)
@@ -86,53 +82,103 @@ def _install_wheel(python: Path, wheel: Path) -> None:
 def _enable_plugin(hermes_exe: Path) -> None:
     """Enable the hermes-x402 plugin."""
     subprocess.check_call(
-        [str(hermes_exe), "plugins", "enable", _PLUGIN_NAME, "--no-allow-tool-override"],
+        [
+            str(hermes_exe),
+            "plugins",
+            "enable",
+            _PLUGIN_NAME,
+            "--no-allow-tool-override",
+        ]
     )
 
 
-def _verify_plugin(hermes_exe: Path) -> dict:
-    """Run HERMES_PLUGINS_DEBUG=1 hermes plugins list and verify."""
+def _query_plugins_json(hermes_exe: Path) -> dict:
+    """Run ``hermes plugins list --json`` and parse the hermes-x402 record.
+
+    Returns the parsed record dict.  Raises on subprocess failure or
+    missing/malformed record.
+    """
     env = os.environ.copy()
     env[_ENV_DEBUG] = "1"
 
     result = subprocess.run(
-        [str(hermes_exe), "plugins", "list"],
+        [str(hermes_exe), "plugins", "list", "--json"],
         capture_output=True,
         text=True,
         env=env,
     )
-    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"hermes plugins list --json failed (rc={result.returncode}): {result.stderr[:500]}"
+        )
 
-    # Parse tool count and hook count from debug output
-    tool_count = 0
-    hook_count = 0
-    for line in output.splitlines():
-        m = re.search(r"registered\s+(\d+)\s+tools?", line, re.IGNORECASE)
-        if m:
-            tool_count = max(tool_count, int(m.group(1)))
-        m = re.search(r"registered\s+(\d+)\s+hooks?", line, re.IGNORECASE)
-        if m:
-            hook_count = max(hook_count, int(m.group(1)))
-
-    # Also try counting individual tool registrations
-    if tool_count == 0:
-        tool_count = output.lower().count("x402_")
-
-    return {
-        "tool_count": tool_count,
-        "hook_count": hook_count,
-        "output": output,
-        "plugin_enabled": _PLUGIN_NAME in output and "enabled" in output,
-    }
-
-
-def _get_package_version() -> str:
-    """Get installed package version."""
     try:
-        from hermes_x402.hermes_plugin.runtime import _VERSION
-        return _VERSION
-    except Exception:
-        return "unknown"
+        records = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse hermes plugins list JSON: {exc}") from exc
+
+    for rec in records:
+        if rec.get("name") == _PLUGIN_NAME:
+            return rec
+
+    raise RuntimeError(f"Plugin '{_PLUGIN_NAME}' not found in plugins list")
+
+
+def _verify_tools_and_hooks(python: Path) -> dict:
+    """Verify 14 tools + 1 hook through the Hermes Python interpreter.
+
+    Imports the plugin entry point and calls register() with a minimal
+    context that counts registrations.
+    """
+    code = (
+        "import json, sys\n"
+        "class _Ctx:\n"
+        "    def __init__(s): s.tools=[]; s.hooks=[]\n"
+        "    def register_tool(s, n, ts, sc, h, **k):\n"
+        "        s.tools.append(n)\n"
+        "    def register_hook(s, ht, h):\n"
+        "        s.hooks.append(ht)\n"
+        "from hermes_x402.hermes_plugin.entry import register\n"
+        "ctx = _Ctx()\n"
+        "register(ctx)\n"
+        "print(json.dumps({'tools': len(ctx.tools), "
+        "'hooks': len(ctx.hooks), 'names': ctx.tools}))\n"
+    )
+
+    result = subprocess.run(
+        [str(python), "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Plugin verification failed: {result.stderr[:500]}")
+
+    try:
+        return json.loads(result.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse verification output: {exc}") from exc
+
+
+def _query_package_info(python: Path) -> dict:
+    """Query installed package version and module path via Hermes Python."""
+    code = (
+        "import json, hermes_x402\n"
+        "print(json.dumps({\n"
+        "    'version': getattr(hermes_x402, '__version__', 'unknown'),\n"
+        "    'path': hermes_x402.__file__,\n"
+        "}))\n"
+    )
+    result = subprocess.run(
+        [str(python), "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return {"version": "unknown", "path": "unknown"}
+    try:
+        return json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return {"version": "unknown", "path": "unknown"}
 
 
 def _get_commit_sha(repo_root: Path) -> str:
@@ -162,7 +208,6 @@ def run_install(repo_root: Path | None = None, check_only: bool = False) -> dict
         "check_only": check_only,
         "success": False,
         "errors": [],
-        "warnings": [],
     }
 
     try:
@@ -176,7 +221,7 @@ def run_install(repo_root: Path | None = None, check_only: bool = False) -> dict
         report["python_env"] = str(python_exe)
         print(f"[install] Python environment: {python_exe}")
 
-        # 3. Get version info
+        # 3. Get commit SHA
         commit_sha = _get_commit_sha(repo_root)
         report["commit_sha"] = commit_sha
         print(f"[install] Commit SHA: {commit_sha}")
@@ -195,29 +240,32 @@ def run_install(repo_root: Path | None = None, check_only: bool = False) -> dict
             _enable_plugin(hermes_exe)
             print(f"[install] Plugin '{_PLUGIN_NAME}' enabled")
 
-        # 7. Verify plugin
-        verification = _verify_plugin(hermes_exe)
+        # 7. Verify via hermes plugins list --json
+        rec = _query_plugins_json(hermes_exe)
+        report["plugin_record"] = rec
+        status = rec.get("status", "")
+        version = rec.get("version", "")
+        print(f"[install] Plugin status: {status} (v{version})")
+
+        if status != "enabled":
+            report["errors"].append(f"Plugin status is '{status}', expected 'enabled'")
+
+        # 8. Verify tools + hooks through Hermes Python
+        verification = _verify_tools_and_hooks(python_exe)
         report["verification"] = verification
-        print(f"[install] Plugin enabled: {verification['plugin_enabled']}")
-        print(f"[install] Tools registered: {verification['tool_count']}")
-        print(f"[install] Hooks registered: {verification['hook_count']}")
+        print(f"[install] Tools: {verification['tools']}, Hooks: {verification['hooks']}")
 
-        # 8. Validate counts
-        if not verification["plugin_enabled"]:
-            report["errors"].append("Plugin is not enabled")
-        if verification["tool_count"] != _EXPECTED_TOOLS:
+        if verification["tools"] != _EXPECTED_TOOLS:
             report["errors"].append(
-                f"Expected {_EXPECTED_TOOLS} tools, got {verification['tool_count']}"
+                f"Expected {_EXPECTED_TOOLS} tools, got {verification['tools']}"
             )
-        if verification["hook_count"] != _EXPECTED_HOOKS:
-            report["errors"].append(
-                f"Expected {_EXPECTED_HOOKS} hook, got {verification['hook_count']}"
-            )
+        if verification["hooks"] != _EXPECTED_HOOKS:
+            report["errors"].append(f"Expected {_EXPECTED_HOOKS} hook, got {verification['hooks']}")
 
-        # 9. Package version
-        version = _get_package_version()
-        report["version"] = version
-        print(f"[install] Package version: {version}")
+        # 9. Package info via Hermes Python
+        pkg_info = _query_package_info(python_exe)
+        report["package"] = pkg_info
+        print(f"[install] Package: v{pkg_info['version']} at {pkg_info['path']}")
 
         # Final verdict
         if not report["errors"]:
@@ -229,20 +277,17 @@ def run_install(repo_root: Path | None = None, check_only: bool = False) -> dict
 
     except Exception as exc:
         report["errors"].append(str(exc))
-        print(f"[install] ❌ Installation failed: {exc}", file=sys.stderr)
+        print(f"[install] ❌ Failed: {exc}", file=sys.stderr)
 
     # Never print secrets
     for key in ("entity_secret", "api_key", "private_key", "otp", "password"):
-        if key in report:
-            del report[key]
+        report.pop(key, None)
 
     return report
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Install and verify hermes-x402 plugin"
-    )
+    parser = argparse.ArgumentParser(description="Install and verify hermes-x402 plugin")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -256,7 +301,15 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.live_test:
+        # Live test requires a successful install first
+        report = run_install(check_only=False)
+        if not report["success"]:
+            print("\n[install] ❌ Live test aborted: installation/verification failed")
+            sys.exit(1)
+
+        print("\n[install] Installation verified. Starting live test...\n")
         from hermes_x402.live_test import run_live_test
+
         sys.exit(0 if run_live_test() else 1)
 
     report = run_install(check_only=args.check)
