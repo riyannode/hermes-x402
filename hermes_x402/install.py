@@ -559,7 +559,7 @@ def _get_commit_sha(repo_root: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _run_uninstall(hermes_exe: Path, python: Path) -> dict:
+def _run_uninstall(hermes_exe: Path, python: Path, restart_gateway: bool = False) -> dict:
     """Uninstall the hermes-x402 plugin.
 
     Steps:
@@ -567,7 +567,7 @@ def _run_uninstall(hermes_exe: Path, python: Path) -> dict:
     2. pip uninstall -y
     3. Verify absence through Hermes Python subprocess (importlib.metadata)
     4. Verify hermes plugins list --json has no entrypoint record
-    5. Restart gateway
+    5. Restart gateway (only with --restart-gateway)
     """
     report: dict = {"uninstall": True, "success": False, "errors": []}
 
@@ -618,11 +618,20 @@ def _run_uninstall(hermes_exe: Path, python: Path) -> dict:
         else:
             report["errors"].append("Plugin still in plugins list after uninstall")
 
-        # 5. Restart gateway
-        if _restart_gateway(hermes_exe):
-            print("[uninstall] Gateway restarted")
+        # 5. Gateway restart (only when explicitly requested)
+        if restart_gateway:
+            if _restart_gateway(hermes_exe):
+                print("[uninstall] Gateway restarted")
+                report["restart_attempted"] = True
+                report["restart_success"] = True
+            else:
+                print("[uninstall] Gateway restart returned non-zero (non-fatal)")
+                report["restart_attempted"] = True
+                report["restart_success"] = False
         else:
-            print("[uninstall] Gateway restart returned non-zero (non-fatal)")
+            report["restart_required"] = True
+            print("[uninstall] Gateway restart required. Run:")
+            print(f"  {hermes_exe} gateway restart")
 
         report["success"] = True
         print("[uninstall] ✅ Uninstall complete")
@@ -768,6 +777,7 @@ def run_install(
     repo_root: Path | None = None,
     check_only: bool = False,
     hermes_python: str | None = None,
+    restart_gateway: bool = False,
 ) -> dict:
     """Run the installer.  Returns a status dict.
 
@@ -873,15 +883,21 @@ def run_install(
                 f"importlib.metadata={pkg_info['version']}"
             )
 
-        # 11. Gateway restart (after install + verification)
+        # 11. Gateway restart (only when explicitly requested)
         if not check_only:
-            restart_ok = _restart_gateway(hermes_exe)
-            report["gateway_restart"] = restart_ok
-            if restart_ok:
-                print("[install] Gateway restarted")
+            if restart_gateway:
+                restart_ok = _restart_gateway(hermes_exe)
+                report["restart_attempted"] = True
+                report["restart_success"] = restart_ok
+                if restart_ok:
+                    print("[install] Gateway restarted")
+                else:
+                    report.setdefault("errors", []).append("Gateway restart failed")
+                    print("[install] ❌ Gateway restart failed")
             else:
-                report["errors"].append("Gateway restart failed")
-                print("[install] ❌ Gateway restart failed")
+                report["restart_required"] = True
+                print("[install] Gateway restart required. Run:")
+                print(f"  {hermes_exe} gateway restart")
 
         # Final verdict
         if not report["errors"]:
@@ -936,6 +952,11 @@ def main() -> None:
         default=None,
         help="Explicit path to the Hermes venv Python interpreter",
     )
+    parser.add_argument(
+        "--restart-gateway",
+        action="store_true",
+        help="Restart the Hermes gateway after install/uninstall",
+    )
     # Live-test arguments (forwarded to run_live_test via config)
     parser.add_argument(
         "--service-url",
@@ -965,7 +986,7 @@ def main() -> None:
     if args.uninstall:
         hermes_exe = _find_hermes_executable()
         python_exe = _detect_python_env(hermes_exe, args.hermes_python)
-        report = _run_uninstall(hermes_exe, python_exe)
+        report = _run_uninstall(hermes_exe, python_exe, args.restart_gateway)
         sys.exit(0 if report["success"] else 1)
 
     # --- Live test ---
@@ -1005,34 +1026,42 @@ def main() -> None:
                 print(f"[install] ❌ {e}", file=sys.stderr)
             sys.exit(1)
 
-        # Run install first (includes gateway restart)
-        report = run_install(check_only=False, hermes_python=args.hermes_python)
+        # Run install first (no gateway restart — Phase 2 is separate)
+        report = run_install(
+            check_only=False,
+            hermes_python=args.hermes_python,
+            restart_gateway=False,
+        )
         if not report["success"]:
             print("\n[install] ❌ Live test aborted: installation/verification failed")
             sys.exit(1)
 
+        # Save pre-restart report
+        rpath = Path(__file__).parent.parent / "dist" / "install-report.json"
+        rpath.parent.mkdir(parents=True, exist_ok=True)
+        rpath.write_text(json.dumps(report, indent=2))
+        print(f"\n[install] Pre-restart report saved: {rpath}")
+
         print(
-            "\n[install] Installation verified + gateway restarted."
-            "\n[install] Starting live test...\n"
+            "\n[install] ✅ Installation verified successfully."
+            "\n[install]"
+            "\n[install] A gateway restart is REQUIRED before the live test."
+            "\n[install]"
+            f"\n[install] Run: {report.get('hermes_exe', 'hermes')} gateway restart"
+            "\n[install]"
+            "\n[install] After the gateway restarts and Telegram reconnects,"
+            "\n[install] start Phase 2 in a new conversation."
+            "\n[install]"
+            "\n[install] Do NOT attempt to continue A-F from this process."
         )
-
-        # Build immutable config for live test
-        from hermes_x402.live_test import LiveTestConfig, run_live_test
-
-        config = LiveTestConfig(
-            service_url=args.service_url,
-            method=args.method,
-            max_payment=args.max_payment,
-            body_file=args.body_file,
-            canonical_body=canonical_body,
-            hermes_python=args.hermes_python,
-            install_report=report,
-        )
-
-        sys.exit(0 if run_live_test(config) else 1)
+        sys.exit(0)
 
     # --- Normal install / check ---
-    report = run_install(check_only=args.check, hermes_python=args.hermes_python)
+    report = run_install(
+        check_only=args.check,
+        hermes_python=args.hermes_python,
+        restart_gateway=args.restart_gateway,
+    )
     sys.exit(0 if report["success"] else 1)
 
 

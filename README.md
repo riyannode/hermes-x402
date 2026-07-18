@@ -326,7 +326,22 @@ hermes-x402 is designed with agent-safety principles:
 ```bash
 git clone https://github.com/riyannode/hermes-x402.git
 cd hermes-x402
-python3 -m hermes_x402.install
+python3 -m hermes_x402.install \
+  --hermes-python /usr/local/lib/hermes-agent/venv/bin/python
+```
+
+Then manually restart the gateway:
+
+```bash
+/usr/local/lib/hermes-agent/venv/bin/hermes gateway restart
+```
+
+Or use the automatic restart flag:
+
+```bash
+python3 -m hermes_x402.install \
+  --hermes-python /usr/local/lib/hermes-agent/venv/bin/python \
+  --restart-gateway
 ```
 
 The installer:
@@ -364,11 +379,13 @@ Makes real Arc Testnet transactions. Never runs on mainnet.
 python3 -m hermes_x402.install --uninstall
 ```
 
+Add `--restart-gateway` to restart the gateway after uninstall.
+
 The uninstall flow:
 1. Disables the plugin via `hermes plugins disable hermes-x402`
 2. Runs `pip uninstall -y hermes-x402`
 3. Verifies the entry-point record is absent
-4. Restarts the Hermes gateway
+4. Prints the restart command (does not restart by default)
 
 Or manually:
 
