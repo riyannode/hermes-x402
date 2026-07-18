@@ -319,6 +319,58 @@ hermes-x402 is designed with agent-safety principles:
 - Circle CLI session state is managed by the CLI itself (on-disk), not by hermes-x402.
 - Session persists across Hermes process restarts as long as the Circle CLI's credential storage is intact.
 
+## Installation as Hermes Plugin
+
+### Install from Git (recommended)
+
+```bash
+hermes plugins install riyannode/hermes-x402 --enable
+```
+
+### Install from wheel (manual)
+
+```bash
+python -m hermes_x402.install
+```
+
+The installer:
+1. Detects the Hermes executable and Python environment
+2. Builds a wheel from the repository
+3. Installs the wheel into the Hermes Python environment
+4. Runs `hermes plugins enable hermes-x402`
+5. Verifies 14 tools and 1 pre_tool_call hook are registered
+
+### Verify installation
+
+```bash
+python -m hermes_x402.install --check
+```
+
+### Live Arc Testnet acceptance test
+
+```bash
+python -m hermes_x402.install --live-test
+# or
+python -m hermes_x402.live_test
+```
+
+⚠️ **Interactive test** — requires manual approval at each step.
+Makes real Arc Testnet transactions. Never runs on mainnet.
+
+### Rollback / Uninstall
+
+```bash
+hermes plugins disable hermes-x402
+hermes plugins remove hermes-x402
+```
+
+Or manually:
+
+```bash
+pip uninstall hermes-x402
+hermes plugins disable hermes-x402
+```
+
 ## Development
 
 ```bash

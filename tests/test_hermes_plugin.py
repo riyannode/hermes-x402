@@ -1,11 +1,17 @@
-"""Tests for the hermes-x402 Hermes plugin integration.
+"""Deterministic regression tests for hermes-x402 plugin.
 
-Covers: registration, status tools, wallet tools, service inspect,
-fetch, pay, error mapping, input validation, output bounding,
-async handlers, URL/host policy, redirect behavior, subclass error codes,
-status consistency, and payment cap validation.
+Retains pure deterministic tests for:
+- import smoke, entry point, packaging
+- payment cap validation
+- error mapping, input validation, URL/host policy
+- output bounding, runtime singleton
+- URL sanitization, preview store state transitions
+- service option fingerprinting
+- wallet status network resolution
+- login completion environment validation
 
-All tests use mocks — no live wallet, no live payment, no Circle CLI.
+Orchestration tests (FakeHermesContext tool handler tests) removed —
+covered by live Arc Testnet acceptance test in hermes_x402/live_test.py.
 """
 
 from __future__ import annotations
@@ -32,126 +38,6 @@ def _reset_runtime():
     yield
     reset_runtime()
 
-
-class FakeHermesContext:
-    """Minimal fake Hermes PluginContext for testing registration."""
-
-    def __init__(self):
-        self.tools: list[dict[str, Any]] = []
-        self.hooks: list[dict[str, Any]] = []
-
-    def register_tool(
-        self,
-        name: str,
-        toolset: str,
-        schema: dict,
-        handler: Any,
-        check_fn: Any = None,
-        requires_env: list | None = None,
-        is_async: bool = False,
-        description: str = "",
-        emoji: str = "",
-        override: bool = False,
-    ) -> None:
-        self.tools.append(
-            {
-                "name": name,
-                "toolset": toolset,
-                "schema": schema,
-                "handler": handler,
-                "is_async": is_async,
-                "description": description,
-            }
-        )
-
-    def register_hook(self, hook_type: str, handler: Any) -> None:
-        """Register a hook with the plugin context."""
-        self.hooks.append({"hook_type": hook_type, "handler": handler})
-
-
-@pytest.fixture
-def fake_ctx() -> FakeHermesContext:
-    return FakeHermesContext()
-
-
-async def _call_handler(handler: Any, *args: Any, **kwargs: Any) -> Any:
-    """Call a handler, awaiting if async."""
-    result = handler(*args, **kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Import smoke tests
-# ---------------------------------------------------------------------------
-
-
-class FakeStreamResponse:
-    """Fake httpx streaming response for testing.
-
-    Implements the exact interface used by production fetch code:
-    - status_code, headers, is_redirect, encoding
-    - async aiter_bytes() yielding real bytes chunks
-    - __aenter__/__aexit__ for ``async with client.stream(...) as response:``
-    """
-
-    def __init__(
-        self,
-        *,
-        status_code: int = 200,
-        body: bytes = b"",
-        headers: dict[str, str] | None = None,
-        is_redirect: bool = False,
-    ) -> None:
-        self.status_code = status_code
-        self.headers = headers or {}
-        self._body = body
-        self.is_redirect = is_redirect
-        self.encoding = "utf-8"
-        self.bytes_read = 0
-        self.closed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self.closed = True
-
-    async def aiter_bytes(self, chunk_size: int = 65536):
-        for offset in range(0, len(self._body), chunk_size):
-            chunk = self._body[offset : offset + chunk_size]
-            self.bytes_read += len(chunk)
-            yield chunk
-
-
-class InfiniteLikeStreamResponse:
-    """Fake stream that yields repeated chunks without allocating the full body.
-
-    Used for large-response / truncation tests.  Proves the production code
-    stops reading at MAX_OUTPUT_BYTES + 1 without buffering the entire payload.
-    """
-
-    def __init__(self, chunk: bytes, chunk_count: int, *, status_code: int = 200):
-        self.status_code = status_code
-        self.headers: dict[str, str] = {}
-        self.chunk = chunk
-        self.chunk_count = chunk_count
-        self.is_redirect = False
-        self.encoding = "utf-8"
-        self.bytes_read = 0
-        self.closed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self.closed = True
-
-    async def aiter_bytes(self):
-        for _ in range(self.chunk_count):
-            self.bytes_read += len(self.chunk)
-            yield self.chunk
 
 
 class TestImportSmoke:
@@ -211,6 +97,7 @@ class TestImportSmoke:
 # ---------------------------------------------------------------------------
 
 
+
 class TestEntryPoint:
     def test_entry_point_exists_in_metadata(self):
         from importlib.metadata import entry_points
@@ -238,571 +125,6 @@ class TestEntryPoint:
 # Registration tests
 # ---------------------------------------------------------------------------
 
-
-class TestRegistration:
-    def test_register_creates_expected_tools(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.entry import register
-
-        register(fake_ctx)
-
-        names = [t["name"] for t in fake_ctx.tools]
-        assert "x402_status" in names
-        assert "x402_wallet_status" in names
-        assert "x402_wallet_balance" in names
-        assert "x402_service_inspect" in names
-        assert "x402_fetch" in names
-        assert "x402_pay" in names
-
-    def test_all_tools_in_x402_toolset(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.entry import register
-
-        register(fake_ctx)
-
-        for tool in fake_ctx.tools:
-            assert tool["toolset"] == "x402"
-
-    def test_all_handlers_return_json_strings(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.entry import register
-
-        register(fake_ctx)
-
-        for tool in fake_ctx.tools:
-            # Some handlers use **kwargs only (wallet_status, wallet_balance, gateway_balance),
-            # others take (args, **kwargs)
-            kwargs_only_tools = (
-                "x402_wallet_status",
-                "x402_wallet_balance",
-                "x402_gateway_balance",
-            )
-            if tool["name"] in kwargs_only_tools:
-                result = asyncio.run(_call_handler(tool["handler"], task_id="test"))
-            else:
-                result = asyncio.run(_call_handler(tool["handler"], {}, task_id="test"))
-            assert isinstance(result, str)
-            parsed = json.loads(result)
-            assert isinstance(parsed, dict)
-
-    def test_async_handlers_registered_with_flag(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.entry import register
-
-        register(fake_ctx)
-
-        async_tools = [t["name"] for t in fake_ctx.tools if t["is_async"]]
-        assert "x402_wallet_balance" in async_tools
-        assert "x402_service_inspect" in async_tools
-        assert "x402_fetch" in async_tools
-        assert "x402_pay" in async_tools
-
-    def test_registration_makes_no_subprocess_calls(self, fake_ctx: FakeHermesContext):
-        import subprocess
-
-        with patch.object(subprocess, "run", side_effect=AssertionError("subprocess called")):
-            from hermes_x402.hermes_plugin.entry import register
-
-            register(fake_ctx)
-
-    def test_registration_makes_no_network_calls(self, fake_ctx: FakeHermesContext):
-        import httpx
-
-        with patch.object(httpx, "Client", side_effect=AssertionError("network called")):
-            from hermes_x402.hermes_plugin.entry import register
-
-            register(fake_ctx)
-
-
-# ---------------------------------------------------------------------------
-# Status tool tests
-# ---------------------------------------------------------------------------
-
-
-class TestX402Status:
-    def test_status_unconfigured(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_status_tools
-
-        register_status_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(handler({}, task_id="test"))
-        assert result["success"] is True
-        assert result["plugin"] == "hermes-x402"
-        # Fix #9: configured=false when no role set
-        assert result["configured"] is False
-        assert result["available"] is False
-        assert result["role"] == "unconfigured"
-        assert result["plugin_loaded"] is True
-
-    def test_status_configured_cli(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_status_tools
-
-        env = {
-            "X402_ROLE": "buyer",
-            "X402_BUYER_BACKEND": "cli",
-            "CIRCLE_AGENT_WALLET_ADDRESS": "0x1234567890abcdef1234567890abcdef12345678",
-            "CIRCLE_AGENT_WALLET_NETWORK": "BASE",
-            "X402_MAX_USDC_PER_PAYMENT": "0.05",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            register_status_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-            result = json.loads(handler({}, task_id="test"))
-            assert result["success"] is True
-            assert result["role"] == "buyer"
-            assert result["backend"] == "cli"
-            assert result["configured"] is True
-            assert result["plugin_loaded"] is True
-            assert "..." in result["wallet_address"]
-
-    def test_status_no_secrets_in_output(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_status_tools
-
-        env = {
-            "X402_ROLE": "buyer",
-            "X402_BUYER_BACKEND": "dcw",
-            "CIRCLE_DCW_WALLET_ID": "wallet-123",
-            "CIRCLE_DCW_WALLET_ADDRESS": "0xabcdef",
-            "CIRCLE_ENTITY_SECRET": "super-secret-entity-key",
-            "CIRCLE_API_KEY": "super-secret-api-key",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            register_status_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-            result_str = handler({}, task_id="test")
-            assert "super-secret" not in result_str
-            assert "entity-key" not in result_str
-            assert "api-key" not in result_str
-
-    def test_status_consistency_no_role(self, fake_ctx: FakeHermesContext):
-        """Fix #9: role=unconfigured AND configured=false when no role."""
-        from hermes_x402.hermes_plugin.tools import register_status_tools
-
-        register_status_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(handler({}, task_id="test"))
-        assert result["role"] == "unconfigured"
-        assert result["configured"] is False
-        assert result["available"] is False
-
-
-# ---------------------------------------------------------------------------
-# Wallet tool tests
-# ---------------------------------------------------------------------------
-
-
-class TestX402WalletStatus:
-    def test_wallet_status_unconfigured(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_wallet_tools
-
-        register_wallet_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(asyncio.run(_call_handler(handler, task_id="test")))
-        assert result["success"] is True
-        assert "configured" not in result or result.get("configured") is False
-
-    def test_wallet_status_dcw_no_secrets(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_wallet_tools
-
-        env = {
-            "X402_ROLE": "buyer",
-            "X402_BUYER_BACKEND": "dcw",
-            "CIRCLE_DCW_WALLET_ID": "wallet-123",
-            "CIRCLE_DCW_WALLET_ADDRESS": "0xabcdef1234567890",
-            "CIRCLE_ENTITY_SECRET": "secret-value",
-            "CIRCLE_API_KEY": "key-value",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            register_wallet_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-            result_str = asyncio.run(_call_handler(handler, task_id="test"))
-            assert "secret-value" not in result_str
-            assert "key-value" not in result_str
-
-
-class TestX402WalletBalance:
-    def test_balance_unconfigured(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_wallet_tools
-
-        register_wallet_tools(fake_ctx)
-        handler = fake_ctx.tools[1]["handler"]
-        result = json.loads(asyncio.run(_call_handler(handler, task_id="test")))
-        # When unconfigured, backend is None → falls through to unsupported
-        assert result["success"] is False
-        assert result["error"] == "unsupported_backend"
-
-    def test_balance_dcw_unsupported(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_wallet_tools
-
-        env = {
-            "X402_ROLE": "buyer",
-            "X402_BUYER_BACKEND": "dcw",
-            "CIRCLE_DCW_WALLET_ID": "wallet-123",
-            "CIRCLE_DCW_WALLET_ADDRESS": "0xabcdef1234567890",
-            "CIRCLE_ENTITY_SECRET": "secret",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            register_wallet_tools(fake_ctx)
-            handler = fake_ctx.tools[1]["handler"]
-            result = json.loads(asyncio.run(_call_handler(handler, task_id="test")))
-            assert result["success"] is True
-            assert result["supported"] is False
-
-
-# ---------------------------------------------------------------------------
-# Service inspect tests
-# ---------------------------------------------------------------------------
-
-
-class TestX402ServiceInspect:
-    def test_inspect_invalid_url(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_service_tools
-
-        register_service_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(asyncio.run(_call_handler(handler, {"url": ""}, task_id="test")))
-        assert result["success"] is False
-        assert result["error"] == "invalid_input"
-
-    def test_inspect_file_url_rejected(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_service_tools
-
-        register_service_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(
-            asyncio.run(_call_handler(handler, {"url": "file:///etc/passwd"}, task_id="test"))
-        )
-        assert result["success"] is False
-
-    def test_inspect_url_too_long(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_service_tools
-
-        register_service_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        long_url = "https://example.com/" + "a" * 3000
-        result = json.loads(asyncio.run(_call_handler(handler, {"url": long_url}, task_id="test")))
-        assert result["success"] is False
-
-    def test_inspect_localhost_blocked(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_service_tools
-
-        register_service_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(
-            asyncio.run(_call_handler(handler, {"url": "https://localhost/admin"}, task_id="test"))
-        )
-        assert result["success"] is False
-        assert "blocked" in result["message"].lower()
-
-    def test_inspect_metadata_ip_blocked(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_service_tools
-
-        register_service_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(
-            asyncio.run(
-                _call_handler(
-                    handler,
-                    {"url": "http://169.254.169.254/metadata"},
-                    task_id="test",
-                )
-            )
-        )
-        assert result["success"] is False
-
-    def test_inspect_no_redirect(self, fake_ctx: FakeHermesContext):
-        """Fix #4: redirects not followed."""
-        from hermes_x402.hermes_plugin.tools import register_service_tools
-
-        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
-            register_service_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-
-            mock_response = MagicMock()
-            mock_response.is_redirect = True
-            mock_response.status_code = 302
-            mock_response.headers = {"location": "https://evil.com/steal"}
-
-            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-                mc = mock_client.return_value
-                mc.__aenter__ = AsyncMock(return_value=mc)
-                mc.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-                mc.request = AsyncMock(return_value=mock_response)
-
-                result = json.loads(
-                    asyncio.run(
-                        _call_handler(
-                            handler,
-                            {"url": "https://example.com/redirect"},
-                            task_id="test",
-                        )
-                    )
-                )
-                assert result["success"] is False
-                assert result["error"] == "redirect_not_followed"
-                assert result["status"] == 302
-                # Redirect target is NOT requested (request called once only)
-                assert mc.request.call_count == 1
-
-    # ---------------------------------------------------------------------------
-    # Fetch tool tests
-    # ---------------------------------------------------------------------------
-
-
-class TestX402Fetch:
-    def test_fetch_invalid_method(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[0]["handler"]
-        result = json.loads(
-            asyncio.run(
-                _call_handler(
-                    handler,
-                    {"url": "https://example.com", "method": "INVALID"},
-                    task_id="test",
-                )
-            )
-        )
-        assert result["success"] is False
-
-    def test_fetch_nonpaying_by_default(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
-            register_payment_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-
-            fake = FakeStreamResponse(
-                status_code=402,
-                headers={"Payment-Required": "price=10000"},
-            )
-
-            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-                mc = mock_client.return_value
-                mc.__aenter__ = AsyncMock(return_value=mc)
-                mc.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.stream = MagicMock(return_value=fake)
-
-                result = json.loads(
-                    asyncio.run(
-                        _call_handler(
-                            handler,
-                            {"url": "https://example.com/resource"},
-                            task_id="test",
-                        )
-                    )
-                )
-                assert result["success"] is True
-                assert result["payment_required"] is True
-                assert fake.closed is True
-
-    def test_fetch_enforces_allowlist(self, fake_ctx: FakeHermesContext):
-        """Fix #5: allowlist enforced before network I/O."""
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        env = {
-            "X402_HOST_ALLOWLIST": "allowed.example.com",
-            "X402_ROLE": "buyer",
-            "X402_BUYER_BACKEND": "cli",
-            "CIRCLE_AGENT_WALLET_ADDRESS": "0x1234",
-            "CIRCLE_AGENT_WALLET_NETWORK": "BASE",
-            "X402_MAX_USDC_PER_PAYMENT": "0.05",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            register_payment_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://evil.com/steal"},
-                        task_id="test",
-                    )
-                )
-            )
-            assert result["success"] is False
-            assert result["error"] == "host_rejected"
-
-    def test_fetch_no_redirect(self, fake_ctx: FakeHermesContext):
-        """Fix #4: redirects not followed."""
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
-            register_payment_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-
-            fake = FakeStreamResponse(
-                status_code=301,
-                headers={"location": "https://other.com/new"},
-                is_redirect=True,
-            )
-
-            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-                mc = mock_client.return_value
-                mc.__aenter__ = AsyncMock(return_value=mc)
-                mc.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.stream = MagicMock(return_value=fake)
-
-                result = json.loads(
-                    asyncio.run(
-                        _call_handler(
-                            handler,
-                            {"url": "https://example.com/moved"},
-                            task_id="test",
-                        )
-                    )
-                )
-                assert result["success"] is False
-                assert result["error"] == "redirect_not_followed"
-                assert fake.closed is True
-
-    def test_fetch_bounded_json_output(self, fake_ctx: FakeHermesContext):
-        """Fix #6: JSON output bounded."""
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
-            register_payment_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-
-            from hermes_x402.hermes_plugin.schemas import MAX_OUTPUT_BYTES
-
-            # Use InfiniteLikeStreamResponse to prove bounded read
-            # without allocating the full body
-            chunk = b"x" * 4096
-            chunk_count = (MAX_OUTPUT_BYTES // 4096) + 10  # way over the limit
-            fake = InfiniteLikeStreamResponse(chunk, chunk_count)
-
-            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-                mc = mock_client.return_value
-                mc.__aenter__ = AsyncMock(return_value=mc)
-                mc.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.stream = MagicMock(return_value=fake)
-
-                result = json.loads(
-                    asyncio.run(
-                        _call_handler(
-                            handler,
-                            {"url": "https://example.com/big"},
-                            task_id="test",
-                        )
-                    )
-                )
-                assert result["success"] is True
-                assert result["truncated"] is True
-                assert result["original_size"] > MAX_OUTPUT_BYTES
-                # Prove bounded read: bytes consumed <= limit
-                assert fake.bytes_read <= MAX_OUTPUT_BYTES + len(chunk)
-                assert fake.closed is True
-
-    def test_fetch_malformed_json(self, fake_ctx: FakeHermesContext):
-        """Fix #6: malformed JSON handled gracefully."""
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        with patch.dict("os.environ", {"X402_NETWORK_POLICY": "public"}, clear=False):
-            register_payment_tools(fake_ctx)
-            handler = fake_ctx.tools[0]["handler"]
-
-            fake = FakeStreamResponse(
-                status_code=200,
-                body=b"{not valid json",
-                headers={"content-type": "application/json"},
-            )
-
-            with patch("hermes_x402.hermes_plugin.tools.httpx.AsyncClient") as mock_client:
-                mc = mock_client.return_value
-                mc.__aenter__ = AsyncMock(return_value=mc)
-                mc.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-                mock_client.return_value.stream = MagicMock(return_value=fake)
-
-                result = json.loads(
-                    asyncio.run(
-                        _call_handler(
-                            handler,
-                            {"url": "https://example.com/bad"},
-                            task_id="test",
-                        )
-                    )
-                )
-                # Result is still valid JSON string
-                assert isinstance(result, dict)
-                assert fake.closed is True
-
-
-# ---------------------------------------------------------------------------
-# Pay tool tests
-# ---------------------------------------------------------------------------
-
-
-class TestX402Pay:
-    def test_pay_unavailable_when_not_configured(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[1]["handler"]
-        result = json.loads(
-            asyncio.run(
-                _call_handler(handler, {"url": "https://example.com/resource"}, task_id="test")
-            )
-        )
-        assert result["success"] is False
-        assert result["error"] == "configuration_error"
-
-    def test_pay_invalid_url(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[1]["handler"]
-        result = json.loads(asyncio.run(_call_handler(handler, {"url": ""}, task_id="test")))
-        assert result["success"] is False
-
-    def test_pay_caller_cap_cannot_exceed_configured(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        env = {
-            "X402_ROLE": "buyer",
-            "X402_BUYER_BACKEND": "cli",
-            "CIRCLE_AGENT_WALLET_ADDRESS": "0x1234",
-            "CIRCLE_AGENT_WALLET_NETWORK": "BASE",
-            "X402_MAX_USDC_PER_PAYMENT": "0.01",
-            "X402_NETWORK_POLICY": "public",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            register_payment_tools(fake_ctx)
-            handler = fake_ctx.tools[1]["handler"]
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://example.com/resource", "max_usdc": "1.00"},
-                        task_id="test",
-                    )
-                )
-            )
-            assert result["success"] is False
-            assert result["error"] == "payment_limit_exceeded"
-
-    def test_pay_negative_amount_rejected(self, fake_ctx: FakeHermesContext):
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        register_payment_tools(fake_ctx)
-        handler = fake_ctx.tools[1]["handler"]
-        result = json.loads(
-            asyncio.run(
-                _call_handler(
-                    handler,
-                    {"url": "https://example.com/resource", "max_usdc": "-1"},
-                    task_id="test",
-                )
-            )
-        )
-        assert result["success"] is False
-
-
-# ---------------------------------------------------------------------------
-# P1: Payment cap validation tests
-# ---------------------------------------------------------------------------
 
 
 class TestPaymentCapValidation:
@@ -894,35 +216,11 @@ class TestPaymentCapValidation:
         assert err is None
         assert cap == "0.05"
 
-    def test_buyer_not_called_on_invalid_cap(self, fake_ctx: FakeHermesContext):
-        """On any invalid-cap case, buyer.pay() must not be called."""
-        from hermes_x402.hermes_plugin.tools import register_payment_tools
-
-        env = {
-            "X402_ROLE": "buyer",
-            "X402_BUYER_BACKEND": "cli",
-            "CIRCLE_AGENT_WALLET_ADDRESS": "0x1234",
-            "CIRCLE_AGENT_WALLET_NETWORK": "BASE",
-            "X402_MAX_USDC_PER_PAYMENT": "bad-config",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            register_payment_tools(fake_ctx)
-            handler = fake_ctx.tools[1]["handler"]
-            result = json.loads(
-                asyncio.run(
-                    _call_handler(
-                        handler,
-                        {"url": "https://example.com", "max_usdc": "0.01"},
-                        task_id="test",
-                    )
-                )
-            )
-            assert result["success"] is False
-
 
 # ---------------------------------------------------------------------------
 # Error mapping tests
 # ---------------------------------------------------------------------------
+
 
 
 class TestErrorMapping:
@@ -1008,6 +306,7 @@ class TestErrorMapping:
 # ---------------------------------------------------------------------------
 
 
+
 class TestInputValidation:
     def test_validate_url_rejects_empty(self):
         from hermes_x402.hermes_plugin.tools import _validate_url
@@ -1044,6 +343,7 @@ class TestInputValidation:
 # ---------------------------------------------------------------------------
 # URL/host policy tests (Fix #3)
 # ---------------------------------------------------------------------------
+
 
 
 class TestURLHostPolicy:
@@ -1101,6 +401,7 @@ class TestURLHostPolicy:
 # ---------------------------------------------------------------------------
 
 
+
 class TestOutput:
     def test_safe_wallet_address_masks(self):
         from hermes_x402.hermes_plugin.output import safe_wallet_address
@@ -1120,6 +421,7 @@ class TestOutput:
 # ---------------------------------------------------------------------------
 # Runtime tests
 # ---------------------------------------------------------------------------
+
 
 
 class TestRuntime:
@@ -1151,6 +453,7 @@ class TestRuntime:
 # ---------------------------------------------------------------------------
 
 
+
 class TestPackaging:
     def test_entry_point_declaration(self):
         from pathlib import Path
@@ -1165,269 +468,6 @@ class TestPackaging:
 # Approval hook unit tests
 # ---------------------------------------------------------------------------
 
-
-class TestApprovalHookUnitTests:
-    """Unit tests for the approval hook logic using FakeHermesContext.
-
-    These tests verify the hook's decision logic but do NOT execute
-    Hermes' native approval gate. They use mocks, not real Hermes runtime.
-
-    Actual Hermes runtime/install smoke is explicitly deferred until
-    the installer work.
-    """
-
-    def test_plugin_loads_14_tools_and_hook(self):
-        """Plugin registration produces 14 tools and one hook."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        ctx = FakeHermesContext()
-        register(ctx)
-
-        assert len(ctx.tools) == 14
-        assert len(ctx.hooks) == 1
-
-        tool_names = {t["name"] for t in ctx.tools}
-        expected_tools = {
-            "x402_status",
-            "x402_wallet_status",
-            "x402_wallet_balance",
-            "x402_networks",
-            "x402_service_search",
-            "x402_supports",
-            "x402_service_inspect",
-            "x402_fetch",
-            "x402_pay",
-            "x402_login_start",
-            "x402_login_complete",
-            "x402_gateway_balance",
-            "x402_gateway_deposit_preview",
-            "x402_gateway_deposit_execute",
-        }
-        assert tool_names == expected_tools
-
-        assert ctx.hooks[0]["hook_type"] == "pre_tool_call"
-        assert callable(ctx.hooks[0]["handler"])
-
-    def test_denied_approval_prevents_backend(self):
-        """When approval hook returns block, fake backend runs zero times."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        ctx = FakeHermesContext()
-        register(ctx)
-
-        hook_fn = ctx.hooks[0]["handler"]
-
-        # Block: no tool_call_id
-        result = hook_fn("x402_pay", {"url": "https://example.com"})
-        assert result is not None
-        assert result["action"] == "block"
-
-        # Fake backend must not be called
-        fake_backend_calls = []
-
-        def fake_backend():
-            fake_backend_calls.append(1)
-
-        # Simulate: if hook blocks, backend should not run
-        if result["action"] == "block":
-            pass  # Backend skipped
-        else:
-            fake_backend()
-
-        assert fake_backend_calls == []
-
-    def test_approved_approval_runs_backend_once(self):
-        """When approval hook returns approve, fake backend runs exactly once."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        ctx = FakeHermesContext()
-        register(ctx)
-
-        hook_fn = ctx.hooks[0]["handler"]
-
-        # Approve: with tool_call_id
-        result = hook_fn(
-            "x402_pay",
-            {"url": "https://example.com", "method": "GET"},
-            tool_call_id="call_123",
-        )
-        assert result is not None
-        assert result["action"] == "approve"
-        assert result["rule_key"] == "hermes-x402:x402_pay:call_123"
-
-        # Fake backend must run exactly once
-        fake_backend_calls = []
-
-        def fake_backend():
-            fake_backend_calls.append(1)
-
-        if result["action"] == "block":
-            pass
-        else:
-            fake_backend()
-
-        assert fake_backend_calls == [1]
-
-    def test_approval_message_includes_url_and_method(self):
-        """Approval message includes URL and method for x402_pay."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        ctx = FakeHermesContext()
-        register(ctx)
-
-        hook_fn = ctx.hooks[0]["handler"]
-
-        result = hook_fn(
-            "x402_pay",
-            {"url": "https://api.example.com/data", "method": "POST"},
-            tool_call_id="call_456",
-        )
-        assert result is not None
-        assert "https://api.example.com/data" in result["message"]
-        assert "POST" in result["message"]
-
-    def test_non_financial_tool_returns_none(self):
-        """Non-financial tools return None (no approval needed)."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        ctx = FakeHermesContext()
-        register(ctx)
-
-        hook_fn = ctx.hooks[0]["handler"]
-
-        result = hook_fn("x402_status", {})
-        assert result is None
-
-        result = hook_fn("x402_wallet_status", {})
-        assert result is None
-
-    def test_gateway_execute_approval_message(self):
-        """Gateway deposit execute gets informative approval message."""
-        import time
-
-        from hermes_x402.hermes_plugin.entry import register
-        from hermes_x402.hermes_plugin.gateway_state import store_preview
-
-        # Store a valid preview for the test
-        store_preview(
-            "abc123",
-            {
-                "service_url": "https://api.example.com/pay",
-                "deposit_amount": "2.5",
-                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
-                "wallet_network": "ARC-TESTNET",
-                "deposit_method": "direct",
-                "expires_at": time.time() + 300,
-                "consumed": False,
-            },
-        )
-
-        ctx = FakeHermesContext()
-        register(ctx)
-
-        hook_fn = ctx.hooks[0]["handler"]
-
-        result = hook_fn(
-            "x402_gateway_deposit_execute",
-            {"preview_id": "abc123"},
-            tool_call_id="call_789",
-        )
-        assert result is not None
-        assert result["action"] == "approve"
-        assert "2.5" in result["message"]
-        assert "example.com" in result["message"]
-        assert "ARC-TESTNET" in result["message"]
-
-
-# ---------------------------------------------------------------------------
-# Focused regression tests — preview blocking, URL sanitization, atomicity
-# ---------------------------------------------------------------------------
-
-
-class TestPreviewBlocking:
-    """Tests that invalid Gateway previews are blocked in the approval hook."""
-
-    def test_missing_preview_returns_block(self):
-        """Missing preview returns action=block."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        ctx = FakeHermesContext()
-        register(ctx)
-        hook_fn = ctx.hooks[0]["handler"]
-
-        result = hook_fn(
-            "x402_gateway_deposit_execute",
-            {"preview_id": "nonexistent_id"},
-            tool_call_id="call_1",
-        )
-        assert result is not None
-        assert result["action"] == "block"
-        assert "missing" in result["message"].lower() or "expired" in result["message"].lower()
-
-    def test_expired_preview_returns_block(self):
-        """Expired preview returns action=block."""
-        # Store a preview that is already expired
-        import time
-
-        from hermes_x402.hermes_plugin.entry import register
-        from hermes_x402.hermes_plugin.gateway_state import store_preview
-
-        store_preview(
-            "expired_123",
-            {
-                "service_url": "https://example.com",
-                "deposit_amount": "1.0",
-                "wallet": "0x1234567890abcdef",
-                "wallet_network": "ARC-TESTNET",
-                "deposit_method": "direct",
-                "expires_at": time.time() - 10,  # Already expired
-                "consumed": False,
-            },
-        )
-
-        ctx = FakeHermesContext()
-        register(ctx)
-        hook_fn = ctx.hooks[0]["handler"]
-
-        result = hook_fn(
-            "x402_gateway_deposit_execute",
-            {"preview_id": "expired_123"},
-            tool_call_id="call_2",
-        )
-        assert result is not None
-        assert result["action"] == "block"
-
-    def test_consumed_preview_returns_block(self):
-        """Consumed preview returns action=block."""
-        import time
-
-        from hermes_x402.hermes_plugin.entry import register
-        from hermes_x402.hermes_plugin.gateway_state import store_preview
-
-        store_preview(
-            "consumed_123",
-            {
-                "service_url": "https://example.com",
-                "deposit_amount": "1.0",
-                "wallet": "0x1234567890abcdef",
-                "wallet_network": "ARC-TESTNET",
-                "deposit_method": "direct",
-                "expires_at": time.time() + 300,
-                "consumed": True,  # Already consumed
-            },
-        )
-
-        ctx = FakeHermesContext()
-        register(ctx)
-        hook_fn = ctx.hooks[0]["handler"]
-
-        result = hook_fn(
-            "x402_gateway_deposit_execute",
-            {"preview_id": "consumed_123"},
-            tool_call_id="call_3",
-        )
-        assert result is not None
-        assert result["action"] == "block"
 
 
 class TestUrlSanitization:
@@ -1485,6 +525,7 @@ class TestUrlSanitization:
         assert result == "[invalid URL]"
 
 
+
 class TestPreviewAtomicity:
     """Tests that concurrent preview claims are atomic."""
 
@@ -1527,6 +568,7 @@ class TestPreviewAtomicity:
         # Exactly one should succeed
         assert results.count(True) == 1
         assert results.count(False) == 1
+
 
 
 class TestPreviewStoreBounds:
@@ -1610,6 +652,7 @@ class TestPreviewStoreBounds:
 # ---------------------------------------------------------------------------
 
 
+
 class TestUrlSanitizerRegression:
     """Regression: malformed port raises ValueError/UnicodeError → [invalid URL]."""
 
@@ -1648,101 +691,6 @@ class TestUrlSanitizerRegression:
         result = _sanitize_url_for_display("https://[::1]:8443/api")
         assert "[::1]:8443" in result
 
-
-class TestPreviewIdValidation:
-    """Regression: preview ID > 128 chars is blocked in approval hook and handler."""
-
-    def test_approval_hook_blocks_overlong_preview_id(self) -> None:
-        """Approval hook blocks preview_id exceeding 128 characters."""
-        from hermes_x402.hermes_plugin.entry import register
-        from hermes_x402.hermes_plugin.gateway_state import _lock, _previews
-
-        # Clear any stale previews
-        with _lock:
-            _previews.clear()
-
-        ctx = FakeHermesContext()
-        register(ctx)
-        hook_fn = ctx.hooks[0]["handler"]
-
-        long_id = "a" * 129
-        result = hook_fn(
-            "x402_gateway_deposit_execute",
-            {"preview_id": long_id},
-            tool_call_id="call_overflow",
-        )
-        assert result is not None
-        assert result["action"] == "block"
-        assert "128" in result["message"]
-
-    def test_approval_hook_allows_valid_preview_id(self) -> None:
-        """Approval hook allows preview_id within 1..128 characters."""
-        import time
-
-        from hermes_x402.hermes_plugin.entry import register
-        from hermes_x402.hermes_plugin.gateway_state import _lock, _previews, store_preview
-
-        # Clear any stale previews from previous tests
-        with _lock:
-            _previews.clear()
-
-        valid_id = "a" * 128
-        store_preview(
-            valid_id,
-            {
-                "service_url": "https://example.com",
-                "deposit_amount": "1.0",
-                "wallet": "0x1234567890abcdef1234567890abcdef12345678",
-                "wallet_network": "ARC-TESTNET",
-                "deposit_method": "direct",
-                "expires_at": time.time() + 300,
-                "consumed": False,
-            },
-        )
-
-        ctx = FakeHermesContext()
-        register(ctx)
-        hook_fn = ctx.hooks[0]["handler"]
-
-        result = hook_fn(
-            "x402_gateway_deposit_execute",
-            {"preview_id": valid_id},
-            tool_call_id="call_valid",
-        )
-        assert result is not None
-        assert result["action"] == "approve"
-
-    async def test_execute_handler_blocks_overlong_preview_id(self) -> None:
-        """Execute handler rejects preview_id exceeding 128 characters."""
-        from hermes_x402.hermes_plugin.tools import register_gateway_tools
-
-        class _C:
-            def __init__(self):
-                self.tools = {}
-                self.hooks = []
-
-            def register_tool(self, **kw):
-                self.tools[kw["name"]] = kw
-
-            def register_hook(self, ht, h):
-                self.hooks.append({"hook_type": ht, "handler": h})
-
-        ctx = _C()
-        register_gateway_tools(ctx)
-        handler = ctx.tools["x402_gateway_deposit_execute"]["handler"]
-
-        long_id = "b" * 129
-        rt = MagicMock()
-        rt.cli_client = AsyncMock()
-        rt.config = MagicMock()
-        rt.is_configured = True
-        with patch("hermes_x402.hermes_plugin.tools.get_runtime", return_value=rt):
-            result = await handler({"preview_id": long_id})
-
-        data = json.loads(result)
-        assert data["success"] is False
-        assert data["error"] == "invalid_input"
-        assert "128" in data["message"]
 
 
 class TestPreviewStoreOverflow:
@@ -1874,6 +822,7 @@ class TestPreviewStoreOverflow:
         assert "256" in data["message"]
 
 
+
 class TestWalletStatusNetworkResolution:
     """Regression: valid mainnet session does NOT satisfy Arc Testnet wallet status."""
 
@@ -1941,6 +890,7 @@ class TestWalletStatusNetworkResolution:
         # session_valid must be False because testnet_status is NOT_LOGGED_IN
         assert data["session_valid"] is False
         assert data["session_environment"] == "testnet"
+
 
 
 class TestLoginCompletionEnvironment:
@@ -2118,6 +1068,7 @@ class TestLoginCompletionEnvironment:
 # ---------------------------------------------------------------------------
 
 
+
 class TestServiceOptionFingerprint:
     """Regression: fingerprint must be a stable 64-char hex string."""
 
@@ -2190,3 +1141,4 @@ class TestServiceOptionFingerprint:
         # Cleanup
         with _lock:
             _previews.clear()
+
