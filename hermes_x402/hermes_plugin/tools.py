@@ -655,7 +655,7 @@ def register_wallet_tools(ctx: Any) -> None:
         name="x402_wallet_status",
         toolset="x402",
         schema=X402_WALLET_STATUS_SCHEMA,
-        handler=wallet_status_handler,
+        handler=lambda args, **kw: wallet_status_handler(**kw),
         is_async=True,
         description=(
             "Report Circle wallet status: CLI installation, authentication, "
@@ -732,7 +732,7 @@ def register_wallet_tools(ctx: Any) -> None:
         name="x402_wallet_balance",
         toolset="x402",
         schema=X402_WALLET_BALANCE_SCHEMA,
-        handler=wallet_balance_handler,
+        handler=lambda args, **kw: wallet_balance_handler(**kw),
         is_async=True,
         description="Report configured wallet USDC balance. Read-only.",
     )
@@ -1870,7 +1870,7 @@ def register_gateway_tools(ctx: Any) -> None:
         name="x402_gateway_balance",
         toolset="x402",
         schema=X402_GATEWAY_BALANCE_SCHEMA,
-        handler=gateway_balance_handler,
+        handler=lambda args, **kw: gateway_balance_handler(**kw),
         is_async=True,
         description=(
             "Report Circle Gateway balance for the active wallet and configured "
@@ -2095,6 +2095,10 @@ def register_gateway_tools(ctx: Any) -> None:
             )
 
         # Extract details from the gateway option
+        # gateway_option.network is a CAIP-2 registry key (e.g. "arcTestnet")
+        # but Circle CLI requires the chain name (e.g. "ARC-TESTNET").
+        # Save the original CLI-compatible network for balance/CLI calls.
+        cli_network = network
         network = gateway_option.network
         gateway_network = gateway_option.network_id
 
@@ -2142,11 +2146,11 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Verify wallet balance
+        # Verify wallet balance (use cli_network, not CAIP-2 registry key)
         usdc_balance = "0"
         try:
             balances = await runtime.cli_client.get_balance(
-                wallet_address=runtime.wallet_address, network=network
+                wallet_address=runtime.wallet_address, network=cli_network
             )
             for b in balances:
                 if b.symbol == "USDC":
@@ -2171,11 +2175,11 @@ def register_gateway_tools(ctx: Any) -> None:
                 }
             )
 
-        # Get current Gateway balance
+        # Get current Gateway balance (use cli_network, not CAIP-2 registry key)
         gw_balance = "0"
         try:
             gw = await runtime.cli_client.gateway_balance(
-                wallet_address=runtime.wallet_address, network=network
+                wallet_address=runtime.wallet_address, network=cli_network
             )
             gw_balance = gw.total_usdc
         except Exception:
@@ -2206,9 +2210,9 @@ def register_gateway_tools(ctx: Any) -> None:
         # Deposit method: direct only for this PR
         deposit_method = "direct"
 
-        # Configuration fingerprint
+        # Configuration fingerprint (use cli_network for consistency with execute)
         config_fingerprint = hashlib.sha256(
-            f"{runtime.wallet_address}:{network}".encode()
+            f"{runtime.wallet_address}:{cli_network}".encode()
         ).hexdigest()[:16]
 
         # Body hash already computed during input validation
@@ -2239,7 +2243,7 @@ def register_gateway_tools(ctx: Any) -> None:
             "body": canonical_body,  # Stored for revalidation, never in output
             # Wallet and config
             "wallet": runtime.wallet_address,
-            "wallet_network": network,
+            "wallet_network": cli_network,
             "deposit_method": deposit_method,
             "config_fingerprint": config_fingerprint,
             "service_option_fingerprint": service_option_fingerprint,

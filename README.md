@@ -319,6 +319,81 @@ hermes-x402 is designed with agent-safety principles:
 - Circle CLI session state is managed by the CLI itself (on-disk), not by hermes-x402.
 - Session persists across Hermes process restarts as long as the Circle CLI's credential storage is intact.
 
+## Installation as Hermes Plugin
+
+### Install from source checkout (recommended)
+
+```bash
+git clone https://github.com/riyannode/hermes-x402.git
+cd hermes-x402
+python3 -m hermes_x402.install \
+  --hermes-python /usr/local/lib/hermes-agent/venv/bin/python
+```
+
+Then manually restart the gateway:
+
+```bash
+/usr/local/lib/hermes-agent/venv/bin/hermes gateway restart
+```
+
+Or use the automatic restart flag:
+
+```bash
+python3 -m hermes_x402.install \
+  --hermes-python /usr/local/lib/hermes-agent/venv/bin/python \
+  --restart-gateway
+```
+
+The installer:
+1. Detects the Hermes executable and Python environment
+2. Builds a wheel from the repository using pip (no third-party build package required)
+3. Installs the wheel into the Hermes Python environment (--no-deps)
+4. Runs `hermes plugins enable hermes-x402 --no-allow-tool-override`
+5. Verifies 14 tools and 1 pre_tool_call hook via static entry-point contract
+
+### Verify installation
+
+```bash
+python3 -m hermes_x402.install --check
+```
+
+### Live Arc Testnet acceptance test
+
+```bash
+python3 -m hermes_x402.install --live-test \
+  --service-url https://seller.example/x402 \
+  --method GET \
+  --max-payment 0.001
+```
+
+Optional flags:
+- `--hermes-python /path/to/python` — override the Hermes Python interpreter
+- `--body-file /path/to/body.json` — JSON body for POST requests
+
+⚠️ **Interactive test** — requires manual approval at each step.
+Makes real Arc Testnet transactions. Never runs on mainnet.
+
+### Uninstall
+
+```bash
+python3 -m hermes_x402.install --uninstall
+```
+
+Add `--restart-gateway` to restart the gateway after uninstall.
+
+The uninstall flow:
+1. Disables the plugin via `hermes plugins disable hermes-x402`
+2. Runs `pip uninstall -y hermes-x402`
+3. Verifies the entry-point record is absent
+4. Prints the restart command (does not restart by default)
+
+Or manually:
+
+```bash
+pip uninstall hermes-x402
+hermes plugins disable hermes-x402
+```
+
 ## Development
 
 ```bash
