@@ -2111,3 +2111,82 @@ class TestLoginCompletionEnvironment:
         assert data["authenticated"] is True
         assert data["environment_valid"] is True
         assert data["environment"] == "mainnet"
+
+
+# ---------------------------------------------------------------------------
+# Regression: service payment-option fingerprint
+# ---------------------------------------------------------------------------
+
+
+class TestServiceOptionFingerprint:
+    """Regression: fingerprint must be a stable 64-char hex string."""
+
+    def test_returns_string_of_length_64(self) -> None:
+        """_service_option_fingerprint returns a 64-char hex digest string."""
+        from hermes_x402.hermes_plugin.tools import _service_option_fingerprint
+
+        option = MagicMock()
+        option.scheme = "https"
+        option.payment_system = "gateway_batching"
+        option.network = "arcTestnet"
+        option.network_id = "eip155:5042002"
+        option.amount_atomic = "1000000"
+        option.asset = "USDC"
+        option.pay_to = "0xdeadbeef"
+        option.max_timeout_seconds = 60
+
+        fp = _service_option_fingerprint(option, "2")
+        assert isinstance(fp, str)
+        assert len(fp) == 64
+        assert all(c in "0123456789abcdef" for c in fp)
+
+    def test_stored_fingerprint_survives_deepcopy(self) -> None:
+        """Preview data containing the fingerprint can be stored and read back."""
+        import copy
+        import time
+
+        from hermes_x402.hermes_plugin.gateway_state import (
+            _lock,
+            _previews,
+            get_preview,
+            store_preview,
+        )
+        from hermes_x402.hermes_plugin.tools import _service_option_fingerprint
+
+        option = MagicMock()
+        option.scheme = "https"
+        option.payment_system = "gateway_batching"
+        option.network = "arcTestnet"
+        option.network_id = "eip155:5042002"
+        option.amount_atomic = "1000000"
+        option.asset = "USDC"
+        option.pay_to = "0xdeadbeef"
+        option.max_timeout_seconds = 60
+
+        fp = _service_option_fingerprint(option, "2")
+        preview_data = {
+            "deposit_amount": "5.0",
+            "service_option_fingerprint": fp,
+            "wallet": "0xabcdef1234567890abcdef1234567890abcdef12",
+            "wallet_network": "ARC-TESTNET",
+            "deposit_method": "direct",
+            "expires_at": time.time() + 300,
+            "consumed": False,
+        }
+
+        # deepcopy must not raise TypeError on the fingerprint
+        copy.deepcopy(preview_data)
+
+        # Clear stale previews and store
+        with _lock:
+            _previews.clear()
+        store_preview("fp_test_123", preview_data)
+
+        read_back = get_preview("fp_test_123")
+        assert read_back is not None
+        assert read_back["service_option_fingerprint"] == fp
+        assert len(read_back["service_option_fingerprint"]) == 64
+
+        # Cleanup
+        with _lock:
+            _previews.clear()

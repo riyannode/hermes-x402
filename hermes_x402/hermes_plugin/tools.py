@@ -73,6 +73,28 @@ from hermes_x402.hermes_plugin.schemas import (
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Fingerprint helper
+# ---------------------------------------------------------------------------
+
+
+def _service_option_fingerprint(option: Any, x402_version: str | int) -> str:
+    """Return a stable SHA-256 hex fingerprint of a Gateway payment option."""
+    payload = {
+        "scheme": option.scheme,
+        "payment_system": option.payment_system,
+        "network": option.network,
+        "network_id": option.network_id,
+        "amount_atomic": option.amount_atomic,
+        "asset": option.asset,
+        "pay_to": option.pay_to,
+        "max_timeout_seconds": option.max_timeout_seconds,
+        "x402_version": x402_version,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
@@ -2193,22 +2215,7 @@ def register_gateway_tools(ctx: Any) -> None:
         # Store canonical body for revalidation (never in output)
 
         # Service payment-option fingerprint from all option fields
-        service_option_fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "scheme": gateway_option.scheme,
-                    "payment_system": gateway_option.payment_system,
-                    "network": gateway_option.network,
-                    "network_id": gateway_option.network_id,
-                    "amount_atomic": gateway_option.amount_atomic,
-                    "asset": gateway_option.asset,
-                    "pay_to": gateway_option.pay_to,
-                    "max_timeout_seconds": gateway_option.max_timeout_seconds,
-                    "x402_version": support.version,
-                },
-                sort_keys=True,
-            ).encode()
-        )
+        service_option_fingerprint = _service_option_fingerprint(gateway_option, support.version)
 
         # Generate preview ID with full state
         preview_id = secrets.token_urlsafe(16)
@@ -2528,23 +2535,7 @@ def register_gateway_tools(ctx: Any) -> None:
         fresh_gateway_option = None
         for opt in fresh_support.options:
             if opt.payment_system == "gateway_batching" and opt.supported_by_backend:
-                # Recompute fingerprint from this option
-                opt_fingerprint = hashlib.sha256(
-                    json.dumps(
-                        {
-                            "scheme": opt.scheme,
-                            "payment_system": opt.payment_system,
-                            "network": opt.network,
-                            "network_id": opt.network_id,
-                            "amount_atomic": opt.amount_atomic,
-                            "asset": opt.asset,
-                            "pay_to": opt.pay_to,
-                            "max_timeout_seconds": opt.max_timeout_seconds,
-                            "x402_version": fresh_support.version,
-                        },
-                        sort_keys=True,
-                    ).encode()
-                ).hexdigest()[:16]
+                opt_fingerprint = _service_option_fingerprint(opt, fresh_support.version)
                 if opt_fingerprint == preview.get("service_option_fingerprint"):
                     fresh_gateway_option = opt
                     break
