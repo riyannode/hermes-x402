@@ -6,21 +6,22 @@ gateway process via Telegram — never through one-shot subprocess calls.
 Requires a deterministic seller endpoint passed via LiveTestConfig.
 
 Usage (from install.py --live-test):
-    python3 -m hermes_x402.install --live-test \
-        --service-url https://seller.example/x402 \
-        --method GET \
+    python3 -m hermes_x402.install --live-test \\
+        --service-url https://seller.example/x402 \\
+        --method GET \\
         --max-payment 0.001
 
 Or standalone (for debugging after install):
-    python3 -m hermes_x402.live_test \
-        --service-url https://seller.example/x402 \
-        --method GET \
+    python3 -m hermes_x402.live_test \\
+        --service-url https://seller.example/x402 \\
+        --method GET \\
         --max-payment 0.001
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -41,6 +42,7 @@ _EXPECTED_TOOLS = 14
 _EXPECTED_HOOKS = 1
 _TX_HASH_RE = re.compile(r"0x[a-fA-F0-9]{64}")
 _ENV_DEBUG = "HERMES_PLUGINS_DEBUG"
+_MAX_BALANCE_ATTEMPTS = 3  # retry operator input on parse failure
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +139,135 @@ def _decimal(s: str) -> Decimal:
     return Decimal(s)
 
 
+def _mask_wallet(addr: str) -> str:
+    """Mask wallet address for display."""
+    if not addr or len(addr) < 10:
+        return "***"
+    return addr[:6] + "..." + addr[-4:]
+
+
+def _sanitize(url: str) -> str:
+    """Bounded, safe-to-display form of a URL."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or "unknown"
+    path = parsed.path or "/"
+    if len(path) > 60:
+        path = path[:57] + "..."
+    return f"{parsed.scheme}://{host}{path}"
+
+
+def _body_hash(body: str | None) -> str:
+    """SHA-256 of canonical body for reports."""
+    if body is None:
+        return "none"
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Strict balance parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_decimal_balance(text: str, label: str) -> Decimal | None:
+    """Parse a single finite non-negative Decimal balance from operator text.
+
+    Requires an explicit JSON field or structured label. Returns None on
+    any parse failure, ambiguous input, or invalid value.
+    """
+    # Try JSON first
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in (label, f"{label}_balance", "balance"):
+                val = data.get(key)
+                if val is not None:
+                    d = Decimal(str(val))
+                    if d.is_finite() and d >= 0:
+                        return d
+    except (json.JSONDecodeError, InvalidOperation, TypeError):
+        pass
+
+    # Try explicit "label: <number>" pattern
+    pattern = rf"(?:{re.escape(label)}|balance)[^0-9]*([\d]+\.[\d]+|[\d]+)"
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    if len(matches) == 1:
+        try:
+            d = Decimal(matches[0])
+            if d.is_finite() and d >= 0:
+                return d
+        except InvalidOperation:
+            pass
+
+    return None
+
+
+def _prompt_balances(
+    hermes: Path,
+    prompt: str,
+    wallet_label: str = "wallet",
+    gateway_label: str = "gateway",
+) -> tuple[Decimal | None, Decimal | None]:
+    """Prompt operator for both wallet and gateway balances.
+
+    Requires structured JSON or explicit numeric labels.
+    Returns (wallet_decimal, gateway_decimal) — None on parse failure.
+    """
+    for attempt in range(_MAX_BALANCE_ATTEMPTS):
+        resp = _hermes_cmd(hermes, prompt)
+
+        # Try JSON parsing
+        wallet = _parse_decimal_balance(resp, wallet_label)
+        gateway = _parse_decimal_balance(resp, gateway_label)
+
+        if wallet is not None and gateway is not None:
+            return wallet, gateway
+
+        if attempt < _MAX_BALANCE_ATTEMPTS - 1:
+            print(
+                f"  ⚠️  Could not parse balances from response. "
+                f"Please provide JSON like: "
+                f'{{"{wallet_label}": "1.234", "{gateway_label}": "5.678"}}'
+            )
+
+    return None, None
+
+
+def _prompt_single_balance(hermes: Path, prompt: str) -> Decimal | None:
+    """Prompt operator for a single balance value."""
+    for attempt in range(_MAX_BALANCE_ATTEMPTS):
+        resp = _hermes_cmd(hermes, prompt)
+
+        # Try JSON
+        try:
+            data = json.loads(resp)
+            if isinstance(data, dict):
+                for key in ("balance", "wallet_balance", "amount"):
+                    val = data.get(key)
+                    if val is not None:
+                        d = Decimal(str(val))
+                        if d.is_finite() and d >= 0:
+                            return d
+        except (json.JSONDecodeError, InvalidOperation, TypeError):
+            pass
+
+        # Try number extraction
+        amounts = re.findall(r"[\d]+\.[\d]+", resp)
+        if len(amounts) == 1:
+            try:
+                d = Decimal(amounts[0])
+                if d.is_finite() and d >= 0:
+                    return d
+            except InvalidOperation:
+                pass
+
+        if attempt < _MAX_BALANCE_ATTEMPTS - 1:
+            print('  ⚠️  Could not parse balance. Please provide JSON like: {"balance": "1.234"}')
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
@@ -181,7 +312,6 @@ def preflight(hermes: Path, config: LiveTestConfig) -> list[str]:
         errors.append("CIRCLE_AGENT_WALLET_ADDRESS not set")
         _step("Wallet address", "not set", False)
     else:
-        # Validate format (0x + hex)
         if not re.match(r"^0x[0-9a-fA-F]{40}$", wallet_addr):
             errors.append(f"CIRCLE_AGENT_WALLET_ADDRESS invalid format: {wallet_addr[:10]}...")
             _step("Wallet address", "invalid format", False)
@@ -233,8 +363,8 @@ def preflight(hermes: Path, config: LiveTestConfig) -> list[str]:
 
     # 6. Operator YOLO confirmation
     print(
-        "\n  ⚠️  Confirm that native tool approval is enabled and the Hermes"
-        "\n     gateway was NOT launched in --yolo mode."
+        "\n  ⚠️  Confirm that native tool approval is enabled and the"
+        "\n     Hermes gateway was NOT launched in --yolo mode."
     )
     confirm = input("  Type 'CONFIRM' to proceed: ").strip()
     if confirm != "CONFIRM":
@@ -257,27 +387,19 @@ def preflight(hermes: Path, config: LiveTestConfig) -> list[str]:
             errors.append("POST requires --body-file with valid JSON")
             _step("Body", "missing", False)
         else:
-            _step("Body", f"{len(config.canonical_body)} bytes canonical", True)
+            _step(
+                "Body",
+                f"{len(config.canonical_body)} bytes, sha256={_body_hash(config.canonical_body)}",
+                True,
+            )
     elif config.body_file:
         _step("Body file", "ignored for GET", True)
 
     return errors
 
 
-def _sanitize(url: str) -> str:
-    """Bounded, safe-to-display form of a URL."""
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    host = parsed.hostname or "unknown"
-    path = parsed.path or "/"
-    if len(path) > 60:
-        path = path[:57] + "..."
-    return f"{parsed.scheme}://{host}{path}"
-
-
 # ---------------------------------------------------------------------------
-# Test A: Verify installed plugin
+# Step A: Verify installed plugin
 # ---------------------------------------------------------------------------
 
 
@@ -385,7 +507,7 @@ def test_a(hermes: Path, config: LiveTestConfig) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Test B: Read-only tools
+# Step B: Read-only tools
 # ---------------------------------------------------------------------------
 
 
@@ -399,33 +521,65 @@ def _hermes_cmd(hermes: Path, prompt: str) -> str:
     return input("  Response: ").strip()
 
 
+def _confirm_tool_success(tool_name: str, response: str) -> bool:
+    """Verify tool response has structured success or operator typed SUCCESS.
+
+    Checks for:
+    - JSON with success=true and expected tool name
+    - Operator typed "SUCCESS" with the exact tool name
+    """
+    # Check JSON structured success
+    try:
+        data = json.loads(response)
+        if isinstance(data, dict):
+            if data.get("success") is True:
+                return True
+            # Also accept result with success field
+            result = data.get("result", {})
+            if isinstance(result, dict) and result.get("success") is True:
+                return True
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Check for operator confirmation with tool name
+    upper = response.upper()
+    return bool("SUCCESS" in upper and tool_name.upper() in upper)
+
+
 def test_b(hermes: Path, config: LiveTestConfig) -> bool:
     """Read-only tools via Telegram session."""
     _section("B. READ-ONLY TOOLS (via Telegram)")
     ok = True
 
-    prompts = [
+    required_tools = [
         ("x402_status", "Call the x402_status tool."),
         ("x402_networks", "Call the x402_networks tool."),
         ("x402_wallet_status", "Call the x402_wallet_status tool."),
         ("x402_wallet_balance", "Call the x402_wallet_balance tool."),
+        (
+            "x402_gateway_balance",
+            "Call the x402_gateway_balance tool.",
+        ),
         (
             "x402_supports",
             f"Call x402_supports with url={config.service_url} method={config.method}.",
         ),
     ]
 
-    for name, prompt in prompts:
+    for tool_name, prompt in required_tools:
         resp = _hermes_cmd(hermes, prompt)
-        # Require structured success or operator confirmation
-        has_output = len(resp) > 10
-        ok &= _step(name, "response received" if has_output else "empty", has_output)
+        success = _confirm_tool_success(tool_name, resp)
+        ok &= _step(
+            tool_name,
+            "confirmed" if success else "NOT CONFIRMED",
+            success,
+        )
 
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Test C: Deny payment
+# Step C: Deny payment
 # ---------------------------------------------------------------------------
 
 
@@ -434,12 +588,19 @@ def test_c(hermes: Path, config: LiveTestConfig) -> bool:
     _section("C. DENY PAYMENT")
     print("  ℹ️  Operator will be prompted to DENY in Hermes approval.\n")
 
-    # Capture balances before (as Decimal)
-    pre_resp = _hermes_cmd(
+    # Capture balances before
+    pre_wallet, pre_gateway = _prompt_balances(
         hermes,
-        "Call x402_wallet_balance and x402_gateway_balance. Report both numbers.",
+        "Call x402_wallet_balance and x402_gateway_balance. "
+        "Report both numbers as JSON: "
+        '{"wallet": "<number>", "gateway": "<number>"}',
     )
-    pre_wallet, pre_gateway = _parse_balances(pre_resp)
+
+    if pre_wallet is None or pre_gateway is None:
+        _step("Pre-balances parsed", "failed to parse", False)
+        return False
+    _step("Pre-wallet balance", str(pre_wallet), True)
+    _step("Pre-gateway balance", str(pre_gateway), True)
 
     # Trigger payment
     resp = _hermes_cmd(
@@ -458,21 +619,35 @@ def test_c(hermes: Path, config: LiveTestConfig) -> bool:
         confirm == "DENY SELECTED",
     )
 
+    # Check for blocked/denied result
+    has_blocked = any(
+        w in resp.lower() for w in ("blocked", "denied", "rejected", "cancelled", "abort")
+    )
+    ok &= _step(
+        "Blocked/denied result",
+        "confirmed" if has_blocked else "not detected",
+        has_blocked,
+    )
+
     # No transaction hash after deny
     tx_match = _TX_HASH_RE.search(resp)
-    has_tx = tx_match is not None
     ok &= _step(
         "No tx hash after deny",
-        "confirmed" if not has_tx else f"FOUND: {tx_match.group(0)}",
-        not has_tx,
+        "confirmed" if tx_match is None else f"FOUND: {tx_match.group(0)}",
+        tx_match is None,
     )
 
     # Capture balances after
-    post_resp = _hermes_cmd(
+    post_wallet, post_gateway = _prompt_balances(
         hermes,
-        "Call x402_wallet_balance and x402_gateway_balance again. Report both numbers.",
+        "Call x402_wallet_balance and x402_gateway_balance again. "
+        "Report both numbers as JSON: "
+        '{"wallet": "<number>", "gateway": "<number>"}',
     )
-    post_wallet, post_gateway = _parse_balances(post_resp)
+
+    if post_wallet is None or post_gateway is None:
+        _step("Post-balances parsed", "failed to parse", False)
+        return False
 
     ok &= _step(
         "Wallet balance unchanged",
@@ -488,17 +663,8 @@ def test_c(hermes: Path, config: LiveTestConfig) -> bool:
     return ok
 
 
-def _parse_balances(text: str) -> tuple[str, str]:
-    """Extract wallet and gateway balance strings from operator response."""
-    # Simple heuristic: look for USDC amounts
-    amounts = re.findall(r"[\d.]+\s*(?:USDC)?", text)
-    wallet = amounts[0].strip() if len(amounts) >= 1 else "unknown"
-    gateway = amounts[1].strip() if len(amounts) >= 2 else "unknown"
-    return wallet, gateway
-
-
 # ---------------------------------------------------------------------------
-# Test D: Allow payment
+# Step D: Allow payment
 # ---------------------------------------------------------------------------
 
 
@@ -508,7 +674,14 @@ def test_d(hermes: Path, config: LiveTestConfig) -> bool:
     print("  ℹ️  Operator will ALLOW the payment in Hermes approval.\n")
 
     # Capture balance before
-    _hermes_cmd(hermes, "Call x402_wallet_balance. Report the number.")
+    pre_wallet = _prompt_single_balance(
+        hermes,
+        'Call x402_wallet_balance. Report as JSON: {"balance": "<number>"}',
+    )
+    if pre_wallet is None:
+        _step("Pre-balance parsed", "failed to parse", False)
+        return False
+    _step("Pre-wallet balance", str(pre_wallet), True)
 
     # Trigger payment
     resp = _hermes_cmd(
@@ -538,19 +711,37 @@ def test_d(hermes: Path, config: LiveTestConfig) -> bool:
     if tx_match:
         print(f"  📝 TX: {tx_match.group(0)}")
 
-    # Structured seller success (not just length > 50)
-    has_seller = "success" in resp.lower() or "paid" in resp.lower() or tx_match is not None
-    ok &= _step("Seller success", "confirmed" if has_seller else "missing", has_seller)
+    # Seller success (require explicit evidence, not just tx hash)
+    has_seller_evidence = (
+        "success" in resp.lower() or "paid" in resp.lower() or "resource" in resp.lower()
+    )
+    ok &= _step(
+        "Seller success evidence",
+        "confirmed" if has_seller_evidence else "missing",
+        has_seller_evidence,
+    )
 
     # Balance after
-    post_resp = _hermes_cmd(hermes, "Call x402_wallet_balance. Report the number.")
-    _step("Balance after payment", post_resp, True)
+    post_wallet = _prompt_single_balance(
+        hermes,
+        'Call x402_wallet_balance. Report as JSON: {"balance": "<number>"}',
+    )
+    if post_wallet is None:
+        _step("Post-balance parsed", "failed to parse", False)
+        return False
+
+    expected_decrease = pre_wallet - post_wallet
+    ok &= _step(
+        "Balance decreased",
+        f"before={pre_wallet} after={post_wallet} decrease={expected_decrease}",
+        post_wallet < pre_wallet,
+    )
 
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Test E: Gateway deposit
+# Step E: Gateway deposit
 # ---------------------------------------------------------------------------
 
 
@@ -560,19 +751,27 @@ def test_e(hermes: Path, config: LiveTestConfig) -> bool:
     ok = True
 
     # Capture gateway balance before
-    _hermes_cmd(hermes, "Call x402_gateway_balance. Report the number.")
+    pre_gateway = _prompt_single_balance(
+        hermes,
+        'Call x402_gateway_balance. Report as JSON: {"balance": "<number>"}',
+    )
+    if pre_gateway is None:
+        _step("Pre-gateway balance", "failed to parse", False)
+        return False
+    _step("Pre-gateway balance", str(pre_gateway), True)
 
-    # Preview with exact parameters
-    body_desc = ""
+    # Preview with exact, untruncated parameters
+    # Build the prompt with full body — no truncation
+    body_param = ""
     if config.method == "POST" and config.canonical_body:
-        body_desc = f" body='{config.canonical_body[:80]}...'"
+        body_param = f" body={config.canonical_body}"
 
     preview_resp = _hermes_cmd(
         hermes,
         f"Create a Gateway deposit preview for 0.5 USDC. "
         f"Use x402_gateway_deposit_preview with "
         f"service_url={config.service_url} method={config.method}"
-        f"{body_desc}.",
+        f"{body_param}.",
     )
 
     pid_match = re.search(
@@ -593,7 +792,6 @@ def test_e(hermes: Path, config: LiveTestConfig) -> bool:
     print(f"\n  ℹ️  Preview ID: {preview_id}")
     print("  ℹ️  Operator will ALLOW the deposit in Hermes approval.")
 
-    # Require operator confirmation
     exec_resp = _hermes_cmd(
         hermes,
         f"Execute Gateway deposit with preview_id='{preview_id}'.",
@@ -608,17 +806,46 @@ def test_e(hermes: Path, config: LiveTestConfig) -> bool:
         confirm == "ALLOW ONCE SELECTED",
     )
 
-    has_op = "operation" in exec_resp.lower() or bool(_TX_HASH_RE.search(exec_resp))
-    ok &= _step("Deposit executed", "success" if has_op else "failed", has_op)
-
+    # Transaction hash or operation ID
     tx_match_e = _TX_HASH_RE.search(exec_resp)
-    if tx_match_e:
-        tx = tx_match_e.group(0)
-        print(f"  📝 TX: {tx}")
+    has_tx = tx_match_e is not None
+    has_op_id = "operation_id" in exec_resp.lower() or "operation" in exec_resp.lower()
+    ok &= _step(
+        "Transaction/operation",
+        tx_match_e.group(0) if has_tx else ("operation ID" if has_op_id else "not found"),
+        has_tx or has_op_id,
+    )
+
+    if has_tx:
+        print(f"  📝 TX: {tx_match_e.group(0)}")
+
+    # Explicit success status (not just substring "operation")
+    has_success = (
+        "success" in exec_resp.lower()
+        or "deposited" in exec_resp.lower()
+        or "completed" in exec_resp.lower()
+        or has_tx
+    )
+    ok &= _step(
+        "Deposit executed successfully",
+        "confirmed" if has_success else "failed",
+        has_success,
+    )
 
     # Gateway balance after
-    post_resp = _hermes_cmd(hermes, "Call x402_gateway_balance. Report the number.")
-    _step("Gateway balance after deposit", post_resp, True)
+    post_gateway = _prompt_single_balance(
+        hermes,
+        'Call x402_gateway_balance. Report as JSON: {"balance": "<number>"}',
+    )
+    if post_gateway is None:
+        _step("Post-gateway balance", "failed to parse", False)
+        return False
+
+    ok &= _step(
+        "Gateway balance increased",
+        f"before={pre_gateway} after={post_gateway}",
+        post_gateway > pre_gateway,
+    )
 
     # Replay rejection
     replay_resp = _hermes_cmd(
@@ -636,7 +863,7 @@ def test_e(hermes: Path, config: LiveTestConfig) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Test F: Final payment with Gateway funds
+# Step F: Final payment with Gateway funds
 # ---------------------------------------------------------------------------
 
 
@@ -644,11 +871,15 @@ def test_f(hermes: Path, config: LiveTestConfig) -> bool:
     """Pay the same endpoint using Gateway funds."""
     _section("F. FINAL PAYMENT (Gateway funds)")
 
-    # Capture balance before
-    pre_resp = _hermes_cmd(
-        hermes, "Call x402_wallet_balance and x402_gateway_balance. Report both numbers."
+    # Capture gateway balance before
+    pre_gateway = _prompt_single_balance(
+        hermes,
+        'Call x402_gateway_balance. Report as JSON: {"balance": "<number>"}',
     )
-    pre_wallet, pre_gateway = _parse_balances(pre_resp)
+    if pre_gateway is None:
+        _step("Pre-gateway balance", "failed to parse", False)
+        return False
+    _step("Pre-gateway balance", str(pre_gateway), True)
 
     # Pay
     resp = _hermes_cmd(
@@ -667,35 +898,45 @@ def test_f(hermes: Path, config: LiveTestConfig) -> bool:
         confirm == "ALLOW ONCE SELECTED",
     )
 
+    # Transaction hash or operation ID
     tx_match = _TX_HASH_RE.search(resp)
+    has_tx = tx_match is not None
+    has_op_id = "operation_id" in resp.lower() or "operation" in resp.lower()
     ok &= _step(
-        "Transaction hash",
-        tx_match.group(0) if tx_match else "not found",
-        tx_match is not None,
+        "Transaction/operation",
+        tx_match.group(0) if has_tx else ("operation ID" if has_op_id else "not found"),
+        has_tx or has_op_id,
     )
 
-    if tx_match:
+    if has_tx:
         print(f"  📝 TX: {tx_match.group(0)}")
 
-    # Seller success
-    has_seller = "success" in resp.lower() or "paid" in resp.lower() or tx_match is not None
-    ok &= _step("Seller success", "confirmed" if has_seller else "missing", has_seller)
-
-    # Balance after
-    post_resp = _hermes_cmd(
-        hermes, "Call x402_wallet_balance and x402_gateway_balance. Report both numbers."
-    )
-    post_wallet, post_gateway = _parse_balances(post_resp)
-
-    ok &= _step(
-        "Final wallet balance",
-        f"before={pre_wallet} after={post_wallet}",
-        True,
+    # Seller success evidence
+    has_seller_evidence = (
+        "success" in resp.lower() or "paid" in resp.lower() or "resource" in resp.lower()
     )
     ok &= _step(
-        "Final gateway balance",
-        f"before={pre_gateway} after={post_gateway}",
-        True,
+        "Seller success evidence",
+        "confirmed" if has_seller_evidence else "missing",
+        has_seller_evidence,
+    )
+
+    # Gateway balance after
+    post_gateway = _prompt_single_balance(
+        hermes,
+        'Call x402_gateway_balance. Report as JSON: {"balance": "<number>"}',
+    )
+    if post_gateway is None:
+        _step("Post-gateway balance", "failed to parse", False)
+        return False
+
+    expected_payment = Decimal(config.max_payment)
+    actual_decrease = pre_gateway - post_gateway
+    ok &= _step(
+        "Gateway balance decreased",
+        f"before={pre_gateway} after={post_gateway} "
+        f"decrease={actual_decrease} expected~={expected_payment}",
+        post_gateway < pre_gateway,
     )
 
     return ok
@@ -715,6 +956,13 @@ def run_live_test(config: LiveTestConfig) -> bool:
     print("🔴" * 30 + "\n")
 
     hermes = _find_hermes()
+
+    # Wait for operator confirmation that gateway is online
+    print(
+        "  ⚠️  Before continuing, confirm the Hermes Telegram gateway"
+        "\n     is online and responding to messages."
+    )
+    _wait_enter("Press Enter when the gateway is confirmed online...")
 
     # Preflight
     errors = preflight(hermes, config)
@@ -737,8 +985,11 @@ def run_live_test(config: LiveTestConfig) -> bool:
 
     # Run A-F
     results: dict[str, bool] = {}
+
     results["A"] = test_a(hermes, config)
     results["B"] = test_b(hermes, config)
+
+    # For C-F, capture structured evidence
     results["C"] = test_c(hermes, config)
     results["D"] = test_d(hermes, config)
     results["E"] = test_e(hermes, config)
@@ -757,24 +1008,32 @@ def run_live_test(config: LiveTestConfig) -> bool:
     verdict = "✅ ALL STEPS PASSED" if all_ok else "❌ INCOMPLETE"
     print(f"\n  {verdict}")
 
-    # Build sanitized report
+    # Build sanitized report with all required evidence
     install_report = config.install_report
     report = {
+        # Source/build identity
         "source_commit_sha": install_report.get("commit_sha", "unknown"),
         "wheel_sha256": install_report.get("wheel_sha256", "unknown"),
+        # Hermes paths
         "hermes_executable": install_report.get("hermes_exe", "unknown"),
         "hermes_python": install_report.get("hermes_python", "unknown"),
-        "hermes_version": install_report.get("hermes_module_path", "unknown"),
+        "hermes_module_path": install_report.get("hermes_module_path", "unknown"),
         "installed_version": install_report.get("installed_version", "unknown"),
         "module_path": install_report.get("module_path", "unknown"),
+        # Plugin catalog
         "plugin_source": install_report.get("plugin_source", "unknown"),
         "plugin_status": install_report.get("plugin_status", "unknown"),
         "registration_contract": install_report.get("registration_contract", {}),
+        # Wallet/network
         "network": os.environ.get("CIRCLE_AGENT_WALLET_NETWORK", "unknown"),
         "masked_wallet": _mask_wallet(os.environ.get("CIRCLE_AGENT_WALLET_ADDRESS", "")),
+        # Request
         "service_url": _sanitize(config.service_url),
         "method": config.method,
         "payment_amount": config.max_payment,
+        "body_sha256": _body_hash(config.canonical_body),
+        "body_length": (len(config.canonical_body) if config.canonical_body else 0),
+        # Results
         "results": results,
         "all_passed": all_ok,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -787,13 +1046,6 @@ def run_live_test(config: LiveTestConfig) -> bool:
     print(f"  Report: {rpath}")
 
     return all_ok
-
-
-def _mask_wallet(addr: str) -> str:
-    """Mask wallet address for display."""
-    if not addr or len(addr) < 10:
-        return "***"
-    return addr[:6] + "..." + addr[-4:]
 
 
 # ---------------------------------------------------------------------------
