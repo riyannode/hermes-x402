@@ -227,7 +227,7 @@ All configuration is via environment variables. No config files required.
 |----------|---------|-------------|
 | `X402_DISCOVERY_PROVIDERS` | `circle_marketplace` | Comma-separated discovery providers |
 | `X402_DISCOVERY_HOST_ALLOWLIST` | `""` | Comma-separated hostnames for discovery results |
-| `X402_NETWORK_PREFERENCE` | `base` | Comma-separated preferred network order |
+| `X402_NETWORK_PREFERENCE` | `arctestnet` | Comma-separated preferred network order |
 
 ### Buyer Safeguards
 
