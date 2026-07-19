@@ -45,29 +45,39 @@ def _mask_email(email: str) -> str:
 
 
 def _network_display(key: str) -> str:
-    """Convert network key to display name."""
-    mapping = {
+    """Convert network key to display name using the shared registry."""
+    if not key or key in ("none", "unknown", ""):
+        return "Not configured"
+    try:
+        from hermes_x402.networks import get_network, list_networks
+
+        # Try exact match first
+        try:
+            cfg = get_network(key)
+            return cfg.display_name
+        except (ValueError, KeyError):
+            pass
+
+        # Try aliases and display names
+        for n in list_networks():
+            if key.lower() in (a.lower() for a in n.aliases):
+                return n.display_name
+            if key.lower() == n.key.lower():
+                return n.display_name
+            if key.lower() == n.display_name.lower():
+                return n.display_name
+            if key.upper() == n.caip2.upper():
+                return n.display_name
+    except ImportError:
+        pass
+
+    # Fallback for known aliases not in registry
+    fallback = {
         "ARC-TESTNET": "Arc Testnet",
         "arcTestnet": "Arc Testnet",
-        "base": "Base",
-        "ethereum": "Ethereum",
-        "polygon": "Polygon",
-        "arbitrum": "Arbitrum",
-        "optimism": "Optimism",
-        "avalanche": "Avalanche",
-        "sonic": "Sonic",
-        "unichain": "Unichain",
-        "worldChain": "World Chain",
-        "hyperevm": "HyperEVM",
-        "sei": "Sei",
-        "baseSepolia": "Base Sepolia",
-        "ethereumSepolia": "Ethereum Sepolia",
-        "polygonAmoy": "Polygon Amoy",
-        "arbitrumSepolia": "Arbitrum Sepolia",
-        "optimismSepolia": "Optimism Sepolia",
-        "avalancheFuji": "Avalanche Fuji",
+        "eip155:5042002": "Arc Testnet",
     }
-    return mapping.get(key, key)
+    return fallback.get(key, key)
 
 
 def _truncate(text: str) -> str:
@@ -88,17 +98,15 @@ def format_status(raw: str) -> str:
     if data is None:
         return "Status unavailable — tool returned invalid response."
 
-    result = data if "success" not in data else data
-
-    role = result.get("role", "unconfigured")
-    backend = result.get("backend", "none")
-    network = result.get("network", "none")
-    wallet = result.get("wallet_address", "")
-    version = result.get("version", "?")
-    max_usdc = result.get("max_usdc_per_payment", "")
-    policy = result.get("host_allowlist", "")
-    configured = result.get("configured", False)
-    available = result.get("available", False)
+    role = data.get("role", "unconfigured")
+    backend = data.get("backend", "none")
+    network = data.get("network", "none")
+    wallet = data.get("wallet_address") or data.get("wallet") or ""
+    version = data.get("version", "?")
+    max_usdc = data.get("max_usdc_per_payment", "")
+    policy = data.get("host_allowlist", "")
+    configured = data.get("configured", False)
+    available = data.get("available", False)
 
     status = "Ready" if available and configured else "Not ready"
 
@@ -135,7 +143,7 @@ def format_wallet_status(raw: str) -> str:
     if data is None:
         return "Wallet status unavailable — tool returned invalid response."
 
-    wallet = data.get("wallet_address", "")
+    wallet = data.get("wallet_address") or data.get("wallet") or ""
     network = data.get("network", "")
     data.get("backend", "")
 
@@ -167,27 +175,41 @@ def format_wallet_status(raw: str) -> str:
 
     lines.append(f"Terms: {'Accepted' if terms else 'Required'}")
 
-    # Balance
-    on_chain = data.get("on_chain_balance", "")
-    gateway = data.get("gateway_balance", "")
+    # Balance — support aliases
+    on_chain = data.get("on_chain_usdc_balance") or data.get("on_chain_balance") or ""
+    gateway_bal = data.get("gateway_usdc_balance") or data.get("gateway_balance") or ""
     if on_chain:
         lines.append(f"On-chain balance: {on_chain} USDC")
-    if gateway:
-        lines.append(f"Gateway balance: {gateway} USDC")
+    if gateway_bal:
+        lines.append(f"Gateway balance: {gateway_bal} USDC")
 
-    # Readiness
-    buyer_ready = data.get("buyer_ready", False)
-    gateway_ready = data.get("gateway_funding_ready", False)
+    # Readiness — support aliases
+    buyer_ready = data.get("buyer_runtime_ready") or data.get("buyer_ready") or False
+    gateway_ready = data.get("gateway_funding_ready") or data.get("ready_for_payment") or False
     lines.append(f"Buyer runtime: {'Ready' if buyer_ready else 'Blocked'}")
     lines.append(f"Gateway funding: {'Ready' if gateway_ready else 'Blocked'}")
 
-    # Next action
-    next_action = data.get("next_action", "")
+    # Next action — support alias
+    next_action = data.get("next_tool") or data.get("next_action") or ""
     if next_action:
         lines.append(f"Next action: {next_action}")
 
-    # Blockers
+    # Blockers — normalize dict form to list
     blockers = data.get("blockers", [])
+    if isinstance(blockers, dict):
+        # Normalize: {"buyer": [...], "gateway": [...]} → flat list
+        flat: list[str] = []
+        for category, items in blockers.items():
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        flat.append(f"{category}: {item.get('message', str(item))}")
+                    else:
+                        flat.append(f"{category}: {item}")
+            elif items:
+                flat.append(f"{category}: {items}")
+        blockers = flat
+
     if blockers:
         lines.append("")
         lines.append("Blockers:")
@@ -204,7 +226,7 @@ def format_wallet_balance(raw: str) -> str:
     if data is None:
         return "Balance unavailable — tool returned invalid response."
 
-    wallet = data.get("wallet_address", "")
+    wallet = data.get("wallet_address") or data.get("wallet") or ""
     network = data.get("network", "")
 
     lines = ["**Wallet Balance**", ""]
@@ -251,7 +273,7 @@ def format_gateway_balance(raw: str) -> str:
     if data is None:
         return "Gateway balance unavailable — tool returned invalid response."
 
-    wallet = data.get("wallet_address", "")
+    wallet = data.get("wallet_address") or data.get("wallet") or ""
     network = data.get("network", "")
     total = data.get("total_usdc") or data.get("balance") or "0"
 
@@ -260,11 +282,47 @@ def format_gateway_balance(raw: str) -> str:
     lines.append(f"Network: {_network_display(network)}")
     lines.append(f"Available: {total} USDC")
 
-    # Payment readiness
-    ready = data.get("payment_ready", data.get("success", False))
+    # Payment readiness — support aliases
+    ready = data.get("ready_for_payment") or data.get("payment_ready") or data.get("success", False)
     lines.append(f"Payment ready: {'Yes' if ready else 'No'}")
 
     return _truncate("\n".join(lines))
+
+
+def _match_network(n: dict, filter_key: str, active_network: str) -> bool:
+    """Check if a network matches the given filter."""
+    key = n.get("key", "")
+    display = n.get("display_name", key)
+
+    if filter_key == "active":
+        # Match active network by key, display, or alias
+        if key == active_network or display == active_network:
+            return True
+        try:
+            from hermes_x402.networks import get_network, list_networks
+
+            try:
+                cfg = get_network(active_network)
+                if key == cfg.key:
+                    return True
+            except (ValueError, KeyError):
+                pass
+            for n2 in list_networks():
+                if active_network.lower() in (a.lower() for a in n2.aliases) and key == n2.key:
+                    return True
+                if active_network.upper() == n2.caip2.upper() and key == n2.key:
+                    return True
+        except ImportError:
+            pass
+        return False
+
+    if filter_key == "buyer":
+        return n.get("buyer_cli_supported", False) or n.get("buyer_backend_supported", False)
+
+    if filter_key == "gateway":
+        return n.get("gateway_supported", False)
+
+    return True  # "all" or default
 
 
 def format_networks(raw: str, filter_key: str = "") -> str:
@@ -277,60 +335,62 @@ def format_networks(raw: str, filter_key: str = "") -> str:
     if not networks:
         return "No networks available."
 
-    # Filter by active/configured
     active_network = data.get("active_network", "")
-    data.get("role", "")
-    data.get("backend", "")
 
-    # Determine which networks to show
-    show_mainnets = True
-    show_testnets = True
-    show_active_only = False
+    # Filter networks
+    filtered: list[dict] = []
+    for n in networks:
+        if not isinstance(n, dict):
+            continue
+        if _match_network(n, filter_key, active_network):
+            filtered.append(n)
 
+    if not filtered:
+        return f"No networks matching filter: {filter_key or 'default'}"
+
+    # Active-only filter
     if filter_key == "active":
-        show_active_only = True
-    elif filter_key == "buyer":
-        # Show only networks supported by the buyer's backend
-        pass  # already filtered by tool
-    elif filter_key == "gateway":
-        pass  # show all with gateway support
+        if filtered:
+            n = filtered[0]
+            display = n.get("display_name", active_network)
+            caip2 = n.get("caip2", "")
+            lines = [
+                "**Active Network**",
+                "",
+                f"Name: {display}",
+            ]
+            if caip2:
+                lines.append(f"CAIP-2: {caip2}")
+            return _truncate("\n".join(lines))
+        return "No active network configured."
 
     # Group by environment
     mainnets: list[dict] = []
     testnets: list[dict] = []
     active_net: dict | None = None
 
-    for n in networks:
-        if not isinstance(n, dict):
-            continue
+    for n in filtered:
         env = n.get("environment", "")
-        key = n.get("key", "")
-        display = n.get("display_name", key)
-
-        if key == active_network or display == active_network:
+        # Use _match_network to identify the active network with alias resolution
+        if _match_network(n, "active", active_network):
             active_net = n
-
-        if env == "mainnet" and show_mainnets:
+        if env == "mainnet":
             mainnets.append(n)
-        elif env == "testnet" and show_testnets:
+        elif env == "testnet":
             testnets.append(n)
 
-    lines = ["**Networks**", ""]
+    filter_label = {
+        "buyer": " (buyer-supported)",
+        "gateway": " (gateway-supported)",
+        "all": " (all)",
+    }.get(filter_key, "")
 
-    if show_active_only and active_net:
-        display = active_net.get("display_name", active_network)
-        caip2 = active_net.get("caip2", "")
-        lines.append(f"Active: {display}")
-        if caip2:
-            lines.append(f"CAIP-2: {caip2}")
-        return _truncate("\n".join(lines))
+    lines = [f"**Networks{filter_label}**", ""]
 
-    # Active
-    if active_net:
+    if active_net and filter_key != "active":
         display = active_net.get("display_name", active_network)
         lines.append(f"Active: {display}")
 
-    # Mainnets
     if mainnets:
         lines.append("")
         lines.append("Mainnet:")
@@ -338,7 +398,6 @@ def format_networks(raw: str, filter_key: str = "") -> str:
             display = n.get("display_name", n.get("key", "?"))
             lines.append(f"  • {display}")
 
-    # Testnets
     if testnets:
         lines.append("")
         lines.append("Testnet:")

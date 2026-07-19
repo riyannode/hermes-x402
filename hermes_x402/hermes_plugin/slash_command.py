@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -64,6 +65,29 @@ _preview_store: dict[str, dict[str, Any]] = {}
 
 # Telegram output budget
 _MAX_OUTPUT = 3500
+
+# Concurrent command guard for expensive CLI commands
+_in_flight_lock = threading.Lock()
+_in_flight_command: str | None = None
+
+
+def _acquire_command_guard(command: str) -> str | None:
+    """Try to acquire the in-flight guard. Returns error message or None."""
+    global _in_flight_command
+    with _in_flight_lock:
+        if _in_flight_command is not None:
+            return (
+                f"An x402 command is already running ({_in_flight_command}). Wait for it to finish."
+            )
+        _in_flight_command = command
+        return None
+
+
+def _release_command_guard() -> None:
+    """Release the in-flight guard."""
+    global _in_flight_command
+    with _in_flight_lock:
+        _in_flight_command = None
 
 
 def _mask_wallet(addr: str) -> str:
@@ -154,12 +178,18 @@ HELP_TEXT = """\
 **Discovery**
   /x402 networks — Supported networks
   /x402 networks active — Active network only
+  /x402 networks buyer — Buyer-supported networks
+  /x402 networks gateway — Gateway-supported networks
   /x402 supports <url> — Check x402 support
 
 **Configuration**
   /x402 configure — Show config state
   /x402 configure preview ... — Preview config
-  /x402 configure apply <id> — Apply config"""
+  /x402 configure apply <id> — Apply config
+
+**Financial operations** (agent tools, not slash commands):
+Payments, deposits, and login completion are requested in chat and
+executed through protected agent tools with approval."""
 
 
 def handle_x402_command(raw_args: str, ctx: Any) -> str:
@@ -192,26 +222,44 @@ def handle_x402_command(raw_args: str, ctx: Any) -> str:
         raw = ctx.dispatch_tool("x402_status", {})
         return format_status(raw)
 
-    # --- wallet ---
+    # --- wallet (with concurrent guard) ---
     if subcommand == "wallet":
         if len(parts) > 1:
             return "Usage: /x402 wallet"
-        raw = ctx.dispatch_tool("x402_wallet_status", {})
-        return format_wallet_status(raw)
+        guard_err = _acquire_command_guard("wallet")
+        if guard_err:
+            return guard_err
+        try:
+            raw = ctx.dispatch_tool("x402_wallet_status", {})
+            return format_wallet_status(raw)
+        finally:
+            _release_command_guard()
 
-    # --- balance ---
+    # --- balance (with concurrent guard) ---
     if subcommand == "balance":
         if len(parts) > 1:
             return "Usage: /x402 balance"
-        raw = ctx.dispatch_tool("x402_wallet_balance", {})
-        return format_wallet_balance(raw)
+        guard_err = _acquire_command_guard("balance")
+        if guard_err:
+            return guard_err
+        try:
+            raw = ctx.dispatch_tool("x402_wallet_balance", {})
+            return format_wallet_balance(raw)
+        finally:
+            _release_command_guard()
 
-    # --- gateway ---
+    # --- gateway (with concurrent guard) ---
     if subcommand == "gateway":
         if len(parts) > 1:
             return "Usage: /x402 gateway"
-        raw = ctx.dispatch_tool("x402_gateway_balance", {})
-        return format_gateway_balance(raw)
+        guard_err = _acquire_command_guard("gateway")
+        if guard_err:
+            return guard_err
+        try:
+            raw = ctx.dispatch_tool("x402_gateway_balance", {})
+            return format_gateway_balance(raw)
+        finally:
+            _release_command_guard()
 
     # --- networks ---
     if subcommand == "networks":
