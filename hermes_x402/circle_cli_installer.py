@@ -8,11 +8,14 @@ funds wallets, pays, or deposits. Never prints credentials.
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_CLI_VERSION = "0.0.6"
 _INSTALL_TIMEOUT = 120  # seconds for bun add -g
@@ -87,35 +90,57 @@ def _check_bun_available() -> Path | None:
 def _install_cli_via_bun(bun: Path) -> tuple[Path | None, str | None]:
     """Install @circle-fin/cli@0.0.6 via bun global.
 
-    Returns (executable_path, error_message).
+    Returns (executable_path, error_code).
+    Detailed stderr goes to debug logging only.
     """
+    bun_path_str = str(bun)
+
+    # Log what we're about to do (safe, no secrets)
+    logger.info(
+        "circle_cli_install_operation: package=%s version=%s bun_path=%s",
+        "@circle-fin/cli",
+        SUPPORTED_CLI_VERSION,
+        bun_path_str,
+    )
+
     try:
         result = subprocess.run(
-            [str(bun), "add", "-g", f"@circle-fin/cli@{SUPPORTED_CLI_VERSION}"],
+            [bun_path_str, "add", "-g", f"@circle-fin/cli@{SUPPORTED_CLI_VERSION}"],
             capture_output=True,
             text=True,
             timeout=_INSTALL_TIMEOUT,
             shell=False,
         )
         if result.returncode != 0:
-            stderr = result.stderr[:500] if result.stderr else ""
-            return None, f"bun add failed (rc={result.returncode}): {stderr}"
+            # Log detailed stderr at debug level only — never expose to normal user output
+            if result.stderr:
+                logger.debug(
+                    "circle_cli_install_stderr (rc=%d): %s",
+                    result.returncode,
+                    result.stderr[:500],
+                )
+            return None, "circle_cli_install_failed"
     except subprocess.TimeoutExpired:
-        return None, f"bun add timed out after {_INSTALL_TIMEOUT}s"
+        logger.debug("circle_cli_install timed out after %ds", _INSTALL_TIMEOUT)
+        return None, "circle_cli_install_timeout"
     except OSError as exc:
-        return None, f"bun add failed: {exc}"
+        logger.debug("circle_cli_install OSError: %s", exc)
+        return None, "circle_cli_install_failed"
 
     # Resolve the installed binary
     circle_path = _find_existing_cli()
     if circle_path is None:
-        return None, "circle binary not found after bun install"
+        return None, "circle_cli_not_found_after_install"
 
     # Verify version
     version = _query_cli_version(circle_path)
     if version != SUPPORTED_CLI_VERSION:
-        return None, (
-            f"Installed circle version {version} does not match expected {SUPPORTED_CLI_VERSION}"
+        logger.debug(
+            "circle_cli_version_mismatch: found=%s expected=%s",
+            version,
+            SUPPORTED_CLI_VERSION,
         )
+        return None, "circle_cli_version_mismatch"
 
     return circle_path, None
 
@@ -144,37 +169,34 @@ def run_circle_cli_bootstrap(
         if version == SUPPORTED_CLI_VERSION:
             report.installed = True
             report.already_present = True
-            report.package_manager = "bun"  # Circle CLI is always installed via npm/bun
+            report.package_manager = "bun"
             return report
 
         if version is not None:
-            # Version mismatch — do not replace
-            report.errors.append(
-                f"circle_cli_version_mismatch: found v{version}, "
-                f"expected v{SUPPORTED_CLI_VERSION}. "
-                f"Manual remediation: bun add -g @circle-fin/cli@{SUPPORTED_CLI_VERSION}"
-            )
+            report.errors.append("circle_cli_version_mismatch")
             return report
 
-        # Version check failed but binary exists
         report.errors.append("circle_cli_version_check_failed")
         return report
 
     # Step 2: CLI not found
     if not with_circle_cli:
-        # Not requested — this is fine, just report absent
         return report
 
     # Step 3: --with-circle-cli requested, CLI absent
     bun = _check_bun_available()
     if bun is None:
-        report.errors.append(
-            "bun_not_found: Bun is required to install Circle CLI. "
-            "Install Bun first: https://bun.sh/docs/installation"
-        )
+        report.errors.append("bun_not_found")
         return report
 
-    # Step 4: Install via bun
+    # Step 4: Install via bun — log operation before starting
+    logger.info(
+        "circle_cli_bootstrap: installing %s@%s via bun at %s",
+        "@circle-fin/cli",
+        SUPPORTED_CLI_VERSION,
+        str(bun),
+    )
+
     circle_path, error = _install_cli_via_bun(bun)
     if error:
         report.errors.append(error)

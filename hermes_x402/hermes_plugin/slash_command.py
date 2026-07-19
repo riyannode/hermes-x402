@@ -14,13 +14,16 @@ Supported syntax:
   /x402 supports <https-url>
   /x402 configure
   /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>
-  /x402 configure apply buyer cli <wallet> ARC-TESTNET <max_usdc>
+  /x402 configure apply <preview_id>
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -30,7 +33,7 @@ from hermes_x402.hermes_plugin.output import safe_wallet_address
 # Wallet address pattern: 0x + 40 hex chars
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
-# Managed keys written by configure apply
+# Managed keys written by configure apply (exactly 10, no CIRCLE_CLI_EXECUTABLE)
 _MANAGED_KEYS_ORDER = [
     "X402_ROLE",
     "X402_BUYER_BACKEND",
@@ -43,6 +46,13 @@ _MANAGED_KEYS_ORDER = [
     "X402_ALLOW_HTTP",
     "X402_ALLOW_CHAT_OTP",
 ]
+
+# Preview TTL: 10 minutes
+_PREVIEW_TTL_SECONDS = 600
+
+# Process-local preview store: preview_id -> preview data
+_preview_store: dict[str, dict[str, Any]] = {}
+
 
 _HELP_TEXT = """\
 /x402 — x402 plugin commands
@@ -57,7 +67,7 @@ Usage:
   /x402 supports <url>                    Check if URL supports x402
   /x402 configure                         Show configuration state
   /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>
-  /x402 configure apply buyer cli <wallet> ARC-TESTNET <max_usdc>
+  /x402 configure apply <preview_id>
 
 Read-only commands dispatch to existing tools.
 Configure is safe — preview never writes, apply writes only managed keys."""
@@ -119,6 +129,17 @@ def _check_cli_available() -> dict[str, Any]:
     }
 
 
+def _fingerprint_config(managed_keys: dict[str, str], env_path: Path) -> str:
+    """Compute a fingerprint of the proposed config + current env file state."""
+    payload = {
+        "keys": dict(sorted(managed_keys.items())),
+        "env_exists": env_path.exists(),
+    }
+    if env_path.exists():
+        payload["env_stat"] = os.stat(str(env_path)).st_mtime
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
 def handle_x402_command(raw_args: str, ctx: Any) -> str:
     """Handle /x402 slash command.
 
@@ -139,31 +160,42 @@ def handle_x402_command(raw_args: str, ctx: Any) -> str:
 
     # --- status ---
     if subcommand == "status":
+        if len(parts) > 1:
+            return "Usage: /x402 status"
         return ctx.dispatch_tool("x402_status", {})
 
     # --- wallet ---
     if subcommand == "wallet":
+        if len(parts) > 1:
+            return "Usage: /x402 wallet"
         return ctx.dispatch_tool("x402_wallet_status", {})
 
     # --- balance ---
     if subcommand == "balance":
+        if len(parts) > 1:
+            return "Usage: /x402 balance"
         return ctx.dispatch_tool("x402_wallet_balance", {})
 
     # --- gateway ---
     if subcommand == "gateway":
+        if len(parts) > 1:
+            return "Usage: /x402 gateway"
         return ctx.dispatch_tool("x402_gateway_balance", {})
 
     # --- networks ---
     if subcommand == "networks":
+        if len(parts) > 1:
+            return "Usage: /x402 networks"
         return ctx.dispatch_tool("x402_networks", {})
 
     # --- supports ---
     if subcommand == "supports":
-        if len(parts) < 2:
+        if len(parts) != 2:
             return "Usage: /x402 supports <https-url>"
         url = parts[1]
         if not url.startswith("https://"):
             return "Error: supports requires an HTTPS URL."
+        # Delegate validation to the existing x402_supports tool
         return ctx.dispatch_tool("x402_supports", {"url": url})
 
     # --- configure ---
@@ -239,7 +271,7 @@ def _handle_configure_show() -> str:
     lines.append("")
     lines.append("Usage:")
     lines.append("  /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>")
-    lines.append("  /x402 configure apply buyer cli <wallet> ARC-TESTNET <max_usdc>")
+    lines.append("  /x402 configure apply <preview_id>")
 
     return "\n".join(lines)
 
@@ -247,15 +279,14 @@ def _handle_configure_show() -> str:
 def _validate_configure_args(
     parts: list[str],
 ) -> tuple[dict[str, str] | None, str | None]:
-    """Validate configure preview/apply arguments.
+    """Validate configure preview arguments.
 
     Expected: buyer cli <wallet> ARC-TESTNET <max_usdc>
     Returns (validated_params, error_message).
+    Rejects extra arguments.
     """
-    if len(parts) < 5:
-        return None, (
-            "Usage: /x402 configure <preview|apply> buyer cli <wallet> ARC-TESTNET <max_usdc>"
-        )
+    if len(parts) != 5:
+        return None, ("Usage: /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>")
 
     role = parts[0].lower()
     backend = parts[1].lower()
@@ -277,9 +308,13 @@ def _validate_configure_args(
             f"Invalid wallet address: {wallet!r}. Must be 0x + 40 hexadecimal characters."
         )
 
-    # Validate network
-    if network != "ARC-TESTNET":
-        return None, f"Invalid network: {network!r}. Only 'ARC-TESTNET' is supported."
+    # Validate network through shared registry
+    try:
+        from hermes_x402.networks import get_network
+
+        get_network(network)
+    except (ValueError, KeyError, Exception):
+        return None, f"Invalid network: {network!r}. Not found in network registry."
 
     # Validate max_usdc
     try:
@@ -299,13 +334,48 @@ def _validate_configure_args(
     }, None
 
 
+def _build_managed_keys(params: dict[str, str]) -> dict[str, str]:
+    """Build the exact 10 managed keys from validated params."""
+    return {
+        "X402_ROLE": params["role"],
+        "X402_BUYER_BACKEND": params["backend"],
+        "CIRCLE_AGENT_WALLET_ADDRESS": params["wallet"],
+        "CIRCLE_AGENT_WALLET_NETWORK": params["network"],
+        "X402_MAX_USDC_PER_PAYMENT": params["max_usdc"],
+        "X402_NETWORK_POLICY": "public",
+        "X402_HOST_ALLOWLIST": "",
+        "X402_REQUIRE_GATEWAY_BATCHING": "true",
+        "X402_ALLOW_HTTP": "false",
+        "X402_ALLOW_CHAT_OTP": "false",
+    }
+
+
 def _handle_configure_preview(parts: list[str]) -> str:
-    """Show proposed configuration (read-only, never writes)."""
+    """Show proposed configuration and return a preview_id (read-only, never writes)."""
     params, error = _validate_configure_args(parts)
     if error:
         return f"Error: {error}"
 
     assert params is not None
+
+    env_path = _resolve_hermes_home() / ".env"
+    managed_keys = _build_managed_keys(params)
+
+    # Create preview_id from hash of managed keys + current env state
+    config_hash = hashlib.sha256(json.dumps(managed_keys, sort_keys=True).encode()).hexdigest()[:16]
+    fingerprint = _fingerprint_config(managed_keys, env_path)
+    preview_id = f"preview-{config_hash}-{fingerprint[:8]}"
+
+    # Store preview data (process-local, not restart-safe)
+    _preview_store[preview_id] = {
+        "managed_keys": managed_keys,
+        "env_path": str(env_path),
+        "fingerprint": fingerprint,
+        "created_at": time.time(),
+        "expires_at": time.time() + _PREVIEW_TTL_SECONDS,
+        "consumed": False,
+    }
+
     lines = [
         "=== Configuration Preview ===",
         "",
@@ -321,55 +391,73 @@ def _handle_configure_preview(parts: list[str]) -> str:
         "  X402_ALLOW_HTTP=false",
         "  X402_ALLOW_CHAT_OTP=false",
         "",
-        "No changes written. Use '/x402 configure apply ...' to apply.",
+        f"preview_id: {preview_id}",
+        f"expires_in: {_PREVIEW_TTL_SECONDS}s",
+        "process_local: preview is not restart-safe",
+        "",
+        "No changes written. Use '/x402 configure apply <preview_id>' to apply.",
     ]
     return "\n".join(lines)
 
 
 def _handle_configure_apply(parts: list[str]) -> str:
-    """Apply configuration — writes managed keys to .env."""
-    params, error = _validate_configure_args(parts)
-    if error:
-        return f"Error: {error}"
+    """Apply configuration — accepts only a preview_id."""
+    if len(parts) != 1:
+        return "Usage: /x402 configure apply <preview_id>"
 
-    assert params is not None
+    preview_id = parts[0].strip()
+
+    # Look up preview
+    preview = _preview_store.get(preview_id)
+    if preview is None:
+        return f"Error: Unknown preview_id: {preview_id!r}. Run '/x402 configure preview' first."
+
+    # Check expiry
+    if time.time() > preview["expires_at"]:
+        del _preview_store[preview_id]
+        return f"Error: Preview {preview_id!r} has expired. Run '/x402 configure preview' again."
+
+    # Check consumed
+    if preview["consumed"]:
+        return (
+            f"Error: Preview {preview_id!r} has already been consumed. "
+            "Run '/x402 configure preview' again."
+        )
+
+    env_path = Path(preview["env_path"])
+
+    # Verify target path is unchanged
+    current_env_path = _resolve_hermes_home() / ".env"
+    if str(current_env_path) != str(env_path):
+        return "Error: Environment path has changed since preview was created."
+
+    # Verify current config fingerprint is unchanged
+    current_fingerprint = _fingerprint_config(preview["managed_keys"], env_path)
+    if current_fingerprint != preview["fingerprint"]:
+        return (
+            "Error: Configuration has changed since preview was created. "
+            "Run '/x402 configure preview' again."
+        )
+
+    # Consume before writing
+    preview["consumed"] = True
 
     from hermes_x402.env_writer import update_env_file
 
-    env_path = _resolve_hermes_home() / ".env"
-
-    managed_keys = {
-        "X402_ROLE": params["role"],
-        "X402_BUYER_BACKEND": params["backend"],
-        "CIRCLE_AGENT_WALLET_ADDRESS": params["wallet"],
-        "CIRCLE_AGENT_WALLET_NETWORK": params["network"],
-        "X402_MAX_USDC_PER_PAYMENT": params["max_usdc"],
-        "X402_NETWORK_POLICY": "public",
-        "X402_HOST_ALLOWLIST": "",
-        "X402_REQUIRE_GATEWAY_BATCHING": "true",
-        "X402_ALLOW_HTTP": "false",
-        "X402_ALLOW_CHAT_OTP": "false",
-    }
-
-    # Preserve CIRCLE_CLI_EXECUTABLE if a verified path exists
-    import shutil
-
-    circle_path = shutil.which("circle")
-    if circle_path:
-        managed_keys["CIRCLE_CLI_EXECUTABLE"] = circle_path
-
     try:
-        update_env_file(env_path, managed_keys)
+        update_env_file(env_path, preview["managed_keys"])
     except OSError as exc:
         return f"Error writing configuration: {exc}"
+
+    import shutil
 
     hermes_exe = shutil.which("hermes") or "hermes"
     lines = [
         "=== Configuration Applied ===",
         "",
         f"Written to: {env_path}",
-        f"Wallet: {_mask_wallet(params['wallet'])}",
-        f"Network: {params['network']}",
+        f"Wallet: {_mask_wallet(preview['managed_keys']['CIRCLE_AGENT_WALLET_ADDRESS'])}",
+        f"Network: {preview['managed_keys']['CIRCLE_AGENT_WALLET_NETWORK']}",
         "",
         "restart_required=true",
         f"Run: {hermes_exe} gateway restart",

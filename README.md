@@ -29,7 +29,7 @@
 | **Login recovery** | Two-step OTP login via Circle CLI v0.0.6 wallet-scoped commands |
 | **Gateway funding** | Gateway balance, deposit preview, deposit execution |
 | **Daily budget** | Optional per-day USDC spending cap |
-| **Hermes plugin** | Auto-registers 14 tools into Hermes Agent on startup |
+| **Hermes plugin** | Auto-registers 14 tools, 1 approval hook, and 1 slash command |
 
 ## Installation
 
@@ -120,19 +120,15 @@ No manual registration is needed — just `pip install hermes-x402` and all tool
 All 14 tools are registered under the `x402` toolset.
 
 ### `x402_status`
-
 Report plugin status and configuration. Shows version, role, backend, network, wallet address (safe form), max payment, and host allowlist.
 
 ### `x402_wallet_status`
-
 Aggregate runtime status: CLI installation, authentication, session validity, terms state, wallet existence, on-chain balance, Gateway balance, blockers, and recommended next tool. Read-only. Never exposes entity secret, API key, or signing operations.
 
 ### `x402_wallet_balance`
-
 Report configured wallet USDC balance. CLI backend uses the existing typed balance client. DCW backend returns structured `unsupported` capability. Read-only.
 
 ### `x402_login_start`
-
 Start Circle Agent Wallet email OTP login. Only runs when no valid session exists. Returns an opaque `login_id` with 5-minute expiry. Presents two choices:
 
 - **Choice A (recommended):** Manual CLI login — the OTP never enters Hermes chat. Complete login through Circle CLI in your terminal.
@@ -141,48 +137,38 @@ Start Circle Agent Wallet email OTP login. Only runs when no valid session exist
 Never accepts or stores Circle Terms of Use.
 
 ### `x402_login_complete`
-
 Complete Circle Agent Wallet login with OTP via chat. **Disabled by default** — requires `X402_ALLOW_CHAT_OTP=true`. Requires `acknowledge_otp_exposure=true`. OTP exists in memory only for the duration of the call. Never logs or returns OTP. Failed OTP consumes the login — require new `x402_login_start`.
 
 ### `x402_networks`
-
 List all supported networks with a capability matrix. Output is filtered based on the active backend (CLI vs DCW) to show only networks you can actually use.
 
 ### `x402_service_search`
-
 Search Circle Marketplace for x402-enabled services. Accepts a query string and optional limit. Returns service URLs, descriptions, and pricing metadata.
 
 ### `x402_supports`
-
 Check if a specific URL supports x402 payments. Sends a preflight request and reports the x402 challenge without making any payment.
 
 ### `x402_service_inspect`
-
 Inspect a service URL without paying. Enforces URL scheme validation, host policy, and URL length limits. Returns normalized service metadata.
 
 ### `x402_fetch`
-
 Fetch a resource URL without paying. When HTTP 402 occurs, reports that payment is required but does not pay. Useful for inspecting free endpoints or understanding the payment challenge before committing.
 
 ### `x402_pay`
-
 Pay for an x402 resource. **This tool may transfer USDC.** Accepts an optional `max_usdc` caller cap that can reduce but never raise the configured cap. Returns the fetched resource data after successful payment. Ambiguous outcomes return `retry_safe=false` and must not be retried automatically. Must obtain a fresh 402 challenge from the server — never reuse a stale one.
 
 ### `x402_gateway_balance`
-
 Report Circle Gateway balance for the active wallet and configured network. Distinguishes Gateway balance from on-chain wallet USDC balance. Read-only.
 
 ### `x402_gateway_deposit_preview`
-
 Service-bound Gateway deposit preview. Requires `service_url`, HTTP `method`, and `amount`. Validates URL policy, fetches a fresh 402 challenge to verify the seller advertises a Gateway payment option, checks network compatibility, session, terms, and wallet balance. Returns a short-lived preview ID bound to all parameters. Read-only — must not move USDC.
 
 ### `x402_gateway_deposit_execute`
-
 Execute a Gateway deposit using a preview ID from `x402_gateway_deposit_preview`. Do not accept replacement amount, wallet, network, or method. Revalidates session, config, wallet, service (fresh 402 challenge), and preview expiry. Execute exactly once. `retry_safe=false` for ambiguous outcomes.
 
-## /x402 Slash Command
+## /x402 Slash Command — Control Panel
 
-A single Hermes slash command for read-only status, discovery, and safe configuration.
+A single Hermes slash command for read-only status, discovery, and safe configuration. **This is a control panel, not a replacement for protected financial tool flows.**
 
 ### Read-only commands
 
@@ -195,7 +181,7 @@ A single Hermes slash command for read-only status, discovery, and safe configur
 /x402 supports <url> — Check if URL supports x402
 ```
 
-These dispatch to the corresponding `x402_*` tools via `ctx.dispatch_tool` — no duplicated logic.
+These dispatch to the corresponding `x402_*` tools via `ctx.dispatch_tool` — no duplicated logic. All read-only subcommands reject extra arguments.
 
 ### Configuration
 
@@ -209,22 +195,45 @@ Shows current configuration state: Circle CLI availability, configured/unconfigu
 /x402 configure preview buyer cli 0xYourWallet... ARC-TESTNET 0.10
 ```
 
-Validates arguments and shows proposed managed keys without writing anything.
+Validates arguments, creates a preview with an opaque `preview_id`, and shows proposed managed keys without writing anything. The preview is bound to the exact wallet, network, max USDC, config fingerprint, and current file state. Previews expire after 10 minutes and are process-local (not restart-safe).
 
 ```
-/x402 configure apply buyer cli 0xYourWallet... ARC-TESTNET 0.10
+/x402 configure apply <preview_id>
 ```
 
-Writes managed keys to `$HERMES_HOME/.env`. Returns `restart_required=true` with the restart command.
+Applies the exact previewed configuration. Accepts **only** a `preview_id` — never raw wallet/network/amount arguments. The apply:
+- Verifies the preview exists and has not expired
+- Verifies the preview has not been consumed
+- Verifies the config fingerprint has not changed since preview
+- Consumes the preview before writing
+- Writes exactly the 10 previewed managed keys via the atomic env writer
 
 ### Constraints
 
 - Only `buyer` role and `cli` backend are supported
-- Only `ARC-TESTNET` network is supported
+- Only networks in the shared network registry are accepted
 - Wallet must be `0x` + 40 hex characters
 - `max_usdc` must be a positive finite Decimal
 - Output masks wallet addresses
 - No `/x402 pay`, `/x402 deposit`, or `/x402 login-complete` commands
+- All extra arguments on read-only commands are rejected
+
+### Managed keys (exactly 10)
+
+| Key | Description |
+|-----|-------------|
+| `X402_ROLE` | Agent role (buyer) |
+| `X402_BUYER_BACKEND` | Buyer backend (cli) |
+| `CIRCLE_AGENT_WALLET_ADDRESS` | Agent wallet address |
+| `CIRCLE_AGENT_WALLET_NETWORK` | Agent wallet network |
+| `X402_MAX_USDC_PER_PAYMENT` | Max USDC per payment |
+| `X402_NETWORK_POLICY` | URL validation mode |
+| `X402_HOST_ALLOWLIST` | Allowed hostnames |
+| `X402_REQUIRE_GATEWAY_BATCHING` | Require Gateway batching |
+| `X402_ALLOW_HTTP` | Allow HTTP URLs |
+| `X402_ALLOW_CHAT_OTP` | Allow OTP through chat |
+
+`CIRCLE_CLI_EXECUTABLE` is **not** written by configure apply. The Circle CLI is resolved through its existing constrained mechanism.
 
 ## Intended Workflow
 
@@ -304,9 +313,7 @@ All configuration is via environment variables. No config files required.
 hermes-x402 enforces a network policy on every outbound URL request (supports, inspect, fetch, pay).
 
 ### `public` Mode (Default)
-
 Any public HTTPS destination may be inspected or paid. The following are **always blocked**:
-
 - Private/reserved IP addresses (`10.*`, `172.16-31.*`, `192.168.*`)
 - Loopback addresses (`localhost`, `127.0.0.1`, `::1`)
 - Link-local addresses (`169.254.*`, `fe80::*`)
@@ -315,17 +322,14 @@ Any public HTTPS destination may be inspected or paid. The following are **alway
 - HTTP URLs (unless `X402_ALLOW_HTTP=true`)
 
 ### `strict_allowlist` Mode (Opt-in)
-
 Only hosts listed in `X402_HOST_ALLOWLIST` are permitted. An empty allowlist means **nothing** is allowed.
 
 ### DNS Validation
-
 - Hostnames are validated against the policy **before** DNS resolution.
 - Literal IP addresses are checked against private/reserved ranges.
 - Blocked hosts are always rejected.
 
 ### Redirect Behavior
-
 Redirects (3xx responses) are **never followed automatically**. The tool returns a bounded `redirect_not_followed` error with the `Location` header.
 
 ## Security
@@ -343,32 +347,34 @@ hermes-x402 is designed with agent-safety principles:
 - **Terms never auto-accepted**: Circle Terms of Use are never automatically accepted.
 - **OTP in memory only**: OTP values exist only in memory for the duration of the login call.
 - **Fund-move approval**: Only `x402_pay` and `x402_gateway_deposit_execute` may transfer funds.
+- **Env writer hardening**: Key names validated against `^[A-Z_][A-Z0-9_]*$`, values reject newline/CR/NUL, targets reject symlinks/directories/FIFOs/sockets/devices, temp files mode 0600 before content write.
+- **Preview-bound configuration**: `configure apply` accepts only a preview_id, never raw arguments. Previews expire, are consumed-before-write, and verify config fingerprint stability.
 
 ## State and Restart Behavior
 
 ### Pending Login State
-
 - Pending login state is **memory-only** — stored in a Python dict inside the tool handler closure.
 - After process restart, all pending logins are lost. A fresh `x402_login_start` is required.
 - The plugin generates an opaque `login_id` that maps to the Circle CLI's internal request ID.
 - A failed OTP consumes the Circle request; a new `x402_login_start` is required.
 
 ### Gateway Deposit Previews
-
 - Deposit previews are **memory-only** — stored in a Python dict inside the tool handler closure.
 - After process restart, all previews are lost. A fresh `x402_gateway_deposit_preview` is required.
 - Preview protection (consumed-once, expiry, config fingerprint) is not restart-safe.
 - Ambiguous deposit outcomes return `retry_safe=false` and must not be retried automatically.
 
-### Session Persistence
+### Configure Previews
+- Configure previews are **memory-only** — stored in a module-level dict.
+- After process restart, all previews are lost. A fresh `/x402 configure preview` is required.
+- Preview protection (consumed-once, expiry, fingerprint verification) is not restart-safe.
 
+### Session Persistence
 - Circle CLI session state is managed by the CLI itself (on-disk), not by hermes-x402.
 - Session persists across Hermes process restarts as long as the Circle CLI's credential storage is intact.
 
 ## Installation as Hermes Plugin
-
 ### Install from source checkout (recommended)
-
 ```bash
 git clone https://github.com/riyannode/hermes-x402.git
 cd hermes-x402
@@ -377,13 +383,11 @@ python3 -m hermes_x402.install \
 ```
 
 Then manually restart the gateway:
-
 ```bash
 /usr/local/lib/hermes-agent/venv/bin/hermes gateway restart
 ```
 
 Or use the automatic restart flag:
-
 ```bash
 python3 -m hermes_x402.install \
   --hermes-python /usr/local/lib/hermes-agent/venv/bin/python \
@@ -406,7 +410,7 @@ python3 -m hermes_x402.install --with-circle-cli
 When `--with-circle-cli` is passed, the installer:
 1. Detects an existing `circle` binary on PATH and validates its version
 2. If absent, requires [Bun](https://bun.sh/docs/installation) and runs `bun add -g @circle-fin/cli@0.0.6`
-3. Writes `CIRCLE_CLI_EXECUTABLE` to `$HERMES_HOME/.env`
+3. Logs the operation details (package, version, bun path) at info level
 
 **Requirements:**
 - Bun must already be installed (the installer never installs Bun or Node automatically)
@@ -415,14 +419,22 @@ When `--with-circle-cli` is passed, the installer:
 
 If a different Circle CLI version already exists, the installer reports `circle_cli_version_mismatch` and provides a manual remediation command. It never replaces, upgrades, or downgrades an existing installation automatically.
 
-### Verify installation
+Stable error codes returned by the installer:
+- `bun_not_found` — Bun is not installed
+- `circle_cli_install_failed` — Installation failed
+- `circle_cli_install_timeout` — Installation timed out
+- `circle_cli_not_found_after_install` — Binary not found after install
+- `circle_cli_version_mismatch` — Installed version does not match expected
+- `circle_cli_version_check_failed` — Version check failed
 
+Detailed stderr goes to bounded debug logging only — never to normal user output.
+
+### Verify installation
 ```bash
 python3 -m hermes_x402.install --check
 ```
 
 ### Live Arc Testnet acceptance test
-
 ```bash
 python3 -m hermes_x402.install --live-test \
   --service-url https://seller.example/x402 \
@@ -438,7 +450,6 @@ Optional flags:
 Makes real Arc Testnet transactions. Never runs on mainnet.
 
 ### Uninstall
-
 ```bash
 python3 -m hermes_x402.install --uninstall
 ```
@@ -452,7 +463,6 @@ The uninstall flow:
 4. Prints the restart command (does not restart by default)
 
 Or manually:
-
 ```bash
 pip uninstall hermes-x402
 hermes plugins disable hermes-x402

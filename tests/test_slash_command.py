@@ -1,24 +1,31 @@
-"""Deterministic tests for the /x402 slash command.
+"""Deterministic tests for the hardened /x402 slash command.
 
 Covers:
   - One command registered (exact name x402)
   - Help and empty invocation
   - Each read-only mapping dispatches the correct tool exactly once
+  - Extra arguments are rejected for all read-only subcommands
   - supports requires exactly one HTTPS URL argument
-  - Unknown subcommand is rejected
+  - supports rejects extra arguments
+  - Unknown subcommand is rejected (fail closed)
   - No financial subcommands exist
   - configure is read-only
-  - preview never writes
-  - apply writes only managed keys
+  - preview never writes, returns preview_id
+  - apply accepts only preview_id
+  - apply rejects unknown/expired/consumed preview
+  - apply verifies fingerprint before writing
   - wallet validation
-  - network validation
+  - network validation (via registry)
   - Decimal validation
   - restart_required=true
   - output masks wallet and does not expose env contents
+  - No CIRCLE_CLI_EXECUTABLE written
+  - Exact 10 managed keys
 """
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,6 +33,7 @@ import pytest
 from hermes_x402.hermes_plugin.slash_command import (
     _handle_configure_apply,
     _handle_configure_preview,
+    _preview_store,
     _validate_configure_args,
     handle_x402_command,
 )
@@ -42,6 +50,14 @@ def _reset_runtime():
     reset_runtime()
     yield
     reset_runtime()
+
+
+@pytest.fixture(autouse=True)
+def _clear_preview_store():
+    """Clear the preview store between tests."""
+    _preview_store.clear()
+    yield
+    _preview_store.clear()
 
 
 @pytest.fixture
@@ -158,6 +174,43 @@ class TestReadOnlyDispatch:
 
 
 # ---------------------------------------------------------------------------
+# Extra argument rejection
+# ---------------------------------------------------------------------------
+
+
+class TestExtraArgumentRejection:
+    def test_status_extra_args_rejected(self, mock_ctx):
+        result = handle_x402_command("status anything", mock_ctx)
+        assert "usage" in result.lower()
+        mock_ctx.dispatch_tool.assert_not_called()
+
+    def test_wallet_extra_args_rejected(self, mock_ctx):
+        result = handle_x402_command("wallet extra", mock_ctx)
+        assert "usage" in result.lower()
+        mock_ctx.dispatch_tool.assert_not_called()
+
+    def test_balance_extra_args_rejected(self, mock_ctx):
+        result = handle_x402_command("balance extra", mock_ctx)
+        assert "usage" in result.lower()
+        mock_ctx.dispatch_tool.assert_not_called()
+
+    def test_gateway_extra_args_rejected(self, mock_ctx):
+        result = handle_x402_command("gateway extra", mock_ctx)
+        assert "usage" in result.lower()
+        mock_ctx.dispatch_tool.assert_not_called()
+
+    def test_networks_extra_args_rejected(self, mock_ctx):
+        result = handle_x402_command("networks extra", mock_ctx)
+        assert "usage" in result.lower()
+        mock_ctx.dispatch_tool.assert_not_called()
+
+    def test_supports_extra_args_rejected(self, mock_ctx):
+        result = handle_x402_command("supports https://example.com extra", mock_ctx)
+        assert "usage" in result.lower()
+        mock_ctx.dispatch_tool.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # supports validation
 # ---------------------------------------------------------------------------
 
@@ -218,7 +271,7 @@ class TestConfigureReadOnly:
 
 
 # ---------------------------------------------------------------------------
-# Configure: preview never writes
+# Configure: preview never writes, returns preview_id
 # ---------------------------------------------------------------------------
 
 
@@ -236,7 +289,6 @@ class TestConfigurePreview:
             )
             assert "preview" in result.lower() or "proposed" in result.lower()
             assert "no changes written" in result.lower()
-            # File unchanged
             assert env_path.read_text() == "EXISTING=value\n"
 
     def test_preview_masks_wallet(self):
@@ -246,14 +298,77 @@ class TestConfigurePreview:
         assert "0xabab" in result  # masked prefix
         assert "ab" * 20 not in result  # full address not shown
 
+    def test_preview_returns_preview_id(self):
+        result = _handle_configure_preview(
+            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
+        )
+        assert "preview_id:" in result.lower()
+
+    def test_preview_stores_in_preview_store(self):
+        result = _handle_configure_preview(
+            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
+        )
+        # Extract preview_id from output
+        for line in result.splitlines():
+            if "preview_id:" in line.lower():
+                preview_id = line.split(":", 1)[1].strip()
+                assert preview_id in _preview_store
+                break
+        else:
+            pytest.fail("preview_id not found in output")
+
 
 # ---------------------------------------------------------------------------
-# Configure: apply writes only managed keys
+# Configure: apply is preview-bound
 # ---------------------------------------------------------------------------
 
 
 class TestConfigureApply:
-    def test_apply_writes_managed_keys(self, tmp_path):
+    def test_apply_requires_preview_id(self, tmp_path):
+        """apply with no args returns usage."""
+        result = _handle_configure_apply([])
+        assert "usage" in result.lower()
+        assert "preview_id" in result.lower()
+
+    def test_apply_rejects_extra_args(self, tmp_path):
+        """apply with extra args returns usage."""
+        result = _handle_configure_apply(["preview-abc", "extra"])
+        assert "usage" in result.lower()
+
+    def test_apply_rejects_unknown_preview(self, tmp_path):
+        result = _handle_configure_apply(["nonexistent-preview-id"])
+        assert "unknown" in result.lower() or "error" in result.lower()
+
+    def test_apply_rejects_expired_preview(self, tmp_path):
+        """Expired preview should be rejected."""
+        preview_id = "preview-expired-test"
+        _preview_store[preview_id] = {
+            "managed_keys": {"KEY": "val"},
+            "env_path": str(tmp_path / ".env"),
+            "fingerprint": "abc",
+            "created_at": time.time() - 1000,
+            "expires_at": time.time() - 1,  # already expired
+            "consumed": False,
+        }
+        result = _handle_configure_apply([preview_id])
+        assert "expired" in result.lower()
+
+    def test_apply_rejects_consumed_preview(self, tmp_path):
+        """Consumed preview should be rejected."""
+        preview_id = "preview-consumed-test"
+        _preview_store[preview_id] = {
+            "managed_keys": {"KEY": "val"},
+            "env_path": str(tmp_path / ".env"),
+            "fingerprint": "abc",
+            "created_at": time.time(),
+            "expires_at": time.time() + 600,
+            "consumed": True,
+        }
+        result = _handle_configure_apply([preview_id])
+        assert "consumed" in result.lower()
+
+    def test_apply_full_flow(self, tmp_path):
+        """Full preview -> apply flow writes managed keys."""
         with (
             patch(
                 "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
@@ -261,10 +376,19 @@ class TestConfigureApply:
             ),
             patch("shutil.which", return_value="/usr/local/bin/hermes"),
         ):
-            result = _handle_configure_apply(
+            preview_result = _handle_configure_preview(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )
-            assert "applied" in result.lower()
+            # Extract preview_id
+            preview_id = None
+            for line in preview_result.splitlines():
+                if "preview_id:" in line.lower():
+                    preview_id = line.split(":", 1)[1].strip()
+                    break
+            assert preview_id is not None
+
+            apply_result = _handle_configure_apply([preview_id])
+            assert "applied" in apply_result.lower()
             env_path = tmp_path / ".env"
             assert env_path.exists()
             content = env_path.read_text()
@@ -276,6 +400,8 @@ class TestConfigureApply:
             assert "X402_REQUIRE_GATEWAY_BATCHING=true" in content
             assert "X402_ALLOW_HTTP=false" in content
             assert "X402_ALLOW_CHAT_OTP=false" in content
+            # No CIRCLE_CLI_EXECUTABLE
+            assert "CIRCLE_CLI_EXECUTABLE" not in content
 
     def test_apply_masks_wallet_in_output(self, tmp_path):
         with (
@@ -285,9 +411,15 @@ class TestConfigureApply:
             ),
             patch("shutil.which", return_value="/usr/local/bin/hermes"),
         ):
-            result = _handle_configure_apply(
+            preview_result = _handle_configure_preview(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )
+            preview_id = None
+            for line in preview_result.splitlines():
+                if "preview_id:" in line.lower():
+                    preview_id = line.split(":", 1)[1].strip()
+                    break
+            result = _handle_configure_apply([preview_id])
             assert "0xabab" in result  # masked
             assert "ab" * 20 not in result  # not full address
 
@@ -299,9 +431,15 @@ class TestConfigureApply:
             ),
             patch("shutil.which", return_value="/usr/local/bin/hermes"),
         ):
-            result = _handle_configure_apply(
+            preview_result = _handle_configure_preview(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )
+            preview_id = None
+            for line in preview_result.splitlines():
+                if "preview_id:" in line.lower():
+                    preview_id = line.split(":", 1)[1].strip()
+                    break
+            result = _handle_configure_apply([preview_id])
             assert "restart_required=true" in result
             assert "gateway restart" in result
 
@@ -315,7 +453,15 @@ class TestConfigureApply:
             ),
             patch("shutil.which", return_value="/usr/local/bin/hermes"),
         ):
-            _handle_configure_apply(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"])
+            preview_result = _handle_configure_preview(
+                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
+            )
+            preview_id = None
+            for line in preview_result.splitlines():
+                if "preview_id:" in line.lower():
+                    preview_id = line.split(":", 1)[1].strip()
+                    break
+            _handle_configure_apply([preview_id])
             content = env_path.read_text()
             assert "# comment" in content
             assert "UNRELATED_VAR=keep" in content
@@ -360,7 +506,7 @@ class TestNetworkValidation:
         assert params is not None
 
     def test_invalid_network(self):
-        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "BASE", "0.10"])
+        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "FAKENET", "0.10"])
         assert err is not None
         assert "network" in err.lower()
 
@@ -420,6 +566,14 @@ class TestRoleBackendValidation:
         assert err is not None
         assert "usage" in err.lower()
 
+    def test_extra_args_rejected(self):
+        """Extra arguments after the required 5 are rejected."""
+        _, err = _validate_configure_args(
+            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10", "extra"]
+        )
+        assert err is not None
+        assert "usage" in err.lower()
+
 
 # ---------------------------------------------------------------------------
 # Env content safety
@@ -438,7 +592,13 @@ class TestEnvContentSafety:
             ),
             patch("shutil.which", return_value="/usr/local/bin/hermes"),
         ):
-            result = _handle_configure_apply(
+            preview_result = _handle_configure_preview(
                 ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
             )
+            preview_id = None
+            for line in preview_result.splitlines():
+                if "preview_id:" in line.lower():
+                    preview_id = line.split(":", 1)[1].strip()
+                    break
+            result = _handle_configure_apply([preview_id])
             assert "supersecretvalue" not in result
