@@ -10,7 +10,7 @@ Supported syntax:
   /x402 wallet
   /x402 balance
   /x402 gateway
-  /x402 networks
+  /x402 networks [active|buyer|gateway|all]
   /x402 supports <https-url>
   /x402 configure
   /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>
@@ -28,6 +28,15 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from hermes_x402.hermes_plugin.formatters import (
+    format_configure,
+    format_gateway_balance,
+    format_networks,
+    format_status,
+    format_supports,
+    format_wallet_balance,
+    format_wallet_status,
+)
 from hermes_x402.hermes_plugin.output import safe_wallet_address
 
 # Wallet address pattern: 0x + 40 hex chars
@@ -53,24 +62,8 @@ _PREVIEW_TTL_SECONDS = 600
 # Process-local preview store: preview_id -> preview data
 _preview_store: dict[str, dict[str, Any]] = {}
 
-
-_HELP_TEXT = """\
-/x402 — x402 plugin commands
-
-Usage:
-  /x402 help                              Show this help
-  /x402 status                            Plugin status and configuration
-  /x402 wallet                            Circle wallet + readiness status
-  /x402 balance                           Wallet USDC balance
-  /x402 gateway                           Gateway balance
-  /x402 networks                          Supported networks
-  /x402 supports <url>                    Check if URL supports x402
-  /x402 configure                         Show configuration state
-  /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>
-  /x402 configure apply <preview_id>
-
-Read-only commands dispatch to existing tools.
-Configure is safe — preview never writes, apply writes only managed keys."""
+# Telegram output budget
+_MAX_OUTPUT = 3500
 
 
 def _mask_wallet(addr: str) -> str:
@@ -140,6 +133,35 @@ def _fingerprint_config(managed_keys: dict[str, str], env_path: Path) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _check_multiline(raw_args: str) -> str | None:
+    """Check if raw_args contains multiple commands. Returns error or None."""
+    lines = raw_args.strip().splitlines()
+    if len(lines) > 1:
+        return "Error: send one /x402 command per message."
+    return None
+
+
+HELP_TEXT = """\
+**x402 Commands**
+
+**Status**
+  /x402 — Show this help
+  /x402 status — Plugin status
+  /x402 wallet — Wallet + readiness
+  /x402 balance — USDC balance
+  /x402 gateway — Gateway balance
+
+**Discovery**
+  /x402 networks — Supported networks
+  /x402 networks active — Active network only
+  /x402 supports <url> — Check x402 support
+
+**Configuration**
+  /x402 configure — Show config state
+  /x402 configure preview ... — Preview config
+  /x402 configure apply <id> — Apply config"""
+
+
 def handle_x402_command(raw_args: str, ctx: Any) -> str:
     """Handle /x402 slash command.
 
@@ -150,43 +172,60 @@ def handle_x402_command(raw_args: str, ctx: Any) -> str:
     Returns:
         Plain-text response string.
     """
+    # Multiline command rejection
+    multiline_err = _check_multiline(raw_args)
+    if multiline_err:
+        return multiline_err
+
     args = raw_args.strip()
     parts = args.split() if args else []
     subcommand = parts[0].lower() if parts else ""
 
     # --- help / empty ---
     if not subcommand or subcommand == "help":
-        return _HELP_TEXT
+        return HELP_TEXT
 
     # --- status ---
     if subcommand == "status":
         if len(parts) > 1:
             return "Usage: /x402 status"
-        return ctx.dispatch_tool("x402_status", {})
+        raw = ctx.dispatch_tool("x402_status", {})
+        return format_status(raw)
 
     # --- wallet ---
     if subcommand == "wallet":
         if len(parts) > 1:
             return "Usage: /x402 wallet"
-        return ctx.dispatch_tool("x402_wallet_status", {})
+        raw = ctx.dispatch_tool("x402_wallet_status", {})
+        return format_wallet_status(raw)
 
     # --- balance ---
     if subcommand == "balance":
         if len(parts) > 1:
             return "Usage: /x402 balance"
-        return ctx.dispatch_tool("x402_wallet_balance", {})
+        raw = ctx.dispatch_tool("x402_wallet_balance", {})
+        return format_wallet_balance(raw)
 
     # --- gateway ---
     if subcommand == "gateway":
         if len(parts) > 1:
             return "Usage: /x402 gateway"
-        return ctx.dispatch_tool("x402_gateway_balance", {})
+        raw = ctx.dispatch_tool("x402_gateway_balance", {})
+        return format_gateway_balance(raw)
 
     # --- networks ---
     if subcommand == "networks":
+        filter_key = ""
         if len(parts) > 1:
-            return "Usage: /x402 networks"
-        return ctx.dispatch_tool("x402_networks", {})
+            filter_arg = parts[1].lower()
+            valid_filters = {"active", "buyer", "gateway", "all"}
+            if filter_arg not in valid_filters:
+                return f"Unknown filter: {filter_arg!r}. Valid: {', '.join(sorted(valid_filters))}"
+            if len(parts) > 2:
+                return "Usage: /x402 networks [active|buyer|gateway|all]"
+            filter_key = filter_arg
+        raw = ctx.dispatch_tool("x402_networks", {})
+        return format_networks(raw, filter_key)
 
     # --- supports ---
     if subcommand == "supports":
@@ -195,8 +234,8 @@ def handle_x402_command(raw_args: str, ctx: Any) -> str:
         url = parts[1]
         if not url.startswith("https://"):
             return "Error: supports requires an HTTPS URL."
-        # Delegate validation to the existing x402_supports tool
-        return ctx.dispatch_tool("x402_supports", {"url": url})
+        raw = ctx.dispatch_tool("x402_supports", {"url": url})
+        return format_supports(raw)
 
     # --- configure ---
     if subcommand == "configure":
@@ -225,55 +264,7 @@ def _handle_configure_show() -> str:
     cli_info = _check_cli_available()
     env_path = _resolve_hermes_home() / ".env"
     managed = _read_managed_keys(env_path)
-
-    role = managed.get("X402_ROLE", "")
-    backend = managed.get("X402_BUYER_BACKEND", "")
-    wallet = managed.get("CIRCLE_AGENT_WALLET_ADDRESS", "")
-    network = managed.get("CIRCLE_AGENT_WALLET_NETWORK", "")
-    max_usdc = managed.get("X402_MAX_USDC_PER_PAYMENT", "")
-
-    is_configured = bool(role and backend and wallet and network and max_usdc)
-
-    lines = [
-        "=== /x402 configure ===",
-        "",
-        f"Circle CLI: {'available' if cli_info['available'] else 'not found'}",
-    ]
-
-    if cli_info["available"]:
-        lines.append(f"  Version: {cli_info['version'] or 'unknown'}")
-        lines.append(f"  Executable: {cli_info['executable']}")
-
-    lines.append("")
-    lines.append(f"Configured: {'yes' if is_configured else 'no'}")
-
-    if is_configured:
-        lines.append(f"  Role: {role}")
-        lines.append(f"  Backend: {backend}")
-        lines.append(f"  Wallet: {_mask_wallet(wallet)}")
-        lines.append(f"  Network: {network}")
-        lines.append(f"  Max USDC/payment: {max_usdc}")
-    else:
-        missing = []
-        if not role:
-            missing.append("X402_ROLE")
-        if not backend:
-            missing.append("X402_BUYER_BACKEND")
-        if not wallet:
-            missing.append("CIRCLE_AGENT_WALLET_ADDRESS")
-        if not network:
-            missing.append("CIRCLE_AGENT_WALLET_NETWORK")
-        if not max_usdc:
-            missing.append("X402_MAX_USDC_PER_PAYMENT")
-        if missing:
-            lines.append(f"  Missing: {', '.join(missing)}")
-
-    lines.append("")
-    lines.append("Usage:")
-    lines.append("  /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>")
-    lines.append("  /x402 configure apply <preview_id>")
-
-    return "\n".join(lines)
+    return format_configure(managed, cli_info)
 
 
 def _validate_configure_args(
@@ -377,25 +368,16 @@ def _handle_configure_preview(parts: list[str]) -> str:
     }
 
     lines = [
-        "=== Configuration Preview ===",
+        "**Configuration Preview**",
         "",
-        "Proposed managed keys:",
-        f"  X402_ROLE={params['role']}",
-        f"  X402_BUYER_BACKEND={params['backend']}",
-        f"  CIRCLE_AGENT_WALLET_ADDRESS={_mask_wallet(params['wallet'])}",
-        f"  CIRCLE_AGENT_WALLET_NETWORK={params['network']}",
-        f"  X402_MAX_USDC_PER_PAYMENT={params['max_usdc']}",
-        "  X402_NETWORK_POLICY=public",
-        "  X402_HOST_ALLOWLIST=",
-        "  X402_REQUIRE_GATEWAY_BATCHING=true",
-        "  X402_ALLOW_HTTP=false",
-        "  X402_ALLOW_CHAT_OTP=false",
+        f"Wallet: {_mask_wallet(params['wallet'])}",
+        f"Network: {params['network']}",
+        f"Max payment: {params['max_usdc']} USDC",
         "",
-        f"preview_id: {preview_id}",
-        f"expires_in: {_PREVIEW_TTL_SECONDS}s",
-        "process_local: preview is not restart-safe",
+        f"Preview ID: `{preview_id}`",
+        f"Expires in: {_PREVIEW_TTL_SECONDS}s",
         "",
-        "No changes written. Use '/x402 configure apply <preview_id>' to apply.",
+        "No changes written. Use `/x402 configure apply <preview_id>` to apply.",
     ]
     return "\n".join(lines)
 
@@ -449,17 +431,12 @@ def _handle_configure_apply(parts: list[str]) -> str:
     except OSError as exc:
         return f"Error writing configuration: {exc}"
 
-    import shutil
-
-    hermes_exe = shutil.which("hermes") or "hermes"
     lines = [
-        "=== Configuration Applied ===",
+        "**Configuration Applied**",
         "",
-        f"Written to: {env_path}",
         f"Wallet: {_mask_wallet(preview['managed_keys']['CIRCLE_AGENT_WALLET_ADDRESS'])}",
         f"Network: {preview['managed_keys']['CIRCLE_AGENT_WALLET_NETWORK']}",
         "",
-        "restart_required=true",
-        f"Run: {hermes_exe} gateway restart",
+        "Restart required. Run: `hermes gateway restart`",
     ]
     return "\n".join(lines)

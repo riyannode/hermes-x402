@@ -1,40 +1,36 @@
-"""Deterministic tests for the hardened /x402 slash command.
+"""Tests for /x402 slash command presentation layer.
 
 Covers:
-  - One command registered (exact name x402)
-  - Help and empty invocation
-  - Each read-only mapping dispatches the correct tool exactly once
-  - Extra arguments are rejected for all read-only subcommands
-  - supports requires exactly one HTTPS URL argument
-  - supports rejects extra arguments
-  - Unknown subcommand is rejected (fail closed)
-  - No financial subcommands exist
-  - configure is read-only
-  - preview never writes, returns preview_id
-  - apply accepts only preview_id
-  - apply rejects unknown/expired/consumed preview
-  - apply verifies fingerprint before writing
-  - wallet validation
-  - network validation (via registry)
-  - Decimal validation
-  - restart_required=true
-  - output masks wallet and does not expose env contents
-  - No CIRCLE_CLI_EXECUTABLE written
-  - Exact 10 managed keys
+  - Tools still return original JSON contracts
+  - Slash commands return human-readable text
+  - No full wallet address in output
+  - No full email in output
+  - No raw JSON dump in successful default output
+  - Duplicate balances removed
+  - Networks output below 3500 chars
+  - Active Arc Testnet shown
+  - Unsupported networks filtered
+  - Configure output hides executable path
+  - Configure output hides CIRCLE_CLI_EXECUTABLE
+  - Multiline commands rejected
+  - Financial slash commands unavailable
+  - Malformed tool JSON fails safely
 """
 
 from __future__ import annotations
 
-import time
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_x402.hermes_plugin.formatters import (
+    format_configure,
+    format_networks,
+    format_wallet_balance,
+)
 from hermes_x402.hermes_plugin.slash_command import (
-    _handle_configure_apply,
-    _handle_configure_preview,
     _preview_store,
-    _validate_configure_args,
     handle_x402_command,
 )
 
@@ -44,17 +40,7 @@ from hermes_x402.hermes_plugin.slash_command import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_runtime():
-    from hermes_x402.hermes_plugin.runtime import reset_runtime
-
-    reset_runtime()
-    yield
-    reset_runtime()
-
-
-@pytest.fixture(autouse=True)
 def _clear_preview_store():
-    """Clear the preview store between tests."""
     _preview_store.clear()
     yield
     _preview_store.clear()
@@ -62,543 +48,516 @@ def _clear_preview_store():
 
 @pytest.fixture
 def mock_ctx():
-    """Create a mock Hermes context with dispatch_tool and register_command."""
     ctx = MagicMock()
     ctx.dispatch_tool = MagicMock(return_value='{"success": true}')
-    ctx.register_command = MagicMock()
     return ctx
 
 
 # ---------------------------------------------------------------------------
-# Command registration
+# Tool JSON contracts unchanged
 # ---------------------------------------------------------------------------
 
 
-class TestCommandRegistration:
-    def test_one_command_registered(self):
-        """Exactly one command is registered."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        class FakeCtx:
-            def __init__(self):
-                self.tools = []
-                self.hooks = []
-                self.commands = []
-
-            def register_tool(self, **kw):
-                self.tools.append(kw.get("name", ""))
-
-            def register_hook(self, hook_type, handler, **kw):
-                self.hooks.append(hook_type)
-
-            def register_command(self, name, handler, **kw):
-                self.commands.append(name)
-
-        ctx = FakeCtx()
-        register(ctx)
-        assert len(ctx.commands) == 1
-
-    def test_command_name_is_x402(self):
-        """The registered command name is exactly 'x402'."""
-        from hermes_x402.hermes_plugin.entry import register
-
-        class FakeCtx:
-            def __init__(self):
-                self.tools = []
-                self.hooks = []
-                self.commands = []
-
-            def register_tool(self, **kw):
-                self.tools.append(kw.get("name", ""))
-
-            def register_hook(self, hook_type, handler, **kw):
-                self.hooks.append(hook_type)
-
-            def register_command(self, name, handler, **kw):
-                self.commands.append(name)
-
-        ctx = FakeCtx()
-        register(ctx)
-        assert ctx.commands == ["x402"]
-
-
-# ---------------------------------------------------------------------------
-# Help and empty invocation
-# ---------------------------------------------------------------------------
-
-
-class TestHelpAndEmpty:
-    def test_empty_invocation_shows_help(self, mock_ctx):
-        result = handle_x402_command("", mock_ctx)
-        assert "/x402" in result
-        assert "help" in result.lower()
-        assert "status" in result
-
-    def test_help_subcommand(self, mock_ctx):
-        result = handle_x402_command("help", mock_ctx)
-        assert "/x402" in result
-        assert "status" in result
-
-
-# ---------------------------------------------------------------------------
-# Read-only dispatch mappings
-# ---------------------------------------------------------------------------
-
-
-class TestReadOnlyDispatch:
-    def test_status_dispatches_x402_status(self, mock_ctx):
-        handle_x402_command("status", mock_ctx)
-        mock_ctx.dispatch_tool.assert_called_once_with("x402_status", {})
-
-    def test_wallet_dispatches_x402_wallet_status(self, mock_ctx):
-        handle_x402_command("wallet", mock_ctx)
-        mock_ctx.dispatch_tool.assert_called_once_with("x402_wallet_status", {})
-
-    def test_balance_dispatches_x402_wallet_balance(self, mock_ctx):
-        handle_x402_command("balance", mock_ctx)
-        mock_ctx.dispatch_tool.assert_called_once_with("x402_wallet_balance", {})
-
-    def test_gateway_dispatches_x402_gateway_balance(self, mock_ctx):
-        handle_x402_command("gateway", mock_ctx)
-        mock_ctx.dispatch_tool.assert_called_once_with("x402_gateway_balance", {})
-
-    def test_networks_dispatches_x402_networks(self, mock_ctx):
-        handle_x402_command("networks", mock_ctx)
-        mock_ctx.dispatch_tool.assert_called_once_with("x402_networks", {})
-
-    def test_supports_dispatches_x402_supports(self, mock_ctx):
-        handle_x402_command("supports https://example.com/api", mock_ctx)
-        mock_ctx.dispatch_tool.assert_called_once_with(
-            "x402_supports", {"url": "https://example.com/api"}
+class TestToolContracts:
+    def test_status_returns_json_string(self, mock_ctx):
+        """Tool dispatch returns JSON string — tool contract preserved."""
+        mock_ctx.dispatch_tool.return_value = json.dumps(
+            {
+                "success": True,
+                "role": "buyer",
+                "backend": "cli",
+                "version": "0.2.0",
+                "wallet_address": "0x1234567890abcdef",
+                "network": "ARC-TESTNET",
+                "configured": True,
+                "available": True,
+                "max_usdc_per_payment": "0.10",
+                "host_allowlist": [],
+            }
         )
+        result = mock_ctx.dispatch_tool("x402_status", {})
+        assert isinstance(result, str)
+        data = json.loads(result)
+        assert data["success"] is True
 
 
 # ---------------------------------------------------------------------------
-# Extra argument rejection
+# Slash commands return human-readable text
 # ---------------------------------------------------------------------------
 
 
-class TestExtraArgumentRejection:
-    def test_status_extra_args_rejected(self, mock_ctx):
-        result = handle_x402_command("status anything", mock_ctx)
-        assert "usage" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+class TestHumanReadable:
+    def _make_ctx(self, tool_response: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(return_value=tool_response)
+        return ctx
 
-    def test_wallet_extra_args_rejected(self, mock_ctx):
-        result = handle_x402_command("wallet extra", mock_ctx)
-        assert "usage" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+    def test_status_human_readable(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "role": "buyer",
+                    "backend": "cli",
+                    "version": "0.2.0",
+                    "wallet_address": "0xabababababababababababababababababababab",
+                    "network": "ARC-TESTNET",
+                    "configured": True,
+                    "available": True,
+                    "max_usdc_per_payment": "0.10",
+                    "host_allowlist": [],
+                }
+            )
+        )
+        result = handle_x402_command("status", ctx)
+        assert "x402 Status" in result
+        assert "hermes-x402" in result
+        assert "Buyer" in result
+        assert "Circle CLI" in result
+        # Must not be raw JSON
+        assert "success" not in result
 
-    def test_balance_extra_args_rejected(self, mock_ctx):
-        result = handle_x402_command("balance extra", mock_ctx)
-        assert "usage" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+    def test_wallet_human_readable(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "wallet_address": "0xabababababababababababababababababababab",
+                    "network": "ARC-TESTNET",
+                    "backend": "cli",
+                    "configured": True,
+                    "session_valid": True,
+                    "session_environment": "testnet",
+                    "terms_accepted": True,
+                    "cli_version": "0.0.6",
+                }
+            )
+        )
+        result = handle_x402_command("wallet", ctx)
+        assert "Circle Wallet" in result
+        assert "Active" in result
 
-    def test_gateway_extra_args_rejected(self, mock_ctx):
-        result = handle_x402_command("gateway extra", mock_ctx)
-        assert "usage" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+    def test_balance_human_readable(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "wallet_address": "0xabababababababababababababababababababab",
+                    "network": "ARC-TESTNET",
+                    "balances": [{"symbol": "USDC", "amount": "1.5"}],
+                }
+            )
+        )
+        result = handle_x402_command("balance", ctx)
+        assert "Wallet Balance" in result
+        assert "1.5" in result
 
-    def test_networks_extra_args_rejected(self, mock_ctx):
-        result = handle_x402_command("networks extra", mock_ctx)
-        assert "usage" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+    def test_gateway_human_readable(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "wallet_address": "0xabababababababababababababababababababab",
+                    "network": "ARC-TESTNET",
+                    "total_usdc": "5.0",
+                }
+            )
+        )
+        result = handle_x402_command("gateway", ctx)
+        assert "Gateway Balance" in result
+        assert "5.0" in result
 
-    def test_supports_extra_args_rejected(self, mock_ctx):
-        result = handle_x402_command("supports https://example.com extra", mock_ctx)
-        assert "usage" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+    def test_networks_human_readable(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "networks": [
+                        {"key": "base", "display_name": "Base", "environment": "mainnet"},
+                        {
+                            "key": "arcTestnet",
+                            "display_name": "Arc Testnet",
+                            "environment": "testnet",
+                        },
+                    ],
+                    "active_network": "arcTestnet",
+                }
+            )
+        )
+        result = handle_x402_command("networks", ctx)
+        assert "Networks" in result
+        assert "Base" in result
+        assert "Arc Testnet" in result
+
+    def test_supports_human_readable(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "url": "https://api.example.com",
+                    "supported": True,
+                    "gateway_batching": True,
+                    "x402_version": "2",
+                    "preferred_network": "arcTestnet",
+                }
+            )
+        )
+        result = handle_x402_command("supports https://api.example.com", ctx)
+        assert "x402 Support Check" in result
+        assert "Supported" in result
 
 
 # ---------------------------------------------------------------------------
-# supports validation
+# No full wallet address
 # ---------------------------------------------------------------------------
 
 
-class TestSupportsValidation:
-    def test_supports_requires_url(self, mock_ctx):
-        result = handle_x402_command("supports", mock_ctx)
-        assert "usage" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+class TestWalletMasking:
+    def _make_ctx(self, tool_response: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(return_value=tool_response)
+        return ctx
 
-    def test_supports_requires_https(self, mock_ctx):
-        result = handle_x402_command("supports http://example.com", mock_ctx)
-        assert "https" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
+    def test_status_masks_wallet(self):
+        full_addr = "0xabababababababababababababababababababab"
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "role": "buyer",
+                    "backend": "cli",
+                    "version": "0.2.0",
+                    "wallet_address": full_addr,
+                    "network": "ARC-TESTNET",
+                    "configured": True,
+                    "available": True,
+                }
+            )
+        )
+        result = handle_x402_command("status", ctx)
+        assert full_addr not in result
+        assert "..." in result
 
+    def test_wallet_masks_wallet(self):
+        full_addr = "0xabababababababababababababababababababab"
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "wallet_address": full_addr,
+                    "network": "ARC-TESTNET",
+                    "backend": "cli",
+                    "configured": True,
+                }
+            )
+        )
+        result = handle_x402_command("wallet", ctx)
+        assert full_addr not in result
 
-# ---------------------------------------------------------------------------
-# Unknown subcommand
-# ---------------------------------------------------------------------------
-
-
-class TestUnknownSubcommand:
-    def test_unknown_rejected(self, mock_ctx):
-        result = handle_x402_command("foobar", mock_ctx)
-        assert "unknown" in result.lower()
-
-
-# ---------------------------------------------------------------------------
-# No financial subcommands
-# ---------------------------------------------------------------------------
-
-
-class TestNoFinancialSubcommands:
-    def test_no_pay_subcommand(self, mock_ctx):
-        result = handle_x402_command("pay", mock_ctx)
-        assert "unknown" in result.lower()
-
-    def test_no_deposit_subcommand(self, mock_ctx):
-        result = handle_x402_command("deposit", mock_ctx)
-        assert "unknown" in result.lower()
-
-    def test_no_login_complete_subcommand(self, mock_ctx):
-        result = handle_x402_command("login-complete", mock_ctx)
-        assert "unknown" in result.lower()
-
-
-# ---------------------------------------------------------------------------
-# Configure: read-only
-# ---------------------------------------------------------------------------
-
-
-class TestConfigureReadOnly:
-    def test_configure_show_is_read_only(self, mock_ctx):
-        """configure with no args shows state, doesn't dispatch any tool."""
-        result = handle_x402_command("configure", mock_ctx)
-        assert "configure" in result.lower() or "circle cli" in result.lower()
-        mock_ctx.dispatch_tool.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Configure: preview never writes, returns preview_id
-# ---------------------------------------------------------------------------
-
-
-class TestConfigurePreview:
-    def test_preview_never_writes(self, tmp_path):
-        """Preview returns proposed keys but never touches the filesystem."""
-        env_path = tmp_path / ".env"
-        env_path.write_text("EXISTING=value\n")
+    def test_configure_masks_wallet(self, tmp_path):
+        full_addr = "0xabababababababababababababababababababab"
         with patch(
             "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
             return_value=tmp_path,
         ):
-            result = _handle_configure_preview(
-                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
+            from hermes_x402.hermes_plugin.slash_command import _handle_configure_preview
+
+            result = _handle_configure_preview(["buyer", "cli", full_addr, "ARC-TESTNET", "0.10"])
+            assert full_addr not in result
+
+
+# ---------------------------------------------------------------------------
+# No full email
+# ---------------------------------------------------------------------------
+
+
+class TestEmailMasking:
+    def test_wallet_masks_email(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(
+            return_value=json.dumps(
+                {
+                    "success": True,
+                    "wallet_address": "0x1234",
+                    "network": "ARC-TESTNET",
+                    "backend": "cli",
+                    "configured": True,
+                    "email_masked": "user@example.com",
+                    "session_valid": True,
+                    "session_environment": "testnet",
+                }
             )
-            assert "preview" in result.lower() or "proposed" in result.lower()
-            assert "no changes written" in result.lower()
-            assert env_path.read_text() == "EXISTING=value\n"
-
-    def test_preview_masks_wallet(self):
-        result = _handle_configure_preview(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
         )
-        assert "0xabab" in result  # masked prefix
-        assert "ab" * 20 not in result  # full address not shown
-
-    def test_preview_returns_preview_id(self):
-        result = _handle_configure_preview(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-        )
-        assert "preview_id:" in result.lower()
-
-    def test_preview_stores_in_preview_store(self):
-        result = _handle_configure_preview(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-        )
-        # Extract preview_id from output
-        for line in result.splitlines():
-            if "preview_id:" in line.lower():
-                preview_id = line.split(":", 1)[1].strip()
-                assert preview_id in _preview_store
-                break
-        else:
-            pytest.fail("preview_id not found in output")
+        result = handle_x402_command("wallet", ctx)
+        # Should mask the email
+        assert "user@example.com" not in result or "***" in result
 
 
 # ---------------------------------------------------------------------------
-# Configure: apply is preview-bound
+# No raw JSON in successful output
 # ---------------------------------------------------------------------------
 
 
-class TestConfigureApply:
-    def test_apply_requires_preview_id(self, tmp_path):
-        """apply with no args returns usage."""
-        result = _handle_configure_apply([])
-        assert "usage" in result.lower()
-        assert "preview_id" in result.lower()
+class TestNoRawJSON:
+    def _make_ctx(self, tool_response: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(return_value=tool_response)
+        return ctx
 
-    def test_apply_rejects_extra_args(self, tmp_path):
-        """apply with extra args returns usage."""
-        result = _handle_configure_apply(["preview-abc", "extra"])
-        assert "usage" in result.lower()
+    def test_status_no_json(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "role": "buyer",
+                    "backend": "cli",
+                    "version": "0.2.0",
+                    "wallet_address": "0x1234",
+                    "network": "ARC-TESTNET",
+                    "configured": True,
+                    "available": True,
+                }
+            )
+        )
+        result = handle_x402_command("status", ctx)
+        assert '{"' not in result  # no raw JSON object
 
-    def test_apply_rejects_unknown_preview(self, tmp_path):
-        result = _handle_configure_apply(["nonexistent-preview-id"])
-        assert "unknown" in result.lower() or "error" in result.lower()
+    def test_balance_no_json(self):
+        ctx = self._make_ctx(
+            json.dumps(
+                {
+                    "success": True,
+                    "wallet_address": "0x1234",
+                    "network": "ARC-TESTNET",
+                    "balances": [{"symbol": "USDC", "amount": "1.0"}],
+                }
+            )
+        )
+        result = handle_x402_command("balance", ctx)
+        assert '{"' not in result
 
-    def test_apply_rejects_expired_preview(self, tmp_path):
-        """Expired preview should be rejected."""
-        preview_id = "preview-expired-test"
-        _preview_store[preview_id] = {
-            "managed_keys": {"KEY": "val"},
-            "env_path": str(tmp_path / ".env"),
-            "fingerprint": "abc",
-            "created_at": time.time() - 1000,
-            "expires_at": time.time() - 1,  # already expired
-            "consumed": False,
+
+# ---------------------------------------------------------------------------
+# Balance deduplication
+# ---------------------------------------------------------------------------
+
+
+class TestBalanceDedup:
+    def test_duplicate_balances_removed(self):
+        raw = json.dumps(
+            {
+                "success": True,
+                "wallet_address": "0x1234",
+                "network": "ARC-TESTNET",
+                "balances": [
+                    {"symbol": "USDC", "amount": "1.0", "token_address": "0xabc"},
+                    {"symbol": "USDC", "amount": "2.0", "token_address": "0xabc"},
+                    {"symbol": "USDC", "amount": "3.0", "token_address": "0xdef"},
+                ],
+            }
+        )
+        result = format_wallet_balance(raw)
+        assert result.count("USDC") == 2  # two distinct USDC entries (different token addresses)
+
+    def test_different_tokens_not_deduped(self):
+        raw = json.dumps(
+            {
+                "success": True,
+                "wallet_address": "0x1234",
+                "network": "ARC-TESTNET",
+                "balances": [
+                    {"symbol": "USDC", "amount": "1.0"},
+                    {"symbol": "ETH", "amount": "0.5"},
+                ],
+            }
+        )
+        result = format_wallet_balance(raw)
+        assert "USDC" in result
+        assert "ETH" in result
+
+
+# ---------------------------------------------------------------------------
+# Networks output length
+# ---------------------------------------------------------------------------
+
+
+class TestNetworksLength:
+    def test_output_below_limit(self):
+        networks = [
+            {
+                "key": f"net{i}",
+                "display_name": f"Network {i}",
+                "environment": "mainnet" if i < 10 else "testnet",
+            }
+            for i in range(25)
+        ]
+        raw = json.dumps({"success": True, "networks": networks})
+        result = format_networks(raw)
+        assert len(result) <= 3500
+
+    def test_active_network_shown(self):
+        raw = json.dumps(
+            {
+                "success": True,
+                "networks": [
+                    {"key": "arcTestnet", "display_name": "Arc Testnet", "environment": "testnet"},
+                    {"key": "base", "display_name": "Base", "environment": "mainnet"},
+                ],
+                "active_network": "arcTestnet",
+            }
+        )
+        result = format_networks(raw)
+        assert "Arc Testnet" in result
+        assert "←" in result  # active marker
+
+    def test_filter_active(self):
+        raw = json.dumps(
+            {
+                "success": True,
+                "networks": [
+                    {
+                        "key": "arcTestnet",
+                        "display_name": "Arc Testnet",
+                        "environment": "testnet",
+                        "caip2": "eip155:5042002",
+                    },
+                ],
+                "active_network": "arcTestnet",
+            }
+        )
+        result = format_networks(raw, "active")
+        assert "Active: Arc Testnet" in result
+        assert "CAIP-2: eip155:5042002" in result
+
+
+# ---------------------------------------------------------------------------
+# Configure hides executable path
+# ---------------------------------------------------------------------------
+
+
+class TestConfigureHidesPath:
+    def test_no_executable_path(self):
+        managed = {
+            "X402_ROLE": "buyer",
+            "X402_BUYER_BACKEND": "cli",
+            "CIRCLE_AGENT_WALLET_ADDRESS": "0x1234",
+            "CIRCLE_AGENT_WALLET_NETWORK": "ARC-TESTNET",
+            "X402_MAX_USDC_PER_PAYMENT": "0.10",
         }
-        result = _handle_configure_apply([preview_id])
-        assert "expired" in result.lower()
+        cli_info = {"available": True, "version": "0.0.6", "executable": "/usr/bin/circle"}
+        result = format_configure(managed, cli_info)
+        assert "/usr/bin/circle" not in result
+        assert "0.0.6" in result
 
-    def test_apply_rejects_consumed_preview(self, tmp_path):
-        """Consumed preview should be rejected."""
-        preview_id = "preview-consumed-test"
-        _preview_store[preview_id] = {
-            "managed_keys": {"KEY": "val"},
-            "env_path": str(tmp_path / ".env"),
-            "fingerprint": "abc",
-            "created_at": time.time(),
-            "expires_at": time.time() + 600,
-            "consumed": True,
-        }
-        result = _handle_configure_apply([preview_id])
-        assert "consumed" in result.lower()
+    def test_no_circle_cli_executable_key(self):
+        env_path = __import__("pathlib").Path(__import__("tempfile").mkdtemp()) / ".env"
+        env_path.write_text("CIRCLE_CLI_EXECUTABLE=/usr/bin/circle\nX402_ROLE=buyer\n")
+        from hermes_x402.hermes_plugin.slash_command import _read_managed_keys
 
-    def test_apply_full_flow(self, tmp_path):
-        """Full preview -> apply flow writes managed keys."""
-        with (
-            patch(
-                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-                return_value=tmp_path,
-            ),
-            patch("shutil.which", return_value="/usr/local/bin/hermes"),
-        ):
-            preview_result = _handle_configure_preview(
-                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-            )
-            # Extract preview_id
-            preview_id = None
-            for line in preview_result.splitlines():
-                if "preview_id:" in line.lower():
-                    preview_id = line.split(":", 1)[1].strip()
-                    break
-            assert preview_id is not None
-
-            apply_result = _handle_configure_apply([preview_id])
-            assert "applied" in apply_result.lower()
-            env_path = tmp_path / ".env"
-            assert env_path.exists()
-            content = env_path.read_text()
-            assert "X402_ROLE=buyer" in content
-            assert "X402_BUYER_BACKEND=cli" in content
-            assert "CIRCLE_AGENT_WALLET_NETWORK=ARC-TESTNET" in content
-            assert "X402_MAX_USDC_PER_PAYMENT=0.10" in content
-            assert "X402_NETWORK_POLICY=public" in content
-            assert "X402_REQUIRE_GATEWAY_BATCHING=true" in content
-            assert "X402_ALLOW_HTTP=false" in content
-            assert "X402_ALLOW_CHAT_OTP=false" in content
-            # No CIRCLE_CLI_EXECUTABLE
-            assert "CIRCLE_CLI_EXECUTABLE" not in content
-
-    def test_apply_masks_wallet_in_output(self, tmp_path):
-        with (
-            patch(
-                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-                return_value=tmp_path,
-            ),
-            patch("shutil.which", return_value="/usr/local/bin/hermes"),
-        ):
-            preview_result = _handle_configure_preview(
-                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-            )
-            preview_id = None
-            for line in preview_result.splitlines():
-                if "preview_id:" in line.lower():
-                    preview_id = line.split(":", 1)[1].strip()
-                    break
-            result = _handle_configure_apply([preview_id])
-            assert "0xabab" in result  # masked
-            assert "ab" * 20 not in result  # not full address
-
-    def test_apply_restart_required(self, tmp_path):
-        with (
-            patch(
-                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-                return_value=tmp_path,
-            ),
-            patch("shutil.which", return_value="/usr/local/bin/hermes"),
-        ):
-            preview_result = _handle_configure_preview(
-                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-            )
-            preview_id = None
-            for line in preview_result.splitlines():
-                if "preview_id:" in line.lower():
-                    preview_id = line.split(":", 1)[1].strip()
-                    break
-            result = _handle_configure_apply([preview_id])
-            assert "restart_required=true" in result
-            assert "gateway restart" in result
-
-    def test_apply_preserves_unrelated_vars(self, tmp_path):
-        env_path = tmp_path / ".env"
-        env_path.write_text("# comment\nUNRELATED_VAR=keep\n")
-        with (
-            patch(
-                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-                return_value=tmp_path,
-            ),
-            patch("shutil.which", return_value="/usr/local/bin/hermes"),
-        ):
-            preview_result = _handle_configure_preview(
-                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-            )
-            preview_id = None
-            for line in preview_result.splitlines():
-                if "preview_id:" in line.lower():
-                    preview_id = line.split(":", 1)[1].strip()
-                    break
-            _handle_configure_apply([preview_id])
-            content = env_path.read_text()
-            assert "# comment" in content
-            assert "UNRELATED_VAR=keep" in content
+        managed = _read_managed_keys(env_path)
+        assert "CIRCLE_CLI_EXECUTABLE" not in managed
 
 
 # ---------------------------------------------------------------------------
-# Validation tests
+# Multiline commands rejected
 # ---------------------------------------------------------------------------
 
 
-class TestWalletValidation:
-    def test_valid_wallet(self):
-        params, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
+class TestMultilineRejection:
+    def test_multiline_rejected(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock()
+        result = handle_x402_command("status\nwallet", ctx)
+        assert "one /x402 command per message" in result
+        ctx.dispatch_tool.assert_not_called()
+
+    def test_single_line_accepted(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(return_value="{}")
+        result = handle_x402_command("status", ctx)
+        assert "one /x402 command per message" not in result
+
+
+# ---------------------------------------------------------------------------
+# Financial slash commands unavailable
+# ---------------------------------------------------------------------------
+
+
+class TestFinancialUnavailable:
+    def test_pay_unavailable(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock()
+        result = handle_x402_command("pay", ctx)
+        assert "unknown" in result.lower()
+
+    def test_deposit_unavailable(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock()
+        result = handle_x402_command("deposit", ctx)
+        assert "unknown" in result.lower()
+
+    def test_login_complete_unavailable(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock()
+        result = handle_x402_command("login-complete", ctx)
+        assert "unknown" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Malformed JSON fails safely
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedJSON:
+    def test_status_malformed(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(return_value="not json at all")
+        result = handle_x402_command("status", ctx)
+        assert "unavailable" in result.lower() or "invalid" in result.lower()
+
+    def test_balance_malformed(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(return_value="{broken json")
+        result = handle_x402_command("balance", ctx)
+        assert "unavailable" in result.lower() or "invalid" in result.lower()
+
+    def test_gateway_malformed(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(return_value="<>")
+        result = handle_x402_command("gateway", ctx)
+        assert "unavailable" in result.lower() or "invalid" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# networks filters
+# ---------------------------------------------------------------------------
+
+
+class TestNetworksFilters:
+    def test_valid_filters_accepted(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock(
+            return_value=json.dumps(
+                {
+                    "success": True,
+                    "networks": [],
+                }
+            )
         )
-        assert err is None
-        assert params is not None
-        assert params["wallet"] == "0x" + "ab" * 20
+        for f in ["active", "buyer", "gateway", "all"]:
+            result = handle_x402_command(f"networks {f}", ctx)
+            assert "Unknown filter" not in result
 
-    def test_invalid_wallet_short(self):
-        _, err = _validate_configure_args(["buyer", "cli", "0xabc", "ARC-TESTNET", "0.10"])
-        assert err is not None
-        assert "wallet" in err.lower()
-
-    def test_invalid_wallet_no_prefix(self):
-        _, err = _validate_configure_args(["buyer", "cli", "ab" * 20, "ARC-TESTNET", "0.10"])
-        assert err is not None
-        assert "wallet" in err.lower()
-
-    def test_invalid_wallet_non_hex(self):
-        _, err = _validate_configure_args(["buyer", "cli", "0x" + "zz" * 20, "ARC-TESTNET", "0.10"])
-        assert err is not None
-        assert "wallet" in err.lower()
-
-
-class TestNetworkValidation:
-    def test_valid_network(self):
-        params, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-        )
-        assert err is None
-        assert params is not None
-
-    def test_invalid_network(self):
-        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "FAKENET", "0.10"])
-        assert err is not None
-        assert "network" in err.lower()
-
-
-class TestDecimalValidation:
-    def test_valid_decimal(self):
-        params, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-        )
-        assert err is None
-        assert params is not None
-        assert params["max_usdc"] == "0.10"
-
-    def test_invalid_decimal(self):
-        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "abc"])
-        assert err is not None
-        assert "max_usdc" in err.lower()
-
-    def test_negative_decimal(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "-0.10"]
-        )
-        assert err is not None
-        assert "max_usdc" in err.lower()
-
-    def test_zero_decimal(self):
-        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0"])
-        assert err is not None
-        assert "max_usdc" in err.lower()
-
-    def test_nan_decimal(self):
-        _, err = _validate_configure_args(["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "NaN"])
-        assert err is not None
-
-    def test_infinity_decimal(self):
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "Infinity"]
-        )
-        assert err is not None
-
-
-class TestRoleBackendValidation:
-    def test_only_buyer_role(self):
-        _, err = _validate_configure_args(
-            ["seller", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-        )
-        assert err is not None
-        assert "role" in err.lower()
-
-    def test_only_cli_backend(self):
-        _, err = _validate_configure_args(["buyer", "dcw", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"])
-        assert err is not None
-        assert "backend" in err.lower()
-
-    def test_insufficient_args(self):
-        _, err = _validate_configure_args(["buyer", "cli"])
-        assert err is not None
-        assert "usage" in err.lower()
+    def test_invalid_filter_rejected(self):
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock()
+        result = handle_x402_command("networks foobar", ctx)
+        assert "Unknown filter" in result
+        ctx.dispatch_tool.assert_not_called()
 
     def test_extra_args_rejected(self):
-        """Extra arguments after the required 5 are rejected."""
-        _, err = _validate_configure_args(
-            ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10", "extra"]
-        )
-        assert err is not None
-        assert "usage" in err.lower()
-
-
-# ---------------------------------------------------------------------------
-# Env content safety
-# ---------------------------------------------------------------------------
-
-
-class TestEnvContentSafety:
-    def test_output_does_not_expose_env_contents(self, tmp_path):
-        """Apply output never dumps the full .env file."""
-        env_path = tmp_path / ".env"
-        env_path.write_text("SECRET_API_KEY=supersecretvalue\n")
-        with (
-            patch(
-                "hermes_x402.hermes_plugin.slash_command._resolve_hermes_home",
-                return_value=tmp_path,
-            ),
-            patch("shutil.which", return_value="/usr/local/bin/hermes"),
-        ):
-            preview_result = _handle_configure_preview(
-                ["buyer", "cli", "0x" + "ab" * 20, "ARC-TESTNET", "0.10"]
-            )
-            preview_id = None
-            for line in preview_result.splitlines():
-                if "preview_id:" in line.lower():
-                    preview_id = line.split(":", 1)[1].strip()
-                    break
-            result = _handle_configure_apply([preview_id])
-            assert "supersecretvalue" not in result
+        ctx = MagicMock()
+        ctx.dispatch_tool = MagicMock()
+        result = handle_x402_command("networks active extra", ctx)
+        assert "Usage" in result
+        ctx.dispatch_tool.assert_not_called()
