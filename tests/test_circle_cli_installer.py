@@ -8,6 +8,9 @@ Covers:
   - Bun not found
   - CLI not found after install
   - Success path
+  - CIRCLE_CLI_EXECUTABLE not written
+  - --check is non-mutating
+  - Bootstrap failure propagation
 """
 
 from __future__ import annotations
@@ -176,8 +179,163 @@ class TestCircleCliInstaller:
         """Report never contains raw stderr content."""
         report = CircleCliReport(errors=["circle_cli_install_failed"])
         d = report.to_dict()
-        # Error list contains only stable codes, not raw output
         for error in d["circle_cli"]["errors"]:
             assert "\n" not in error
             assert "\r" not in error
-            assert len(error) < 200  # bounded
+            assert len(error) < 200
+
+
+class TestInstallerCIRCLE_CLI_EXECUTABLE:
+    def test_with_circle_cli_does_not_write_env(self, tmp_path):
+        """--with-circle-cli must NOT write CIRCLE_CLI_EXECUTABLE to .env."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("EXISTING=value\n")
+        with (
+            patch(
+                "hermes_x402.install._find_hermes_executable",
+                return_value=tmp_path / "hermes",
+            ),
+            patch(
+                "hermes_x402.install._detect_python_env",
+                return_value=tmp_path / "python3",
+            ),
+            patch(
+                "hermes_x402.install._validate_hermes_python",
+                return_value={"hermes_cli_file": "test"},
+            ),
+            patch(
+                "hermes_x402.install._get_commit_sha",
+                return_value="abc123",
+            ),
+            patch(
+                "hermes_x402.circle_cli_installer.run_circle_cli_bootstrap",
+                return_value=CircleCliReport(
+                    requested=True,
+                    available=True,
+                    installed=True,
+                    already_present=True,
+                    version="0.0.6",
+                    executable="/usr/bin/circle",
+                    package_manager="bun",
+                ),
+            ),
+            patch(
+                "hermes_x402.install._build_wheel",
+                return_value=tmp_path / "dist" / "pkg.whl",
+            ),
+            patch("hermes_x402.install._install_wheel"),
+            patch("hermes_x402.install._enable_plugin"),
+            patch(
+                "hermes_x402.install._verify_entrypoint_registration_contract",
+                return_value={"tools": 14, "hooks": 1, "commands": 1},
+            ),
+            patch(
+                "hermes_x402.install._verify_installed_package_path",
+                return_value={"version": "0.2.0"},
+            ),
+        ):
+            from hermes_x402.install import run_install
+
+            run_install(
+                repo_root=tmp_path,
+                hermes_python=str(tmp_path / "python3"),
+                with_circle_cli=True,
+            )
+
+        content = env_path.read_text()
+        assert "CIRCLE_CLI_EXECUTABLE" not in content
+
+
+class TestInstallerCheckMode:
+    def test_check_with_circle_cli_is_non_mutating(self, tmp_path):
+        """--check --with-circle-cli must NOT run bootstrap or write env."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("EXISTING=value\n")
+        with (
+            patch(
+                "hermes_x402.install._find_hermes_executable",
+                return_value=tmp_path / "hermes",
+            ),
+            patch(
+                "hermes_x402.install._detect_python_env",
+                return_value=tmp_path / "python3",
+            ),
+            patch(
+                "hermes_x402.install._validate_hermes_python",
+                return_value={"hermes_cli_file": "test"},
+            ),
+            patch(
+                "hermes_x402.install._get_commit_sha",
+                return_value="abc123",
+            ),
+            patch(
+                "hermes_x402.circle_cli_installer.run_circle_cli_bootstrap",
+            ) as mock_bootstrap,
+            patch(
+                "hermes_x402.install._verify_entrypoint_registration_contract",
+                return_value={"tools": 14, "hooks": 1, "commands": 1},
+            ),
+            patch(
+                "hermes_x402.install._verify_installed_package_path",
+                return_value={"version": "0.2.0"},
+            ),
+        ):
+            from hermes_x402.install import run_install
+
+            run_install(
+                repo_root=tmp_path,
+                hermes_python=str(tmp_path / "python3"),
+                check_only=True,
+                with_circle_cli=True,
+            )
+
+        mock_bootstrap.assert_not_called()
+        content = env_path.read_text()
+        assert "CIRCLE_CLI_EXECUTABLE" not in content
+
+
+class TestInstallerBootstrapFailurePropagation:
+    def test_bun_not_found_propagates_to_report(self, tmp_path):
+        """Bootstrap failure is propagated to top-level report."""
+        with (
+            patch(
+                "hermes_x402.install._find_hermes_executable",
+                return_value=tmp_path / "hermes",
+            ),
+            patch(
+                "hermes_x402.install._detect_python_env",
+                return_value=tmp_path / "python3",
+            ),
+            patch(
+                "hermes_x402.install._validate_hermes_python",
+                return_value={"hermes_cli_file": "test"},
+            ),
+            patch(
+                "hermes_x402.install._get_commit_sha",
+                return_value="abc123",
+            ),
+            patch(
+                "hermes_x402.circle_cli_installer.run_circle_cli_bootstrap",
+                return_value=CircleCliReport(
+                    requested=True,
+                    errors=["bun_not_found"],
+                ),
+            ),
+            patch(
+                "hermes_x402.install._verify_entrypoint_registration_contract",
+                return_value={"tools": 14, "hooks": 1, "commands": 1},
+            ),
+            patch(
+                "hermes_x402.install._verify_installed_package_path",
+                return_value={"version": "0.2.0"},
+            ),
+        ):
+            from hermes_x402.install import run_install
+
+            report = run_install(
+                repo_root=tmp_path,
+                hermes_python=str(tmp_path / "python3"),
+                with_circle_cli=True,
+            )
+
+        assert "circle_cli: bun_not_found" in report["errors"]

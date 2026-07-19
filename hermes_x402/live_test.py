@@ -446,16 +446,19 @@ def test_a(hermes: Path, config: LiveTestConfig) -> bool:
     code = (
         "import json\n"
         "class _Ctx:\n"
-        "  def __init__(s): s.tools=[]; s.hooks=[]\n"
+        "  def __init__(s): s.tools=[]; s.hooks=[]; s.commands=[]\n"
         "  def register_tool(s, *, name, toolset, schema, handler, **kw):\n"
         "    if not isinstance(name, str) or not name: raise TypeError('name required')\n"
         "    s.tools.append(name)\n"
         "  def register_hook(s, hook_type, handler, **kw): s.hooks.append(hook_type)\n"
+        "  def register_command(s, name, handler, **kw): s.commands.append(name)\n"
         "from hermes_x402.hermes_plugin.entry import register\n"
         "ctx=_Ctx(); register(ctx)\n"
         "print(json.dumps({\n"
         "  'tools': len(ctx.tools),\n"
         "  'hooks': len(ctx.hooks),\n"
+        "  'commands': len(ctx.commands),\n"
+        "  'command_names': ctx.commands,\n"
         "  'verification_type': 'static_contract'\n"
         "}))\n"
     )
@@ -478,6 +481,16 @@ def test_a(hermes: Path, config: LiveTestConfig) -> bool:
         f"Hooks ({counts['verification_type']})",
         str(counts["hooks"]),
         counts["hooks"] == _EXPECTED_HOOKS,
+    )
+    ok &= _step(
+        f"Commands ({counts['verification_type']})",
+        str(counts["commands"]),
+        counts["commands"] == 1,
+    )
+    ok &= _step(
+        "Command name",
+        str(counts.get("command_names", [])),
+        counts.get("command_names", []) == ["x402"],
     )
 
     # Module path + version via importlib.metadata

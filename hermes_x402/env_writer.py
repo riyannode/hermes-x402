@@ -175,6 +175,10 @@ def update_env_file(
             appended_keys.add(key)
 
     # Append new keys at the end
+    # Ensure separation: if existing content is non-empty and its final line
+    # does not end in \n or \r\n, insert a newline separator before appending.
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines.append("\n")
     for key in appended_keys:
         value = managed_keys[key]
         new_lines.append(f"{key}={value}\n")

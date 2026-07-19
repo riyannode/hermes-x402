@@ -303,3 +303,68 @@ class TestEnvWriterFailureCleanup:
         # No temp files left
         temp_files = list(tmp_path.rglob(".env.tmp.*"))
         assert len(temp_files) == 0
+
+
+class TestEnvWriterUnterminatedLine:
+    def test_lf_terminated_file(self, tmp_path):
+        """LF-terminated file: new key appended on its own line."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("OTHER=keep\n")
+        update_env_file(env_path, {"X402_ROLE": "buyer"}, _fsync=False)
+        content = env_path.read_text()
+        assert content == "OTHER=keep\nX402_ROLE=buyer\n"
+
+    def test_crlf_terminated_file(self, tmp_path):
+        """CRLF-terminated file: new key appended with LF separator."""
+        env_path = tmp_path / ".env"
+        env_path.write_bytes(b"OTHER=keep\r\n")
+        update_env_file(env_path, {"X402_ROLE": "buyer"}, _fsync=False)
+        content = env_path.read_text()
+        # The existing line is preserved, new key appended with \n
+        assert "OTHER=keep" in content
+        assert "X402_ROLE=buyer" in content
+
+    def test_unterminated_final_line(self, tmp_path):
+        """Unterminated final line gets a newline separator before append."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("OTHER=keep")
+        update_env_file(env_path, {"X402_ROLE": "buyer"}, _fsync=False)
+        content = env_path.read_text()
+        # Must NOT be "OTHER=keepX402_ROLE=buyer"
+        assert "OTHER=keep\nX402_ROLE=buyer\n" in content
+        assert "OTHER=keepX402" not in content
+
+    def test_empty_file(self, tmp_path):
+        """Empty file: key appended directly."""
+        env_path = tmp_path / ".env"
+        update_env_file(env_path, {"X402_ROLE": "buyer"}, _fsync=False)
+        assert env_path.read_text() == "X402_ROLE=buyer\n"
+
+    def test_existing_managed_key_update(self, tmp_path):
+        """Existing managed key is updated in place, no separator needed."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("X402_ROLE=seller\nOTHER=keep")
+        update_env_file(env_path, {"X402_ROLE": "buyer"}, _fsync=False)
+        content = env_path.read_text()
+        assert "X402_ROLE=buyer" in content
+        assert "X402_ROLE=seller" not in content
+        assert "OTHER=keep" in content
+
+    def test_unterminated_followed_by_new_managed_key(self, tmp_path):
+        """Unrelated unterminated key followed by new managed key."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("OTHER=keep")
+        update_env_file(
+            env_path,
+            {"X402_ROLE": "buyer", "X402_BUYER_BACKEND": "cli"},
+            _fsync=False,
+        )
+        content = env_path.read_text()
+        lines = content.splitlines()
+        # First line is the existing unterminated key
+        assert lines[0] == "OTHER=keep"
+        # New keys are appended after separator
+        assert "X402_ROLE=buyer" in content
+        assert "X402_BUYER_BACKEND=cli" in content
+        # No concatenation
+        assert "OTHER=keepX402" not in content
