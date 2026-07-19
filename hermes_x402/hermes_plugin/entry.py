@@ -170,7 +170,7 @@ def _register_slash_command(ctx: Any) -> None:
     ctx.register_command(
         "x402",
         command_handler,
-        args_hint="",
+        args_hint="[help|status|wallet|balance|gateway|networks|supports|configure] [args]",
     )
     logger.debug("hermes-x402: registered /x402 slash command")
 

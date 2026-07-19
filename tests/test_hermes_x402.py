@@ -83,6 +83,16 @@ def encoded_challenge(amount: str = "10000") -> str:
 
 class TestConfig:
     def test_legacy_from_env_remains_usable(self, monkeypatch):
+        # Live Hermes environments may export the explicit v2 buyer role/CLI
+        # variables. This regression exercises the legacy DCW-only env shape, so
+        # isolate it from process-level configuration.
+        for key in (
+            "X402_ROLE",
+            "X402_BUYER_BACKEND",
+            "CIRCLE_AGENT_WALLET_ADDRESS",
+            "CIRCLE_AGENT_WALLET_NETWORK",
+        ):
+            monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("X402_SELLER_ADDRESS", "0xSeller")
         monkeypatch.setenv("CIRCLE_DCW_WALLET_ID", "wallet-123")
         monkeypatch.setenv("CIRCLE_DCW_WALLET_ADDRESS", "0xBuyer")
