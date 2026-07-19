@@ -27,13 +27,15 @@ class _Hooks:
 def real_hermes_x402_command_registry(monkeypatch: pytest.MonkeyPatch):
     """Register x402 through Hermes' real PluginContext/PluginManager registry."""
 
-    from hermes_cli.plugins import (
-        PluginContext,
-        PluginManifest,
-        get_plugin_manager,
+    hermes_plugins = pytest.importorskip(
+        "hermes_cli.plugins",
+        reason="real Hermes router integration requires installed Hermes Agent core",
     )
-
     from hermes_x402.hermes_plugin.entry import register
+
+    PluginContext = hermes_plugins.PluginContext
+    PluginManifest = hermes_plugins.PluginManifest
+    get_plugin_manager = hermes_plugins.get_plugin_manager
 
     manager = get_plugin_manager()
     old_commands = dict(manager._plugin_commands)
