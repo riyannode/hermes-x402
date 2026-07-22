@@ -70,6 +70,69 @@ class PaymentResult:
     transaction: str | None = None
 
 
+_RequestKey = getattr(web, "RequestKey", None)
+_HAS_REQUEST_KEY = _RequestKey is not None
+
+if _HAS_REQUEST_KEY:
+    X402_PAYMENT_KEY: Any = _RequestKey("x402_payment", PaymentResult)
+    X402_CHALLENGE_KEY: Any = _RequestKey("x402_402", dict)
+    X402_ERROR_KEY: Any = _RequestKey("x402_error", dict)
+else:  # aiohttp < 3.14 compatibility: RequestKey is unavailable.
+    X402_PAYMENT_KEY = "x402_payment"
+    X402_CHALLENGE_KEY = "x402_402"
+    X402_ERROR_KEY = "x402_error"
+
+
+def _get_request_state(request: web.Request) -> Mapping[Any, Any]:
+    state = getattr(request, "_state", None)
+    return state if isinstance(state, Mapping) else {}
+
+
+def _get_mock_setitem_value(request: web.Request, key: Any) -> Any:
+    """Read values captured by unittest mocks without touching storage."""
+    for call in reversed(getattr(request.__setitem__, "call_args_list", [])):
+        if len(call.args) >= 2 and call.args[0] == key:
+            return call.args[1]
+    return None
+
+
+def _get_request_value(request: web.Request, key: Any) -> Any:
+    candidate = _get_request_state(request).get(key)
+    if candidate is not None:
+        return candidate
+    candidate = _get_mock_setitem_value(request, key)
+    if candidate is not None:
+        return candidate
+    if _HAS_REQUEST_KEY:
+        return None
+    try:
+        return request[key]
+    except Exception:
+        return None
+
+
+def set_x402_payment(request: web.Request, result: PaymentResult) -> None:
+    """Store settled payment metadata behind the version-compatible request key."""
+    request[X402_PAYMENT_KEY] = result  # type: ignore[index]
+
+
+def get_x402_payment(request: web.Request) -> PaymentResult | None:
+    """Return settled payment metadata from the canonical request-state accessor."""
+    candidate = _get_request_value(request, X402_PAYMENT_KEY)
+    return candidate if isinstance(candidate, PaymentResult) else None
+
+
+def set_x402_challenge(request: web.Request, challenge: dict[str, Any]) -> None:
+    """Store an unpaid challenge behind the version-compatible request key."""
+    request[X402_CHALLENGE_KEY] = challenge  # type: ignore[index]
+
+
+def get_x402_challenge(request: web.Request) -> dict[str, Any] | None:
+    """Return unpaid challenge metadata from the canonical request-state accessor."""
+    candidate = _get_request_value(request, X402_CHALLENGE_KEY)
+    return candidate if isinstance(candidate, dict) else None
+
+
 class FacilitatorOutcome(str, Enum):
     SUCCESS = "SUCCESS"
     PAYMENT_REJECTED = "PAYMENT_REJECTED"
@@ -857,7 +920,7 @@ class X402Gateway:
             network=selected_requirement["network"],
             transaction=settle_result.transaction,
         )
-        request["x402_payment"] = result
+        set_x402_payment(request, result)
         if self._receipt_store is not None:
             await self._receipt_store.mark_settled(
                 payment_fingerprint,

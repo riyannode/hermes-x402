@@ -22,6 +22,9 @@ from hermes_x402.seller_gateway import (
     PAYMENT_REQUIRED_HEADER,
     PAYMENT_RESPONSE_HEADER,
     PAYMENT_SIGNATURE_HEADER,
+    X402_CHALLENGE_KEY,
+    X402_ERROR_KEY,
+    X402_PAYMENT_KEY,
     X402_VERSION,
     CircleFacilitatorClient,
     FacilitatorOutcome,
@@ -31,6 +34,9 @@ from hermes_x402.seller_gateway import (
     ReceiptStore,
     X402Gateway,
     create_aiohttp_gateway,
+    get_x402_challenge,
+    get_x402_payment,
+    set_x402_challenge,
 )
 
 
@@ -116,15 +122,9 @@ class X402SellerMiddleware:
             self.description,
         )
         if response.status == 204:
-            try:
-                candidate = request["x402_payment"]
-                if isinstance(candidate, PaymentResult):
-                    return candidate
-            except Exception:
-                pass
-            for call in getattr(request.__setitem__, "call_args_list", []):
-                if call.args and call.args[0] == "x402_payment":
-                    return call.args[1]
+            candidate = get_x402_payment(request)
+            if candidate is not None:
+                return candidate
         if response.status == 402:
             try:
                 body = response.body.decode("utf-8") if isinstance(response.body, bytes) else "{}"
@@ -133,15 +133,18 @@ class X402SellerMiddleware:
                 parsed = json.loads(body)
             except Exception:
                 parsed = {}
-            request["x402_402"] = {
-                "status": 402,
-                "headers": {
-                    PAYMENT_REQUIRED_HEADER: response.headers.get(PAYMENT_REQUIRED_HEADER, "")
+            set_x402_challenge(
+                request,
+                {
+                    "status": 402,
+                    "headers": {
+                        PAYMENT_REQUIRED_HEADER: response.headers.get(PAYMENT_REQUIRED_HEADER, "")
+                    },
+                    "body": parsed,
                 },
-                "body": parsed,
-            }
+            )
             return None
-        request["x402_error"] = {"status": response.status}
+        request[X402_ERROR_KEY] = {"status": response.status}  # type: ignore[index]
         return None
 
     @staticmethod
@@ -184,6 +187,10 @@ __all__ = [
     "X402_VERSION",
     "DEFAULT_MAX_TIMEOUT_SECONDS",
     "PaymentResult",
+    "X402_PAYMENT_KEY",
+    "X402_CHALLENGE_KEY",
+    "get_x402_payment",
+    "get_x402_challenge",
     "X402SellerMiddleware",
     "create_aiohttp_middleware",
     "X402Gateway",

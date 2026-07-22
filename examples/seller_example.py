@@ -11,7 +11,7 @@ import os
 
 from aiohttp import web
 
-from hermes_x402 import create_aiohttp_middleware
+from hermes_x402 import create_aiohttp_middleware, get_x402_challenge
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("seller_example")
@@ -31,7 +31,11 @@ async def premium_data(request: web.Request):
 
     if result is None:
         # Payment needed or failed — return 402
-        resp_402 = request["x402_402"]
+        resp_402 = get_x402_challenge(request) or {
+            "status": 402,
+            "headers": {},
+            "body": {"error": "Payment required"},
+        }
         return web.json_response(
             resp_402["body"],
             status=resp_402["status"],

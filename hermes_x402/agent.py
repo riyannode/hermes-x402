@@ -12,7 +12,7 @@ from hermes_x402.buyer.policy import PaymentPolicy
 from hermes_x402.circle_cli import CircleCliClient, CircleCliRunner
 from hermes_x402.config import X402Config
 from hermes_x402.context import X402ContextBridge
-from hermes_x402.middleware import create_aiohttp_middleware
+from hermes_x402.middleware import create_aiohttp_middleware, get_x402_challenge
 
 
 class X402HermesAgent:
@@ -139,7 +139,8 @@ class X402HermesAgent:
         return (
             None
             if result is not None
-            else request.get("x402_402", {"status": 402, "body": {"error": "Payment required"}})
+            else get_x402_challenge(request)
+            or {"status": 402, "body": {"error": "Payment required"}}
         )
 
     async def pay(

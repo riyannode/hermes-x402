@@ -21,17 +21,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import json
+import sys
+import warnings
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from aiohttp.web_exceptions import NotAppKeyWarning
 
 from hermes_x402.middleware import (
     PAYMENT_RESPONSE_HEADER,
     PAYMENT_SIGNATURE_HEADER,
+    X402_CHALLENGE_KEY,
+    X402_PAYMENT_KEY,
     X402SellerMiddleware,
+    get_x402_challenge,
+    get_x402_payment,
 )
 from hermes_x402.networks import get_network
 from hermes_x402.seller_gateway import InMemoryReceiptStore, create_aiohttp_gateway
@@ -122,7 +130,7 @@ class TestMiddlewareServerAmount:
         # Verify 402 response was stored on request
         assert mock_request.__setitem__.call_count > 0
         stored_keys = [call.args[0] for call in mock_request.__setitem__.call_args_list]
-        assert "x402_402" in stored_keys
+        assert X402_CHALLENGE_KEY in stored_keys
 
     async def test_overpayment_rejected(self):
         """Client offers more than server price -> 402, no settlement."""
@@ -136,7 +144,7 @@ class TestMiddlewareServerAmount:
         result = await mw.process_request(mock_request, price="$0.01")
         assert result is None
         stored_keys = [call.args[0] for call in mock_request.__setitem__.call_args_list]
-        assert "x402_402" in stored_keys
+        assert X402_CHALLENGE_KEY in stored_keys
 
     async def test_real_aiohttp_request_unpaid_stores_challenge(self):
         """Compatibility adapter works with real aiohttp Request objects."""
@@ -146,8 +154,10 @@ class TestMiddlewareServerAmount:
         result = await mw.process_request(request, price="$0.003")
 
         assert result is None
-        assert request["x402_402"]["status"] == 402
-        body = request["x402_402"]["body"]
+        challenge = get_x402_challenge(request)
+        assert challenge is not None
+        assert challenge["status"] == 402
+        body = challenge["body"]
         assert body["resource"]["url"] == "https://seller.local/premium?item=1"
         assert body["accepts"][0]["network"] == _NETWORK_CAIP2
         assert body["accepts"][0]["amount"] == "3000"
@@ -168,7 +178,7 @@ class TestMiddlewareServerAmount:
         assert result is not None
         assert result.amount == "3000"
         assert result.network == _NETWORK_CAIP2
-        assert request["x402_payment"] is result
+        assert get_x402_payment(request) is result
 
     async def test_exact_amount_settles_with_server_amount(self):
         """Client offers exact server amount -> settlement succeeds, result uses server amount."""
@@ -185,6 +195,178 @@ class TestMiddlewareServerAmount:
             assert result is not None
             assert result.amount == "10000"  # server-computed
             assert result.network == _NETWORK_CAIP2
+
+
+class TestAiohttpRequestState:
+    """Canonical request state uses typed aiohttp keys and documented accessors."""
+
+    @staticmethod
+    def _not_app_key_warnings(caught):
+        return [item for item in caught if issubclass(item.category, NotAppKeyWarning)]
+
+    async def test_canonical_payment_key_access_works_without_warning(self):
+        gw = create_aiohttp_gateway(seller_address=_VALID_SELLER, networks=["arcTestnet"])
+        request = make_mocked_request(
+            "GET",
+            "/premium",
+            headers={PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="10000")},
+        )
+
+        async def handler(req):
+            assert get_x402_payment(req) is not None
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                resp = await gw._handle_request(request, handler, "$0.01", None, None, "test")
+
+        assert resp.status == 200
+        payment = request[X402_PAYMENT_KEY]
+        assert payment.amount == "10000"
+        assert get_x402_payment(request) is payment
+        assert self._not_app_key_warnings(caught) == []
+
+    async def test_unpaid_challenge_accessor_works_without_warning(self):
+        mw = _make_middleware()
+        request = make_mocked_request("GET", "/premium?item=1", headers={})
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = await mw.process_request(request, price="$0.003")
+
+        assert result is None
+        challenge = request[X402_CHALLENGE_KEY]
+        assert challenge["status"] == 402
+        assert get_x402_challenge(request) is challenge
+        assert self._not_app_key_warnings(caught) == []
+
+    async def test_request_key_unavailable_falls_back_to_single_string_key(self, monkeypatch):
+        import hermes_x402.middleware as middleware_module
+        import hermes_x402.seller_gateway as seller_gateway_module
+
+        original_request_key = web.RequestKey
+        monkeypatch.delattr(web, "RequestKey")
+        try:
+            fallback_gateway = importlib.reload(seller_gateway_module)
+            fallback_middleware = importlib.reload(middleware_module)
+
+            assert fallback_gateway.X402_PAYMENT_KEY == "x402_payment"
+            assert fallback_gateway.X402_CHALLENGE_KEY == "x402_402"
+
+            class FakeRequest:
+                def __init__(self):
+                    self._state = {}
+
+                def __setitem__(self, key, value):
+                    self._state[key] = value
+
+                def __getitem__(self, key):
+                    return self._state[key]
+
+            request = FakeRequest()
+            result = fallback_gateway.PaymentResult(
+                payer="0x" + "cd" * 20,
+                amount="3000",
+                network=_NETWORK_CAIP2,
+                transaction="0xlegacy",
+            )
+            fallback_gateway.set_x402_payment(request, result)
+            fallback_gateway.set_x402_challenge(request, {"status": 402})
+
+            assert fallback_gateway.get_x402_payment(request) is result
+            assert fallback_gateway.get_x402_challenge(request) == {"status": 402}
+            assert request["x402_payment"] is result
+            assert request["x402_402"] == {"status": 402}
+            assert "x402_error" not in request._state
+            assert fallback_middleware.X402_PAYMENT_KEY == "x402_payment"
+        finally:
+            monkeypatch.setattr(web, "RequestKey", original_request_key, raising=False)
+            importlib.reload(seller_gateway_module)
+            importlib.reload(middleware_module)
+
+    def test_package_import_with_request_key_unavailable(self, monkeypatch):
+        import hermes_x402.seller_gateway as seller_gateway_module
+
+        original_request_key = web.RequestKey
+        monkeypatch.delattr(web, "RequestKey")
+        removed = {
+            name: sys.modules.pop(name)
+            for name in list(sys.modules)
+            if name == "hermes_x402" or name.startswith("hermes_x402.")
+        }
+        try:
+            package = importlib.import_module("hermes_x402")
+            fallback_gateway = importlib.import_module("hermes_x402.seller_gateway")
+            assert package.get_x402_payment is fallback_gateway.get_x402_payment
+            assert fallback_gateway.X402_PAYMENT_KEY == "x402_payment"
+        finally:
+            monkeypatch.setattr(web, "RequestKey", original_request_key, raising=False)
+            for name in list(sys.modules):
+                if name == "hermes_x402" or name.startswith("hermes_x402."):
+                    sys.modules.pop(name, None)
+            sys.modules.update(removed)
+            importlib.reload(seller_gateway_module)
+
+    async def test_sequential_requests_remain_isolated(self):
+        mw = _make_middleware()
+        paid_request = make_mocked_request(
+            "GET",
+            "/premium-paid",
+            headers={PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="3000")},
+        )
+        unpaid_request = make_mocked_request("GET", "/premium-unpaid", headers={})
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xpaid"}
+            paid_result = await mw.process_request(paid_request, price="$0.003")
+            unpaid_result = await mw.process_request(unpaid_request, price="$0.003")
+
+        assert paid_result is get_x402_payment(paid_request)
+        assert get_x402_challenge(paid_request) is None
+        assert unpaid_result is None
+        assert get_x402_payment(unpaid_request) is None
+        challenge = get_x402_challenge(unpaid_request)
+        assert challenge is not None
+        assert challenge["status"] == 402
+
+    async def test_concurrent_requests_remain_isolated(self):
+        mw = _make_middleware()
+        req_a = make_mocked_request(
+            "GET",
+            "/premium-a",
+            headers={PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="3000")},
+        )
+        req_b = make_mocked_request(
+            "GET",
+            "/premium-b",
+            headers={PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="4000")},
+        )
+
+        async def settle(payload, requirements):
+            await asyncio.sleep(0)
+            return {
+                "success": True,
+                "transaction": f"0x{requirements['amount']}",
+                "payer": payload["payload"]["authorization"]["from"],
+            }
+
+        with patch.object(mw, "_settle", new=AsyncMock(side_effect=settle)):
+            result_a, result_b = await asyncio.gather(
+                mw.process_request(req_a, price="$0.003"),
+                mw.process_request(req_b, price="$0.004"),
+            )
+
+        assert result_a is not None
+        assert result_b is not None
+        assert result_a is get_x402_payment(req_a)
+        assert result_b is get_x402_payment(req_b)
+        assert result_a is not result_b
+        assert result_a.amount == "3000"
+        assert result_b.amount == "4000"
+        assert result_a.transaction == "0x3000"
+        assert result_b.transaction == "0x4000"
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +932,12 @@ class TestSettlementFlow:
         with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
             mock_settle.return_value = {"success": True, "transaction": "0xtx"}
             await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
-            payment = stored["x402_payment"]
+            payment = (
+                stored.get(X402_PAYMENT_KEY)
+                or stored.get("x402_payment")
+                or next(iter(stored.values()))
+            )
+            assert payment is not None
             assert payment.amount == "10000"  # server-computed
 
     async def test_payment_context_stores_server_amount(self):
@@ -997,7 +1184,12 @@ class TestGatewayServerAmountInResult:
         with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
             mock_settle.return_value = {"success": True, "transaction": "0xtx"}
             await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
-            payment = stored["x402_payment"]
+            payment = (
+                stored.get(X402_PAYMENT_KEY)
+                or stored.get("x402_payment")
+                or next(iter(stored.values()))
+            )
+            assert payment is not None
             assert payment.amount == "10000"  # server-computed, not client-provided
 
 
@@ -1141,7 +1333,12 @@ class TestCompleteSettlementFlow:
             assert PAYMENT_RESPONSE_HEADER in resp.headers
 
             # Payment result must be stored on request
-            payment = stored["x402_payment"]
+            payment = (
+                stored.get(X402_PAYMENT_KEY)
+                or stored.get("x402_payment")
+                or next(iter(stored.values()))
+            )
+            assert payment is not None
             assert payment.amount == "10000"
             assert payment.network == _NETWORK_CAIP2
             assert payment.transaction == "0xsettlement_tx_hash"
