@@ -68,7 +68,7 @@ from hermes_x402.seller_gateway import create_aiohttp_gateway
 
 gateway = create_aiohttp_gateway(
     seller_address="0xYourAddress1234567890abcdef1234567890abcdef",
-    networks=["base", "polygon"],
+    networks=["arctestnet","base", "polygon"],
 )
 
 @gateway.require("$0.01")
