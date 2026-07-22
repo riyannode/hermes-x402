@@ -74,7 +74,10 @@ def register(ctx: Any) -> None:
     register_login_tools(ctx)
     register_gateway_tools(ctx)
 
-    logger.debug("hermes-x402 plugin: registered x402 tools and approval hook")
+    # Register /x402 slash command
+    _register_slash_command(ctx)
+
+    logger.debug("hermes-x402 plugin: registered x402 tools, approval hook, and command")
 
 
 def _register_approval_hook(ctx: Any) -> None:
@@ -151,6 +154,25 @@ def _register_approval_hook(ctx: Any) -> None:
     # Register without try/except — let exceptions propagate
     ctx.register_hook("pre_tool_call", approval_hook)
     logger.debug("hermes-x402: registered pre_tool_call approval hook")
+
+
+def _register_slash_command(ctx: Any) -> None:
+    """Register /x402 slash command for read-only status and safe configuration.
+
+    Uses ctx.register_command for registration and ctx.dispatch_tool
+    for delegating to existing tools. No duplicated handler logic.
+    """
+    from hermes_x402.hermes_plugin.slash_command import handle_x402_command
+
+    def command_handler(raw_args: str = "", **kwargs: Any) -> str:
+        return handle_x402_command(raw_args, ctx)
+
+    ctx.register_command(
+        "x402",
+        command_handler,
+        args_hint="[help|status|wallet|balance|gateway|networks|supports|configure] [args]",
+    )
+    logger.debug("hermes-x402: registered /x402 slash command")
 
 
 def _sanitize_url_for_display(raw_url: Any) -> str:

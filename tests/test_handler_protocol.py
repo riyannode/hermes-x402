@@ -50,6 +50,7 @@ class FakeCtx:
     def __init__(self) -> None:
         self.tools: list[dict[str, Any]] = []
         self.hooks: list[dict[str, Any]] = []
+        self.commands: list[dict[str, Any]] = []
 
     def register_tool(
         self,
@@ -77,6 +78,9 @@ class FakeCtx:
 
     def register_hook(self, hook_type: str, handler: Any, **kwargs: Any) -> None:
         self.hooks.append({"type": hook_type, "handler": handler})
+
+    def register_command(self, name: str, handler: Any, **kwargs: Any) -> None:
+        self.commands.append({"name": name, "handler": handler})
 
 
 # ---------------------------------------------------------------------------

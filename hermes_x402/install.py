@@ -2,8 +2,8 @@
 
 Detects the Hermes executable, identifies the Python environment,
 builds a wheel with pip (no third-party build package), installs it,
-enables the plugin, and verifies 14 tools + 1 pre_tool_call hook
-are registered via a static entry-point contract check.
+enables the plugin, and verifies 14 tools + 1 pre_tool_call hook + 1
+slash command are registered via a static entry-point contract check.
 
 Usage:
     python3 -m hermes_x402.install                         # full install
@@ -11,6 +11,7 @@ Usage:
     python3 -m hermes_x402.install --uninstall             # remove plugin
     python3 -m hermes_x402.install --live-test ...         # install + live test
     python3 -m hermes_x402.install --hermes-python /path   # override Python
+    python3 -m hermes_x402.install --with-circle-cli       # detect/install Circle CLI
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from urllib.parse import urlparse
 
 _EXPECTED_TOOLS = 14
 _EXPECTED_HOOKS = 1
+_EXPECTED_COMMANDS = 1
 _PLUGIN_NAME = "hermes-x402"
 _ENV_DEBUG = "HERMES_PLUGINS_DEBUG"
 _HERMES_EXE_CANDIDATES = ("hermes",)
@@ -497,20 +499,24 @@ def _verify_entrypoint_registration_contract(python: Path) -> dict:
     code = (
         "import json, sys\n"
         "class _Ctx:\n"
-        "    def __init__(s): s.tools=[]; s.hooks=[]\n"
+        "    def __init__(s): s.tools=[]; s.hooks=[]; s.commands=[]\n"
         "    def register_tool(s, *, name, toolset, schema, handler, **kw):\n"
         "        if not isinstance(name, str) or not name:\n"
         "            raise TypeError('register_tool requires a non-empty name')\n"
         "        s.tools.append(name)\n"
         "    def register_hook(s, hook_type, handler, **kw):\n"
         "        s.hooks.append(hook_type)\n"
+        "    def register_command(s, name, handler, **kw):\n"
+        "        s.commands.append(name)\n"
         "from hermes_x402.hermes_plugin.entry import register\n"
         "ctx = _Ctx()\n"
         "register(ctx)\n"
         "print(json.dumps({\n"
         "    'tools': len(ctx.tools),\n"
         "    'hooks': len(ctx.hooks),\n"
+        "    'commands': len(ctx.commands),\n"
         "    'names': ctx.tools,\n"
+        "    'command_names': ctx.commands,\n"
         "    'verification_type': 'static_contract',\n"
         "}))\n"
     )
@@ -916,6 +922,7 @@ def run_install(
     check_only: bool = False,
     hermes_python: str | None = None,
     restart_gateway: bool = False,
+    with_circle_cli: bool = False,
 ) -> dict:
     """Run the installer.  Returns a status dict.
 
@@ -951,6 +958,21 @@ def run_install(
         commit_sha = _get_commit_sha(repo_root)
         report["commit_sha"] = commit_sha
         print(f"[install] Source commit: {commit_sha}")
+
+        # 4b. Circle CLI bootstrap (only when explicitly requested AND not check_only)
+        if with_circle_cli and not check_only:
+            from hermes_x402.circle_cli_installer import run_circle_cli_bootstrap
+
+            cli_report = run_circle_cli_bootstrap(with_circle_cli=True)
+            report["circle_cli"] = cli_report.to_dict()["circle_cli"]
+            if cli_report.errors:
+                for err in cli_report.errors:
+                    print(f"[install] Circle CLI: {err}")
+                # Propagate bootstrap failures to top-level report
+                report["success"] = False
+                report["errors"].extend(f"circle_cli: {err}" for err in cli_report.errors)
+            elif cli_report.installed:
+                print(f"[install] Circle CLI: v{cli_report.version} at {cli_report.executable}")
 
         if not check_only:
             # 5. Build wheel
@@ -989,11 +1011,12 @@ def run_install(
         report["registration_contract"] = {
             "tools": verification["tools"],
             "hooks": verification["hooks"],
+            "commands": verification.get("commands", 0),
             "verification_type": "static_contract",
         }
         print(
             f"[install] Static contract: {verification['tools']} tools, "
-            f"{verification['hooks']} hooks"
+            f"{verification['hooks']} hooks, {verification.get('commands', 0)} commands"
         )
 
         if verification["tools"] != _EXPECTED_TOOLS:
@@ -1002,6 +1025,11 @@ def run_install(
             )
         if verification["hooks"] != _EXPECTED_HOOKS:
             report["errors"].append(f"Expected {_EXPECTED_HOOKS} hook, got {verification['hooks']}")
+        commands_count = verification.get("commands", 0)
+        if commands_count != _EXPECTED_COMMANDS:
+            report["errors"].append(
+                f"Expected {_EXPECTED_COMMANDS} command(s), got {commands_count}"
+            )
 
         # 10. Verify installed package path and version (isolated, canonical)
         if not check_only:
@@ -1100,6 +1128,11 @@ def main() -> None:
         action="store_true",
         help="Restart the Hermes gateway after install/uninstall",
     )
+    parser.add_argument(
+        "--with-circle-cli",
+        action="store_true",
+        help="Detect or install Circle CLI (@circle-fin/cli@0.0.6) via Bun",
+    )
     # Live-test arguments (forwarded to run_live_test via config)
     parser.add_argument(
         "--service-url",
@@ -1174,6 +1207,7 @@ def main() -> None:
             check_only=False,
             hermes_python=args.hermes_python,
             restart_gateway=False,
+            with_circle_cli=args.with_circle_cli,
         )
         if not report["success"]:
             print("\n[install] ❌ Live test aborted: installation/verification failed")
@@ -1204,6 +1238,7 @@ def main() -> None:
         check_only=args.check,
         hermes_python=args.hermes_python,
         restart_gateway=args.restart_gateway,
+        with_circle_cli=args.with_circle_cli,
     )
     sys.exit(0 if report["success"] else 1)
 

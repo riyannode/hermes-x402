@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-x402"
-version = "0.1.0"
+version = "0.2.0"
 description = "Circle x402 nanopayment integration for Hermes Agent — seller middleware (aiohttp) + buyer tool (DCW) + dual-role agent"
 readme = "README.md"
 license = "MIT"
