@@ -19,12 +19,14 @@ Payment requirements (scheme, network, asset, amount, payTo) belong in accepted.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp import web
+from aiohttp.test_utils import make_mocked_request
 
 from hermes_x402.middleware import (
     PAYMENT_RESPONSE_HEADER,
@@ -32,7 +34,7 @@ from hermes_x402.middleware import (
     X402SellerMiddleware,
 )
 from hermes_x402.networks import get_network
-from hermes_x402.seller_gateway import create_aiohttp_gateway
+from hermes_x402.seller_gateway import InMemoryReceiptStore, create_aiohttp_gateway
 
 _VALID_SELLER = "0x" + "ab" * 20
 _VALID_ASSET = "0x3600000000000000000000000000000000000000"
@@ -82,7 +84,7 @@ def _build_auth_header(
             "asset": _VALID_ASSET,
             "amount": value,
             "payTo": _VALID_SELLER,
-            "maxTimeoutSeconds": 604900,
+            "maxTimeoutSeconds": 2592000,
             "extra": {
                 "name": "GatewayWalletBatched",
                 "version": "1",
@@ -135,6 +137,38 @@ class TestMiddlewareServerAmount:
         assert result is None
         stored_keys = [call.args[0] for call in mock_request.__setitem__.call_args_list]
         assert "x402_402" in stored_keys
+
+    async def test_real_aiohttp_request_unpaid_stores_challenge(self):
+        """Compatibility adapter works with real aiohttp Request objects."""
+        mw = _make_middleware()
+        request = make_mocked_request("GET", "/premium?item=1", headers={})
+
+        result = await mw.process_request(request, price="$0.003")
+
+        assert result is None
+        assert request["x402_402"]["status"] == 402
+        body = request["x402_402"]["body"]
+        assert body["resource"]["url"] == "https://seller.local/premium?item=1"
+        assert body["accepts"][0]["network"] == _NETWORK_CAIP2
+        assert body["accepts"][0]["amount"] == "3000"
+
+    async def test_real_aiohttp_request_paid_returns_payment_result(self):
+        """Compatibility adapter delegates paid real aiohttp requests to canonical core."""
+        mw = _make_middleware()
+        request = make_mocked_request(
+            "GET",
+            "/premium",
+            headers={PAYMENT_SIGNATURE_HEADER: _build_auth_header(value="3000")},
+        )
+
+        with patch.object(mw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            result = await mw.process_request(request, price="$0.003")
+
+        assert result is not None
+        assert result.amount == "3000"
+        assert result.network == _NETWORK_CAIP2
+        assert request["x402_payment"] is result
 
     async def test_exact_amount_settles_with_server_amount(self):
         """Client offers exact server amount -> settlement succeeds, result uses server amount."""
@@ -394,7 +428,7 @@ class TestServerAuthority:
         )
 
         # Build header with wrong network (base) but client price matches
-        header = _build_auth_header(value="10000", network="eip155:8453")
+        header = _build_auth_header(value="10000", network="eip155:5042002")
 
         mock_request = AsyncMock()
         mock_request.path = "/test"
@@ -532,7 +566,7 @@ class TestPriceProtection:
                 "asset": _VALID_ASSET,
                 "amount": "10000",
                 "payTo": _VALID_SELLER,
-                "maxTimeoutSeconds": 604900,
+                "maxTimeoutSeconds": 2592000,
                 "extra": {
                     "name": "GatewayWalletBatched",
                     "version": "1",
@@ -629,8 +663,63 @@ class TestSettlementFlow:
         with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
             mock_settle.side_effect = RuntimeError("Network error")
             resp = await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
-            assert resp.status == 402
+            assert resp.status == 503
             assert not handler_called
+
+    async def test_receipt_store_concurrent_duplicate_executes_handler_once(self):
+        """Same payment + same request recovers existing result without double execution."""
+        store = InMemoryReceiptStore()
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+            receipt_store=store,
+        )
+        header = _build_auth_header(value="10000")
+        req1 = make_mocked_request("GET", "/premium", headers={PAYMENT_SIGNATURE_HEADER: header})
+        req2 = make_mocked_request("GET", "/premium", headers={PAYMENT_SIGNATURE_HEADER: header})
+        handler_calls = 0
+
+        async def handler(req):
+            nonlocal handler_calls
+            handler_calls += 1
+            await asyncio.sleep(0.01)
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            responses = await asyncio.gather(
+                gw._handle_request(req1, handler, "$0.01", None, None, "test"),
+                gw._handle_request(req2, handler, "$0.01", None, None, "test"),
+            )
+
+        assert [resp.status for resp in responses] == [200, 200]
+        assert handler_calls == 1
+        assert mock_settle.await_count == 1
+        assert responses[1].body == responses[0].body
+
+    async def test_receipt_store_same_payment_different_request_conflicts(self):
+        """Same payment reused for a different request is a 409 conflict."""
+        store = InMemoryReceiptStore()
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+            receipt_store=store,
+        )
+        header = _build_auth_header(value="10000")
+        req1 = make_mocked_request("GET", "/premium/a", headers={PAYMENT_SIGNATURE_HEADER: header})
+        req2 = make_mocked_request("GET", "/premium/b", headers={PAYMENT_SIGNATURE_HEADER: header})
+
+        async def handler(req):
+            return web.json_response({"ok": True})
+
+        with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
+            mock_settle.return_value = {"success": True, "transaction": "0xtx"}
+            first = await gw._handle_request(req1, handler, "$0.01", None, None, "test")
+            second = await gw._handle_request(req2, handler, "$0.01", None, None, "test")
+
+        assert first.status == 200
+        assert second.status == 409
+        assert mock_settle.await_count == 1
 
     async def test_payment_result_stores_server_amount(self):
         """PaymentResult stores server-computed amount, not client-provided value."""
@@ -680,14 +769,18 @@ class TestSettlementFlow:
 
         with patch.object(gw, "_settle", new_callable=AsyncMock) as mock_settle:
             mock_settle.return_value = {"success": True, "transaction": "0xtx"}
-            with patch("hermes_x402.seller_gateway.set_payment_context") as mock_ctx:
-                await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
-                mock_ctx.assert_called_once_with(
-                    payer="0x" + "cd" * 20,
-                    amount="10000",
-                    network=_NETWORK_CAIP2,
-                    transaction="0xtx",
-                )
+            with patch("hermes_x402.seller_gateway.set_payment_context_token") as mock_ctx:
+                token = object()
+                mock_ctx.return_value = token
+                with patch("hermes_x402.seller_gateway.reset_payment_context") as mock_reset:
+                    await gw._handle_request(mock_request, handler, "$0.01", None, None, "test")
+                    mock_ctx.assert_called_once_with(
+                        payer="0x" + "cd" * 20,
+                        amount="10000",
+                        network=_NETWORK_CAIP2,
+                        transaction="0xtx",
+                    )
+                    mock_reset.assert_called_once_with(token)
 
 
 # ---------------------------------------------------------------------------
@@ -832,17 +925,17 @@ class TestGatewayCAIP2Matching:
     def test_caip2_matches(self):
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
-            networks=["base"],
+            networks=["arcTestnet"],
         )
-        reqs = gw._build_settle_requirements("10000", "eip155:8453", gw._networks)
-        assert reqs["network"] == "eip155:8453"
+        reqs = gw._build_settle_requirements("10000", "eip155:5042002", gw._networks)
+        assert reqs["network"] == "eip155:5042002"
         assert reqs["amount"] == "10000"
 
     def test_registry_key_fails(self):
         """Passing 'base' instead of 'eip155:8453' must raise."""
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
-            networks=["base"],
+            networks=["arcTestnet"],
         )
         with pytest.raises(ValueError, match="not in accepted networks"):
             gw._build_settle_requirements("10000", "base", gw._networks)
@@ -859,7 +952,7 @@ class TestGatewayAcceptsDeepCopy:
     def test_no_mutation_between_calls(self):
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
-            networks=["base"],
+            networks=["arcTestnet"],
         )
         # Build 402 body with amount "10000"
         body1 = gw._build_402_body("10000", "/a", "desc1", gw._networks)
@@ -931,7 +1024,7 @@ class TestGatewaySellerSupported:
 class TestGatewayMixedEnvironment:
     def test_mixed_mainnet_testnet_rejected(self):
         """Cannot mix mainnet and testnet networks."""
-        with pytest.raises(ValueError, match="Cannot mix networks"):
+        with pytest.raises(ValueError, match="not supported for seller mode"):
             create_aiohttp_gateway(
                 seller_address=_VALID_SELLER,
                 networks=["base", "arcTestnet"],

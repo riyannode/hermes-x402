@@ -32,7 +32,7 @@ def _opt(
         asset="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
         supported_by_backend=True,
         pay_to="0xSeller",
-        max_timeout_seconds=604900,
+        max_timeout_seconds=2592000,
     )
 
 
@@ -53,7 +53,7 @@ class TestInvalidOptionsDiscarded:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         result = select_payment_option((opt,))
         assert result is None
@@ -69,7 +69,7 @@ class TestInvalidOptionsDiscarded:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         result = select_payment_option((opt,))
         assert result is None
@@ -102,7 +102,7 @@ class TestRegistryFiltering:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         result = select_payment_option((opt,))
         assert result is None
@@ -174,7 +174,7 @@ class TestPreferenceOrdering:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         opt_base = PaymentOption(
             scheme="exact",
@@ -186,7 +186,7 @@ class TestPreferenceOrdering:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         result = select_payment_option(
             (opt_polygon, opt_base),
@@ -214,7 +214,7 @@ class TestDeterministicOrder:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         opt_base = PaymentOption(
             scheme="exact",
@@ -226,7 +226,7 @@ class TestDeterministicOrder:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         result = select_payment_option(
             (opt_polygon, opt_base),
@@ -268,7 +268,7 @@ class TestNoMatch:
             asset="0xabc",
             supported_by_backend=False,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         # With configured backend, unsupported networks are discarded
         result = select_payment_option((opt,), configured_backend="cli")
@@ -353,7 +353,7 @@ class TestGatewayPriority:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         opt_gateway = PaymentOption(
             scheme="exact",
@@ -365,7 +365,7 @@ class TestGatewayPriority:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         result = select_payment_option(
             (opt_vanilla, opt_gateway),

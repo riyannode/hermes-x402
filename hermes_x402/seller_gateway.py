@@ -1,272 +1,683 @@
-"""Ergonomic aiohttp gateway decorator for x402 seller mode.
+"""Canonical aiohttp seller implementation for Circle x402 v2 Gateway settlement.
 
-Wraps the low-level X402SellerMiddleware with a decorator-based API so
-sellers can protect routes with a single line::
-
-    gateway = create_aiohttp_gateway("0x...")
-
-    @gateway.require("$0.01")
-    async def premium_data(request):
-        return web.json_response({"secret": 42})
-
-The gateway builds 402 responses from the centralized network registry and
-delegates settlement to X402SellerMiddleware._settle() via Circle Gateway.
+This module is the single seller engine.  ``hermes_x402.middleware`` is a
+backward-compatible adapter over this code, not a second settlement path.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
+import hashlib
 import json
 import logging
+import os
 import re
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from enum import Enum
+from typing import Any, Protocol
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from aiohttp import web
 
-from hermes_x402.context import set_payment_context
-from hermes_x402.middleware import (
-    CIRCLE_BATCHING_NAME,
-    CIRCLE_BATCHING_SCHEME,
-    CIRCLE_BATCHING_VERSION,
-    DEFAULT_MAX_TIMEOUT_SECONDS,
-    PAYMENT_REQUIRED_HEADER,
-    PAYMENT_RESPONSE_HEADER,
-    PAYMENT_SIGNATURE_HEADER,
-    X402_VERSION,
-    PaymentResult,
-)
+from hermes_x402.context import reset_payment_context, set_payment_context_token
 from hermes_x402.networks import NetworkConfig, NetworkNotFoundError, get_network
 
 logger = logging.getLogger("hermes_x402.seller_gateway")
 
+PAYMENT_SIGNATURE_HEADER = "Payment-Signature"
+PAYMENT_REQUIRED_HEADER = "Payment-Required"
+PAYMENT_RESPONSE_HEADER = "Payment-Response"
 
-async def _call_handler(handler: Callable, request: web.Request) -> web.Response:
-    """Invoke an async aiohttp handler (needed for lambda/await bridging)."""
+CIRCLE_BATCHING_SCHEME = "exact"
+CIRCLE_BATCHING_NAME = "GatewayWalletBatched"
+CIRCLE_BATCHING_VERSION = "1"
+X402_VERSION = 2
+# Circle's seller docs and @circle-fin/x402-batching publish the server-owned
+# Gateway requirement as seven days plus a small buffer.
+SERVER_MIN_TIMEOUT_SECONDS = 7 * 24 * 60 * 60 + 100
+DEFAULT_MAX_TIMEOUT_SECONDS = SERVER_MIN_TIMEOUT_SECONDS
+# Circle CLI 0.0.6 normalizes the buyer's selected/accepted requirement to a
+# 30-day validity preference before embedding it in the x402 v2 payload. Treat
+# that as buyer-side compatibility metadata: it may be >= server minimum, but it
+# must not replace the server-owned settlement requirement.
+BUYER_MAX_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
+
+_USDC_DECIMALS = 6
+_USDC_MULTIPLIER = Decimal(10) ** _USDC_DECIMALS
+_MAX_ATOMIC = 10**18
+_MAX_ENCODED_PAYMENT_HEADER = 8192
+_MAX_DECODED_PAYMENT_PAYLOAD = 32768
+_MAX_FACILITATOR_RESPONSE = 65536
+_MAX_JSON_DEPTH = 16
+_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_MAINNET_FACILITATOR = "https://gateway-api.circle.com"
+_TESTNET_FACILITATOR = "https://gateway-api-testnet.circle.com"
+
+
+@dataclass
+class PaymentResult:
+    """Result of a successful payment settlement."""
+
+    payer: str
+    amount: str
+    network: str
+    transaction: str | None = None
+
+
+class FacilitatorOutcome(str, Enum):
+    SUCCESS = "SUCCESS"
+    PAYMENT_REJECTED = "PAYMENT_REJECTED"
+    REPLAY_OR_CONFLICT = "REPLAY_OR_CONFLICT"
+    RATE_LIMITED = "RATE_LIMITED"
+    FACILITATOR_UNAVAILABLE = "FACILITATOR_UNAVAILABLE"
+    AMBIGUOUS = "AMBIGUOUS"
+    INVALID_FACILITATOR_RESPONSE = "INVALID_FACILITATOR_RESPONSE"
+
+
+@dataclass(frozen=True)
+class FacilitatorSettlementResult:
+    outcome: FacilitatorOutcome
+    success: bool = False
+    transaction: str = ""
+    payer: str = ""
+    error: str = ""
+    http_status: int | None = None
+    retry_safe: bool = False
+
+
+@dataclass
+class ReceiptRecord:
+    payment_fingerprint: str
+    request_fingerprint: str
+    route_id: str
+    state: str
+    settlement: dict[str, Any] = field(default_factory=dict)
+    resource_result_reference: str = ""
+    response_status: int | None = None
+    response_headers: dict[str, str] = field(default_factory=dict)
+    response_body: bytes | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    _event: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class ReceiptBeginResult:
+    action: str  # owner | wait | replay | conflict
+    record: ReceiptRecord
+
+
+class ReceiptStore(Protocol):
+    """Pluggable receipt/idempotency seam for seller routes."""
+
+    async def begin(
+        self, payment_fingerprint: str, request_fingerprint: str, route_id: str
+    ) -> ReceiptBeginResult: ...
+
+    async def wait(self, record: ReceiptRecord) -> ReceiptRecord: ...
+
+    async def mark_settled(self, payment_fingerprint: str, settlement: dict[str, Any]) -> None: ...
+
+    async def mark_rejected(self, payment_fingerprint: str, error: str) -> None: ...
+
+    async def mark_completed(
+        self,
+        payment_fingerprint: str,
+        *,
+        response_status: int,
+        response_headers: Mapping[str, str],
+        response_body: bytes | None,
+        resource_result_reference: str = "",
+    ) -> None: ...
+
+    async def mark_handler_failed(self, payment_fingerprint: str) -> None: ...
+
+    async def mark_ambiguous(
+        self, payment_fingerprint: str, settlement: dict[str, Any]
+    ) -> None: ...
+
+
+class InMemoryReceiptStore:
+    """Non-production in-memory receipt store for tests and development only."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._records: dict[str, ReceiptRecord] = {}
+
+    async def begin(
+        self, payment_fingerprint: str, request_fingerprint: str, route_id: str
+    ) -> ReceiptBeginResult:
+        async with self._lock:
+            rec = self._records.get(payment_fingerprint)
+            if rec is None:
+                rec = ReceiptRecord(
+                    payment_fingerprint=payment_fingerprint,
+                    request_fingerprint=request_fingerprint,
+                    route_id=route_id,
+                    state="in_progress",
+                )
+                self._records[payment_fingerprint] = rec
+                return ReceiptBeginResult("owner", rec)
+            if rec.request_fingerprint != request_fingerprint or rec.route_id != route_id:
+                return ReceiptBeginResult("conflict", rec)
+            if rec.state == "completed":
+                return ReceiptBeginResult("replay", rec)
+            return ReceiptBeginResult("wait", rec)
+
+    async def wait(self, record: ReceiptRecord) -> ReceiptRecord:
+        await record._event.wait()
+        return record
+
+    async def mark_settled(self, payment_fingerprint: str, settlement: dict[str, Any]) -> None:
+        async with self._lock:
+            rec = self._records[payment_fingerprint]
+            rec.state = "settled"
+            rec.settlement = dict(settlement)
+            rec.updated_at = time.time()
+
+    async def mark_rejected(self, payment_fingerprint: str, error: str) -> None:
+        async with self._lock:
+            rec = self._records[payment_fingerprint]
+            rec.state = "rejected"
+            rec.settlement = {"error": error}
+            rec.updated_at = time.time()
+            rec._event.set()
+
+    async def mark_completed(
+        self,
+        payment_fingerprint: str,
+        *,
+        response_status: int,
+        response_headers: Mapping[str, str],
+        response_body: bytes | None,
+        resource_result_reference: str = "",
+    ) -> None:
+        async with self._lock:
+            rec = self._records[payment_fingerprint]
+            rec.state = "completed"
+            rec.response_status = response_status
+            rec.response_headers = dict(response_headers)
+            rec.response_body = response_body
+            rec.resource_result_reference = resource_result_reference
+            rec.updated_at = time.time()
+            rec._event.set()
+
+    async def mark_handler_failed(self, payment_fingerprint: str) -> None:
+        async with self._lock:
+            rec = self._records[payment_fingerprint]
+            rec.state = "handler_failed"
+            rec.updated_at = time.time()
+            rec._event.set()
+
+    async def mark_ambiguous(self, payment_fingerprint: str, settlement: dict[str, Any]) -> None:
+        async with self._lock:
+            rec = self._records[payment_fingerprint]
+            rec.state = "ambiguous"
+            rec.settlement = dict(settlement)
+            rec.updated_at = time.time()
+            rec._event.set()
+
+
+class SellerConfigurationError(ValueError):
+    """Invalid seller configuration."""
+
+
+class PaymentParsingError(ValueError):
+    """Malformed Payment-Signature header."""
+
+    def __init__(self, message: str, *, status: int = 402) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+async def _call_handler(
+    handler: Callable[[web.Request], Awaitable[web.Response]], request: web.Request
+) -> web.Response:
     return await handler(request)
 
 
-# USDC has 6 decimal places
-_USDC_DECIMALS = 6
-_USDC_MULTIPLIER = 10**_USDC_DECIMALS
-
-# Max USDC amount that fits safely (conservative: $42,949,672.95 = 2^32 - 1 in 6-dec)
-_MAX_ATOMIC = 2**64  # well within uint256, generous safety margin
-
-# Seller address: 0x + 40 hex characters (EIP-55 checksum not enforced)
-_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-
-
-# ---------------------------------------------------------------------------
-# Price parsing
-# ---------------------------------------------------------------------------
-
-
 def _parse_price(price: str | Decimal) -> str:
-    """Parse a human USDC price like ``"$0.01"`` to an atomic 6-decimal string.
-
-    Returns a string of the atomic amount (e.g. ``"10000"`` for $0.01).
-
-    Raises ``ValueError`` on negative, NaN, Infinity, excess precision, or
-    overflow.  Uses ``Decimal`` exclusively — never ``float``.
-    """
+    """Parse USDC price to exact 6-decimal atomic units as a string."""
+    if isinstance(price, bool):
+        raise TypeError("price must not be a boolean")
     if callable(price):
         raise TypeError("price must be a string or Decimal, not a callable")
+    if not isinstance(price, (str, Decimal)):
+        raise TypeError("price must be a string or Decimal")
 
-    # Normalise currency marker: strip $ from anywhere, not just prefix.
-    # This handles "$0.01", "-$0.01", "$-0.01", and bare "0.01".
-    raw = str(price).strip().replace("$", "")
-
+    raw = str(price).strip()
+    if raw.startswith("$"):
+        raw = raw[1:].strip()
+    elif raw.startswith("-$"):
+        raw = "-" + raw[2:].strip()
+    elif raw.startswith("+$"):
+        raw = raw[2:].strip()
+    elif "$" in raw:
+        raise ValueError(f"Cannot parse price: {price!r}")
     if not raw:
         raise ValueError("price must not be empty")
 
     try:
-        d = Decimal(raw)
+        parsed = Decimal(raw)
     except InvalidOperation:
         raise ValueError(f"Cannot parse price: {price!r}") from None
 
-    # Reject special values
-    if d.is_nan():
-        raise ValueError("price must not be NaN")
-    if d.is_infinite():
+    if not parsed.is_finite():
+        if parsed.is_nan():
+            raise ValueError("price must not be NaN")
         raise ValueError("price must not be Infinity")
-    if d < 0:
+    if parsed < 0:
         raise ValueError(f"price must not be negative: {price!r}")
-
-    # Reject zero (free resources shouldn't be gated)
-    if d == 0:
+    if parsed == 0:
         raise ValueError("price must be greater than zero")
 
-    # Check excess precision (more than 6 decimal places)
-    # Convert to tuple and check the exponent
-    sign, digits, exponent = d.as_tuple()
+    exponent = parsed.as_tuple().exponent
     if isinstance(exponent, int) and exponent < -_USDC_DECIMALS:
         raise ValueError(
             f"price has excess precision (more than {_USDC_DECIMALS} decimals): {price!r}"
         )
 
-    # Multiply to atomic 6-decimal
-    atomic = d * _USDC_MULTIPLIER
-
-    # Round to integer (handles edge cases like 0.001 with excess precision after scaling)
-    try:
-        atomic_int = int(atomic)
-    except (OverflowError, ValueError):
-        raise ValueError(f"price overflows atomic amount: {price!r}") from None
-
-    # Validate range
+    atomic = parsed * _USDC_MULTIPLIER
+    if atomic != atomic.to_integral_exact():
+        raise ValueError(f"price conversion is not exact: {price!r}")
+    atomic_int = int(atomic)
     if atomic_int <= 0:
-        raise ValueError(f"price too small (must be > $0.000001): {price!r}")
+        raise ValueError(f"price too small (must be at least one atomic USDC unit): {price!r}")
     if atomic_int > _MAX_ATOMIC:
         raise ValueError(f"price exceeds maximum: {price!r}")
-
     return str(atomic_int)
 
 
-# ---------------------------------------------------------------------------
-# Address validation
-# ---------------------------------------------------------------------------
-
-
-def _validate_address(address: str) -> None:
-    """Validate a seller (payTo) address.  Must be 0x + 40 hex chars."""
+def _validate_address(address: str, *, field_name: str = "address") -> None:
     if not isinstance(address, str) or not _ADDRESS_RE.match(address):
         raise ValueError(
-            f"Invalid seller address: {address!r}. Must be 0x followed by 40 hex characters."
+            f"Invalid {field_name}: {address!r}. Must be 0x followed by 40 hex characters."
         )
 
 
-# ---------------------------------------------------------------------------
-# Gateway
-# ---------------------------------------------------------------------------
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+
+
+def _b64_json(value: Any) -> str:
+    return base64.b64encode(_canonical_json_bytes(value)).decode("ascii")
+
+
+def _ensure_json_depth(value: Any, *, max_depth: int = _MAX_JSON_DEPTH) -> None:
+    def walk(node: Any, depth: int) -> None:
+        if depth > max_depth:
+            raise PaymentParsingError("payment payload exceeds maximum JSON nesting")
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if not isinstance(key, str):
+                    raise PaymentParsingError("payment payload contains a non-string object key")
+                walk(child, depth + 1)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, depth + 1)
+
+    walk(value, 0)
+
+
+def _decode_payment_header(encoded: str) -> dict[str, Any]:
+    if not isinstance(encoded, str) or not encoded:
+        raise PaymentParsingError("missing payment header")
+    if len(encoded) > _MAX_ENCODED_PAYMENT_HEADER:
+        raise PaymentParsingError("encoded payment header is too large", status=413)
+    try:
+        raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        raise PaymentParsingError("payment header is not strict base64") from None
+    if len(raw) > _MAX_DECODED_PAYMENT_PAYLOAD:
+        raise PaymentParsingError("decoded payment payload is too large", status=413)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise PaymentParsingError("payment payload is not valid UTF-8") from None
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        raise PaymentParsingError("payment payload is not valid JSON") from None
+    if not isinstance(decoded, dict):
+        raise PaymentParsingError("payment payload must be a JSON object")
+    _ensure_json_depth(decoded)
+    payload = decoded.get("payload")
+    if not isinstance(payload, dict):
+        raise PaymentParsingError("payment payload is missing payload object")
+    if not isinstance(payload.get("authorization"), dict):
+        raise PaymentParsingError("payment payload is missing authorization object")
+    if not isinstance(payload.get("signature"), str) or not payload.get("signature"):
+        raise PaymentParsingError("payment payload is missing signature")
+    if not isinstance(decoded.get("accepted"), dict):
+        raise PaymentParsingError("payment payload is missing accepted requirement")
+    return decoded
+
+
+def _normalize_path(path_qs: str) -> str:
+    if not isinstance(path_qs, str) or not path_qs.startswith("/"):
+        path_qs = "/" + str(path_qs or "")
+    parts = urlsplit(path_qs)
+    path = quote(parts.path or "/", safe="/%:@")
+    query = parts.query
+    return urlunsplit(("", "", path, query, ""))
+
+
+def _build_resource_url(
+    public_base_url: str, request: web.Request | None = None, path: str | None = None
+) -> str:
+    base = urlsplit(public_base_url)
+    rel = _normalize_path(
+        path if path is not None else getattr(request, "path_qs", getattr(request, "path", "/"))
+    )
+    rel_parts = urlsplit(rel)
+    return urlunsplit((base.scheme, base.netloc, rel_parts.path, rel_parts.query, ""))
+
+
+def _fingerprint(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _log_seller_rejection(stage: str, reason: str, **fields: Any) -> None:
+    """Log only structural payment validation diagnostics.
+
+    Deliberately excludes the raw payment header, payment payload, signature,
+    nonce, authorization object, and request headers.
+    """
+    safe_fields = {
+        key: value
+        for key, value in fields.items()
+        if key.lower()
+        not in {
+            "payment-signature",
+            "payment_signature",
+            "paymentheader",
+            "paymentpayload",
+            "authorization",
+            "signature",
+            "nonce",
+            "headers",
+        }
+    }
+    logger.info(
+        "x402 seller payment rejected stage=%s reason=%s fields=%s",
+        stage,
+        reason,
+        safe_fields,
+    )
+
+
+def _log_timeout_compatibility(
+    *, buyer_max_timeout_seconds: int, server_max_timeout_seconds: int
+) -> None:
+    """Log sanitized timeout compatibility metadata only.
+
+    Do not include payment payload, authorization, signature, nonce, or request
+    headers. This exists to diagnose Circle CLI normalization without exposing
+    authorization material.
+    """
+    logger.debug(
+        "x402 seller timeout compatibility fields=%s",
+        {
+            "buyer_maxTimeoutSeconds": buyer_max_timeout_seconds,
+            "server_maxTimeoutSeconds": server_max_timeout_seconds,
+        },
+    )
+
+
+def _validate_buyer_timeout(raw_timeout: Any, server_min_timeout: int) -> int:
+    if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int):
+        raise ValueError("invalid maxTimeoutSeconds")
+    if raw_timeout < server_min_timeout:
+        raise ValueError("maxTimeoutSeconds below server minimum")
+    if raw_timeout > BUYER_MAX_TIMEOUT_SECONDS:
+        raise ValueError("maxTimeoutSeconds above defensive maximum")
+    return raw_timeout
+
+
+def _validation_stage_from_error(exc: ValueError) -> str:
+    reason = str(exc)
+    if reason == "wrong x402Version":
+        return "x402Version mismatch"
+    if reason in {"invalid authorization value", "wrong amount"}:
+        return "authorization value mismatch"
+    if (
+        reason.startswith("wrong ")
+        or reason.startswith("missing accepted")
+        or "maxTimeoutSeconds" in reason
+    ):
+        return "selected requirement mismatch"
+    return "payload schema rejection"
+
+
+class CircleFacilitatorClient:
+    """Typed Circle Gateway facilitator client for direct settle()."""
+
+    def __init__(self, base_url: str, *, client: httpx.AsyncClient | None = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._client = client
+        self._owned_client: httpx.AsyncClient | None = None
+
+    async def aclose(self) -> None:
+        if self._owned_client is not None:
+            await self._owned_client.aclose()
+            self._owned_client = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is not None:
+            return self._client
+        if self._owned_client is None:
+            timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+            self._owned_client = httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                max_redirects=0,
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            )
+        return self._owned_client
+
+    async def settle(
+        self, payment_payload: dict[str, Any], payment_requirements: dict[str, Any]
+    ) -> FacilitatorSettlementResult:
+        url = f"{self.base_url}/v1/x402/settle"
+        body = {"paymentPayload": payment_payload, "paymentRequirements": payment_requirements}
+        try:
+            response = await self._get_client().post(
+                url, json=body, headers={"Content-Type": "application/json"}
+            )
+        except httpx.TimeoutException as exc:
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.FACILITATOR_UNAVAILABLE, error=type(exc).__name__
+            )
+        except httpx.TransportError as exc:
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.FACILITATOR_UNAVAILABLE, error=type(exc).__name__
+            )
+
+        if response.is_redirect:
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.INVALID_FACILITATOR_RESPONSE,
+                error="facilitator redirects are not allowed",
+                http_status=response.status_code,
+            )
+        if response.status_code == 429:
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.RATE_LIMITED, error="rate limited", http_status=429
+            )
+        if response.status_code >= 500:
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.FACILITATOR_UNAVAILABLE,
+                error="facilitator server error",
+                http_status=response.status_code,
+            )
+
+        raw = response.content
+        if len(raw) > _MAX_FACILITATOR_RESPONSE:
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.INVALID_FACILITATOR_RESPONSE,
+                error="facilitator response too large",
+                http_status=response.status_code,
+            )
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.INVALID_FACILITATOR_RESPONSE,
+                error="facilitator response is not valid JSON",
+                http_status=response.status_code,
+            )
+        if not isinstance(data, dict):
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.INVALID_FACILITATOR_RESPONSE,
+                error="facilitator response must be an object",
+                http_status=response.status_code,
+            )
+
+        if response.status_code >= 400:
+            reason = str(
+                data.get("errorReason")
+                or data.get("error")
+                or data.get("message")
+                or "payment rejected"
+            )[:200]
+            lower = reason.lower()
+            if "nonce" in lower or "replay" in lower or "duplicate" in lower or "conflict" in lower:
+                return FacilitatorSettlementResult(
+                    FacilitatorOutcome.REPLAY_OR_CONFLICT,
+                    error=reason,
+                    http_status=response.status_code,
+                )
+            if response.status_code in {408, 425}:
+                return FacilitatorSettlementResult(
+                    FacilitatorOutcome.AMBIGUOUS, error=reason, http_status=response.status_code
+                )
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.PAYMENT_REJECTED, error=reason, http_status=response.status_code
+            )
+
+        success = data.get("success")
+        if success is not True:
+            reason = str(data.get("errorReason") or data.get("error") or "payment rejected")[:200]
+            lower = reason.lower()
+            outcome = (
+                FacilitatorOutcome.REPLAY_OR_CONFLICT
+                if any(x in lower for x in ("nonce", "replay", "duplicate", "conflict"))
+                else FacilitatorOutcome.PAYMENT_REJECTED
+            )
+            return FacilitatorSettlementResult(
+                outcome, error=reason, http_status=response.status_code
+            )
+        transaction = data.get("transaction") or data.get("txHash") or data.get("transactionHash")
+        if not isinstance(transaction, str) or not transaction:
+            return FacilitatorSettlementResult(
+                FacilitatorOutcome.INVALID_FACILITATOR_RESPONSE,
+                error="success response missing transaction",
+                http_status=response.status_code,
+            )
+        payer = data.get("payer") if isinstance(data.get("payer"), str) else ""
+        return FacilitatorSettlementResult(
+            FacilitatorOutcome.SUCCESS,
+            success=True,
+            transaction=transaction,
+            payer=payer,
+            http_status=response.status_code,
+            retry_safe=False,
+        )
 
 
 class X402Gateway:
-    """Ergonomic aiohttp gateway for x402 paid routes.
-
-    Create via :func:`create_aiohttp_gateway`, then decorate handlers with
-    :meth:`require`::
-
-        gateway = create_aiohttp_gateway("0x...")
-
-        @gateway.require("$0.01")
-        async def my_handler(request):
-            return web.json_response({"ok": True})
-
-    The decorator intercepts requests, checks for x402 payment headers,
-    returns 402 Payment-Required if absent, and settles via Circle Gateway
-    before forwarding to the original handler.
-    """
+    """Canonical aiohttp gateway/decorator for x402 paid routes."""
 
     def __init__(
         self,
         seller_address: str,
-        networks: list[NetworkConfig],
+        networks: list[NetworkConfig | str],
         facilitator_url: str,
         default_description: str,
+        *,
+        public_base_url: str | None = None,
+        allow_http: bool = False,
+        receipt_store: ReceiptStore | None = None,
+        after_settlement: Callable[[web.Request, PaymentResult], Awaitable[None] | None]
+        | None = None,
+        on_settlement_ambiguous: Callable[[web.Request, dict[str, Any]], Awaitable[None] | None]
+        | None = None,
+        on_paid_handler_error: Callable[
+            [web.Request, PaymentResult, BaseException], Awaitable[None] | None
+        ]
+        | None = None,
+        facilitator_client: CircleFacilitatorClient | None = None,
     ) -> None:
-        _validate_address(seller_address)
-        if not networks:
-            raise ValueError("At least one network must be specified")
-
+        _validate_address(seller_address, field_name="seller address")
+        if networks and isinstance(networks[0], str):
+            networks = _resolve_seller_networks(networks)  # type: ignore[arg-type]
+        resolved_networks = networks  # type: ignore[assignment]
+        if not resolved_networks:
+            raise SellerConfigurationError("At least one network must be specified")
         self._seller_address = seller_address
-        self._networks = networks  # list of NetworkConfig
-        self._facilitator_url = facilitator_url
+        self._networks = resolved_networks
+        self._facilitator_url = _validate_facilitator_url(facilitator_url, resolved_networks)
         self._default_description = default_description
-
-        # Pre-index networks by key for fast lookup
-        self._networks_by_key: dict[str, NetworkConfig] = {n.key: n for n in networks}
-
-        # Build default accepts[] entries (one per network)
+        if public_base_url is None:
+            public_base_url = os.environ.get("X402_PUBLIC_BASE_URL", "https://seller.local")
+        self._public_base_url = _validate_public_base_url(public_base_url, allow_http=allow_http)
+        self._allow_http = allow_http
+        self._receipt_store = receipt_store
+        self._after_settlement = after_settlement
+        self._on_settlement_ambiguous = on_settlement_ambiguous
+        self._on_paid_handler_error = on_paid_handler_error
+        self._facilitator_client = facilitator_client or CircleFacilitatorClient(
+            self._facilitator_url
+        )
         self._default_accepts = self._build_accepts(networks, None)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def require(
         self,
-        price: str | Decimal | Callable[..., str | Decimal] | None = None,
+        price: str | Decimal | Callable[[web.Request], str | Decimal] | None = None,
         *,
         networks: list[str] | None = None,
         description: str | None = None,
-    ) -> Callable:
-        """Decorator to protect an aiohttp route with x402 payment.
-
-        Usage::
-
-            @gateway.require("$0.01")
-            async def handler(request): ...
-
-            @gateway.require(
-                price="$0.01",
-                networks=["base", "polygon"],
-                description="Premium data",
-            )
-            async def handler(request): ...
-
-            @gateway.require(
-                price=lambda request: "$0.01",
-            )
-            async def handler(request): ...
-
-        Args:
-            price: Static price string (e.g. ``"$0.01"``), a ``Decimal``, or
-                a callable ``(request) -> str | Decimal`` for dynamic pricing.
-            networks: Override accepted networks for this route.  Must be
-                valid network keys or aliases from the registry.
-            description: Override the default description for this route.
-        """
-        # Validate and resolve per-route network overrides
+        route_id: str | None = None,
+    ) -> Callable[
+        [Callable[[web.Request], Awaitable[web.Response]]],
+        Callable[[web.Request], Awaitable[web.Response]],
+    ]:
         resolved_networks: list[NetworkConfig] | None = None
         if networks is not None:
-            resolved_networks = []
-            for net in networks:
-                try:
-                    nc = get_network(net)
-                except (NetworkNotFoundError, Exception) as e:
-                    raise ValueError(f"Unknown network in require(): {net!r}") from e
-                resolved_networks.append(nc)
-
+            resolved_networks = _resolve_seller_networks(networks)
+        route_accepts = self._build_accepts(resolved_networks, None) if resolved_networks else None
         route_desc = description or self._default_description
 
-        # Pre-build accepts for this route (if networks differ from default)
-        route_accepts: list[dict] | None = None
-        if resolved_networks is not None:
-            route_accepts = self._build_accepts(resolved_networks, None)
-
-        def decorator(handler: Callable) -> Callable:
+        def decorator(
+            handler: Callable[[web.Request], Awaitable[web.Response]],
+        ) -> Callable[[web.Request], Awaitable[web.Response]]:
             return self._wrap_handler(
                 handler,
                 price=price,
                 networks=resolved_networks,
                 accepts=route_accepts,
                 description=route_desc,
+                route_id=route_id,
             )
 
         return decorator
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     def _wrap_handler(
         self,
-        handler: Callable,
-        price: str | Decimal | Callable | None,
+        handler: Callable[[web.Request], Awaitable[web.Response]],
+        price: str | Decimal | Callable[[web.Request], str | Decimal] | None,
         networks: list[NetworkConfig] | None,
-        accepts: list[dict] | None,
+        accepts: list[dict[str, Any]] | None,
         description: str,
-    ) -> Callable:
-        """Wrap an aiohttp handler with x402 payment checking.
-
-        Returns a new async handler that checks for x402 payment headers
-        before forwarding to the original handler.  The original handler
-        is accessible via ``__wrapped_handler__`` on the returned callable.
-        """
+        route_id: str | None = None,
+    ) -> Callable[[web.Request], Awaitable[web.Response]]:
         gateway = self
 
         async def x402_wrapped(request: web.Request) -> web.Response:
@@ -277,6 +688,7 @@ class X402Gateway:
                 networks,
                 accepts,
                 description,
+                route_id=route_id,
             )
 
         x402_wrapped.__wrapped_handler__ = handler  # type: ignore[attr-defined]
@@ -285,247 +697,287 @@ class X402Gateway:
     async def _handle_request(
         self,
         request: web.Request,
-        handler_call: Callable,
-        price_spec: str | Decimal | Callable | None,
+        handler_call: Callable[[web.Request], Awaitable[web.Response]],
+        price_spec: str | Decimal | Callable[[web.Request], str | Decimal] | None,
         networks: list[NetworkConfig] | None,
-        accepts: list[dict] | None,
+        accepts: list[dict[str, Any]] | None,
         description: str,
+        *,
+        route_id: str | None = None,
     ) -> web.Response:
-        """Core request handling: check payment, settle, forward."""
-        # Resolve price (static or dynamic)
-        if callable(price_spec):
-            resolved_price = price_spec(request)
-        elif price_spec is not None:
-            resolved_price = price_spec
-        else:
-            # No price specified — shouldn't happen if require() is used correctly
-            raise ValueError("No price specified for require()")
-
-        # Parse to atomic amount
         try:
-            amount = _parse_price(resolved_price)
-        except (ValueError, TypeError) as e:
-            logger.error("Invalid price for route %s: %s", request.path, e)
-            return web.json_response(
-                {"error": "Server configuration error", "detail": str(e)},
-                status=500,
+            amount = self._resolve_amount(request, price_spec)
+        except (ValueError, TypeError) as exc:
+            logger.error(
+                "Invalid seller price configuration for route %s: %s",
+                getattr(request, "path", ""),
+                exc,
             )
+            return web.json_response({"error": "invalid_seller_price"}, status=500)
 
-        # Determine which networks to use
         route_networks = networks if networks is not None else self._networks
         route_accepts = accepts if accepts is not None else self._default_accepts
-
-        # Check for x402 payment header
+        challenge = self._build_402_body(
+            amount, description, route_networks, route_accepts, request=request
+        )
         payment_header = request.headers.get(PAYMENT_SIGNATURE_HEADER)
-
         if not payment_header:
-            # No payment → return 402
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
+            _log_seller_rejection("payment header missing", "missing Payment-Signature")
+            return self._challenge_response(challenge)
 
-        # Payment header present → decode and settle
         try:
-            raw = base64.b64decode(payment_header).decode()
-            decoded = json.loads(raw)
-        except Exception as e:
-            logger.warning("Invalid payment header: %s", e)
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
+            decoded = _decode_payment_header(payment_header)
+            selected_requirement = self._validate_selected_requirement(
+                decoded, amount, route_networks
             )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
+        except PaymentParsingError as exc:
+            if exc.status == 413:
+                _log_seller_rejection("payload schema rejection", str(exc))
+                return web.json_response({"error": "payment_payload_too_large"}, status=413)
+            stage = (
+                "strict Base64 rejection"
+                if str(exc) == "payment header is not strict base64"
+                else "payload schema rejection"
             )
+            _log_seller_rejection(stage, str(exc))
+            return self._challenge_response(challenge)
+        except ValueError as exc:
+            _log_seller_rejection(_validation_stage_from_error(exc), str(exc))
+            return self._challenge_response(challenge)
 
-        # Extract nested payload (circlekit/x402-header-agent format)
-        inner_payload = decoded.get("payload", {})
-        authorization = inner_payload.get("authorization", {})
-
-        # Fallback: flat format (backward compat)
-        if not authorization:
-            authorization = decoded.get("authorization", {})
-
-        # --- Validate authorization fields before any settlement ---
-        if not authorization:
-            logger.warning("Missing authorization in payment payload")
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
+        payment_fingerprint = _fingerprint(decoded)
+        raw_method = getattr(request, "method", "GET")
+        method = raw_method if isinstance(raw_method, str) else "GET"
+        request_fingerprint = _fingerprint(
+            {
+                "method": method,
+                "resource_url": challenge["resource"]["url"],
+                "amount": amount,
+                "network": selected_requirement["network"],
+            }
+        )
+        route_hint = getattr(request, "match_info", None)
+        route_value = ""
+        if isinstance(route_hint, dict):
+            route_value = str(route_hint.get("route", ""))
+        raw_path = getattr(request, "path", "")
+        path_value = raw_path if isinstance(raw_path, str) else ""
+        effective_route_id = route_id or route_value or path_value
+        begin: ReceiptBeginResult | None = None
+        if self._receipt_store is not None:
+            begin = await self._receipt_store.begin(
+                payment_fingerprint, request_fingerprint, effective_route_id
             )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
+            if begin.action == "conflict":
+                return web.json_response(
+                    {"error": "payment_reused_for_different_request"}, status=409
+                )
+            if begin.action in {"replay", "wait"}:
+                rec = (
+                    begin.record
+                    if begin.action == "replay"
+                    else await self._receipt_store.wait(begin.record)
+                )
+                if rec.state == "completed" and rec.response_status is not None:
+                    return web.Response(
+                        status=rec.response_status,
+                        body=rec.response_body,
+                        headers=rec.response_headers,
+                    )
+                if rec.state == "handler_failed":
+                    return web.json_response(
+                        {"error": "paid_handler_failed", "retry_safe": False}, status=500
+                    )
+                if rec.state == "ambiguous":
+                    return web.json_response(
+                        {"error": "settlement_outcome_unknown", "retry_safe": False}, status=503
+                    )
+                if rec.state == "rejected":
+                    return self._challenge_response(challenge)
+                return web.json_response({"error": "settlement_state_conflict"}, status=409)
 
-        payer = authorization.get("from", "")
-        client_value = str(authorization.get("value", "0"))
-
-        # Determine which network the client claims to pay on.
-        # The accepted-network field in the payload must be CAIP-2.
-        accepted = decoded.get("accepted", {})
-        payload_network = accepted.get("network", "")
-
-        # Validate network is one we accept (CAIP-2 matching)
-        accepted_networks = {n.caip2 for n in route_networks}
-        if payload_network not in accepted_networks:
-            logger.warning(
-                "Payment on unaccepted network %s (accepted: %s)",
-                payload_network,
-                accepted_networks,
-            )
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
-
-        # --- Validate client value matches server-computed amount ---
-        try:
-            client_atomic = int(client_value)
-            server_atomic = int(amount)
-        except (ValueError, TypeError):
-            logger.warning("Malformed authorization value: %s", client_value)
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
-
-        if client_atomic != server_atomic:
-            logger.warning("Underpayment rejected: client=%s server=%s", client_value, amount)
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
-
-        # --- Build settle requirements from SERVER-computed amount ---
-        requirements = self._build_settle_requirements(amount, payload_network, route_networks)
-
-        # Settle via Circle Gateway (skip verify)
+        requirements = self._build_settle_requirements(
+            amount, selected_requirement["network"], route_networks
+        )
         try:
             settle_result = await self._settle(decoded, requirements)
-        except Exception as e:
-            logger.error("Settle failed: %s", e)
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
-            )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
-            return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
-            )
+        except Exception as exc:
+            logger.error("Settle failed: %s", type(exc).__name__)
+            if self._receipt_store is not None:
+                await self._receipt_store.mark_ambiguous(
+                    payment_fingerprint, {"error": type(exc).__name__}
+                )
+            return web.json_response({"error": "facilitator_unavailable"}, status=503)
+        if isinstance(settle_result, dict):
+            settle_result = _coerce_legacy_settle_result(settle_result)
 
-        if not settle_result.get("success"):
-            reason = settle_result.get("errorReason", "unknown")
-            logger.warning("Settlement rejected: %s", reason)
-            body = self._build_402_body(
-                amount, request.path, description, route_networks, route_accepts
+        if settle_result.outcome == FacilitatorOutcome.AMBIGUOUS:
+            if self._receipt_store is not None:
+                await self._receipt_store.mark_ambiguous(
+                    payment_fingerprint, {"error": settle_result.error}
+                )
+            await _maybe_await(
+                self._on_settlement_ambiguous, request, {"error": settle_result.error}
             )
-            encoded = base64.b64encode(json.dumps(body).encode()).decode()
             return web.json_response(
-                body,
-                status=402,
-                headers={PAYMENT_REQUIRED_HEADER: encoded},
+                {"error": "settlement_outcome_unknown", "retry_safe": False}, status=503
             )
+        if settle_result.outcome == FacilitatorOutcome.REPLAY_OR_CONFLICT:
+            if self._receipt_store is not None:
+                await self._receipt_store.mark_ambiguous(
+                    payment_fingerprint, {"error": settle_result.error}
+                )
+            return web.json_response({"error": "payment_replay_or_conflict"}, status=409)
+        if settle_result.outcome in {
+            FacilitatorOutcome.RATE_LIMITED,
+            FacilitatorOutcome.FACILITATOR_UNAVAILABLE,
+            FacilitatorOutcome.INVALID_FACILITATOR_RESPONSE,
+        }:
+            if self._receipt_store is not None:
+                await self._receipt_store.mark_ambiguous(
+                    payment_fingerprint, {"error": settle_result.error}
+                )
+            return web.json_response(
+                {"error": "facilitator_unavailable"},
+                status=503
+                if settle_result.outcome != FacilitatorOutcome.INVALID_FACILITATOR_RESPONSE
+                else 502,
+            )
+        if not settle_result.success:
+            _log_seller_rejection("facilitator rejection", settle_result.error)
+            if self._receipt_store is not None:
+                await self._receipt_store.mark_rejected(payment_fingerprint, settle_result.error)
+            return self._challenge_response(challenge)
 
-        # Payment succeeded — use server-computed amount in result
-        transaction = settle_result.get("transaction", "")
+        authorization = decoded["payload"]["authorization"]
+        payer = settle_result.payer or authorization.get("from", "")
         result = PaymentResult(
             payer=payer,
             amount=amount,
-            network=payload_network,
-            transaction=transaction,
+            network=selected_requirement["network"],
+            transaction=settle_result.transaction,
         )
-
-        # Store on request and set context for tools
         request["x402_payment"] = result
-        set_payment_context(
-            payer=payer,
-            amount=amount,
-            network=payload_network,
-            transaction=transaction,
+        if self._receipt_store is not None:
+            await self._receipt_store.mark_settled(
+                payment_fingerprint,
+                {
+                    "transaction": result.transaction,
+                    "payer": result.payer,
+                    "network": result.network,
+                },
+            )
+        await _maybe_await(self._after_settlement, request, result)
+
+        token = set_payment_context_token(
+            payer=result.payer,
+            amount=result.amount,
+            network=result.network,
+            transaction=result.transaction,
         )
+        try:
+            response = await handler_call(request)
+        except Exception as exc:
+            if self._receipt_store is not None:
+                await self._receipt_store.mark_handler_failed(payment_fingerprint)
+            await _maybe_await(self._on_paid_handler_error, request, result, exc)
+            logger.error("Paid handler failed after settlement: %s", type(exc).__name__)
+            return web.json_response(
+                {"error": "paid_handler_failed", "retry_safe": False}, status=500
+            )
+        finally:
+            reset_payment_context(token)
 
-        logger.info("Payment settled: %s USDC by %s tx=%s", amount, payer, transaction)
-
-        # Forward to the original handler
-        response = await handler_call(request)
-        # Add Payment-Response header after successful settlement
         if isinstance(response, web.Response):
-            response.headers[PAYMENT_RESPONSE_HEADER] = base64.b64encode(
-                json.dumps({"transaction": transaction, "network": payload_network}).encode()
-            ).decode()
+            response.headers[PAYMENT_RESPONSE_HEADER] = _b64_json(
+                {
+                    "success": True,
+                    "transaction": result.transaction or "",
+                    "network": result.network,
+                    "payer": result.payer,
+                }
+            )
+        if self._receipt_store is not None:
+            body = getattr(response, "body", None)
+            await self._receipt_store.mark_completed(
+                payment_fingerprint,
+                response_status=response.status,
+                response_headers=response.headers,
+                response_body=body if isinstance(body, bytes) else None,
+            )
         return response
 
-    def _build_accepts(
+    def _resolve_amount(
         self,
-        networks: list[NetworkConfig],
-        override_amount: str | None,
-    ) -> list[dict]:
-        """Build the accepts[] array for the 402 response."""
-        accepts = []
-        for net in networks:
-            entry: dict[str, Any] = {
-                "scheme": CIRCLE_BATCHING_SCHEME,
-                "network": net.caip2,
-                "asset": net.usdc_address,
-                "amount": override_amount or "0",
-                "payTo": self._seller_address,
-                "maxTimeoutSeconds": DEFAULT_MAX_TIMEOUT_SECONDS,
-                "extra": {
-                    "name": CIRCLE_BATCHING_NAME,
-                    "version": CIRCLE_BATCHING_VERSION,
-                    "verifyingContract": net.gateway_wallet,
-                },
-            }
-            accepts.append(entry)
+        request: web.Request,
+        price_spec: str | Decimal | Callable[[web.Request], str | Decimal] | None,
+    ) -> str:
+        if callable(price_spec):
+            return _parse_price(price_spec(request))
+        if price_spec is None:
+            raise ValueError("No price specified for require()")
+        return _parse_price(price_spec)
+
+    def _build_accepts(
+        self, networks: list[NetworkConfig] | None, override_amount: str | None
+    ) -> list[dict[str, Any]]:
+        accepts: list[dict[str, Any]] = []
+        for net in networks or []:
+            accepts.append(
+                {
+                    "scheme": CIRCLE_BATCHING_SCHEME,
+                    "network": net.caip2,
+                    "asset": net.usdc_address,
+                    "amount": override_amount or "0",
+                    "payTo": self._seller_address,
+                    "maxTimeoutSeconds": DEFAULT_MAX_TIMEOUT_SECONDS,
+                    "extra": {
+                        "name": CIRCLE_BATCHING_NAME,
+                        "version": CIRCLE_BATCHING_VERSION,
+                        "verifyingContract": net.gateway_wallet,
+                    },
+                }
+            )
         return accepts
 
     def _build_402_body(
         self,
         amount: str,
-        path: str,
-        description: str,
-        networks: list[NetworkConfig],
-        accepts: list[dict] | None = None,
+        description_or_path: str,
+        networks_or_description: list[NetworkConfig] | str,
+        accepts_or_networks: list[dict[str, Any]] | list[NetworkConfig] | None = None,
+        *,
+        request: web.Request | None = None,
+        path: str | None = None,
     ) -> dict[str, Any]:
-        """Build the full 402 x402-v2 response body."""
-        if accepts is None:
-            accepts = self._build_accepts(networks, amount)
+        """Build x402 v2 challenge body.
+
+        Supports the old private signature ``(amount, path, description,
+        networks, accepts=None)`` sufficiently for compatibility tests and the
+        new canonical call shape used by this class.
+        """
+        if isinstance(networks_or_description, str):
+            path = description_or_path
+            description = networks_or_description
+            networks = (
+                accepts_or_networks if isinstance(accepts_or_networks, list) else self._networks
+            )
+            accepts = self._build_accepts(networks, amount)  # type: ignore[arg-type]
         else:
-            # Deep copy accepts to avoid mutating shared dicts between requests
-            accepts = copy.deepcopy(accepts)
+            description = description_or_path
+            networks = networks_or_description
+            accepts = (
+                copy.deepcopy(accepts_or_networks)
+                if accepts_or_networks is not None
+                else self._build_accepts(networks, amount)
+            )  # type: ignore[arg-type]
             for entry in accepts:
                 entry["amount"] = amount
-
+        resource_url = _build_resource_url(self._public_base_url, request=request, path=path)
         return {
             "x402Version": X402_VERSION,
             "resource": {
-                "url": path,
+                "url": resource_url,
                 "description": description,
                 "mimeType": "application/json",
             },
@@ -533,58 +985,148 @@ class X402Gateway:
         }
 
     def _build_settle_requirements(
-        self,
-        amount: str,
-        network: str,
-        networks: list[NetworkConfig],
+        self, amount: str, network: str, networks: list[NetworkConfig]
     ) -> dict[str, Any]:
-        """Build payment requirements for Circle Gateway settle()."""
-        # Find the NetworkConfig for this network (CAIP-2 matching)
-        nc = None
-        for n in networks:
-            if n.caip2 == network:
-                nc = n
-                break
-        if nc is None:
-            raise ValueError(f"Network {network!r} not in accepted networks")
+        for net in networks:
+            if net.caip2 == network:
+                return {
+                    "scheme": CIRCLE_BATCHING_SCHEME,
+                    "network": net.caip2,
+                    "asset": net.usdc_address,
+                    "amount": amount,
+                    "payTo": self._seller_address,
+                    "maxTimeoutSeconds": DEFAULT_MAX_TIMEOUT_SECONDS,
+                    "extra": {
+                        "name": CIRCLE_BATCHING_NAME,
+                        "version": CIRCLE_BATCHING_VERSION,
+                        "verifyingContract": net.gateway_wallet,
+                    },
+                }
+        raise ValueError(f"Network {network!r} not in accepted networks")
 
-        return {
-            "scheme": CIRCLE_BATCHING_SCHEME,
-            "network": network,
-            "asset": nc.usdc_address,
-            "amount": amount,
-            "payTo": self._seller_address,
-            "maxTimeoutSeconds": DEFAULT_MAX_TIMEOUT_SECONDS,
-            "extra": {
-                "name": CIRCLE_BATCHING_NAME,
-                "version": CIRCLE_BATCHING_VERSION,
-                "verifyingContract": nc.gateway_wallet,
-            },
-        }
+    def _validate_selected_requirement(
+        self, decoded: dict[str, Any], amount: str, networks: list[NetworkConfig]
+    ) -> dict[str, Any]:
+        if decoded.get("x402Version") != X402_VERSION:
+            raise ValueError("wrong x402Version")
+        accepted = decoded["accepted"]
+        authorization = decoded["payload"]["authorization"]
+        signature = decoded["payload"].get("signature")
+        if not isinstance(signature, str) or not signature:
+            raise ValueError("missing signature")
+        if not isinstance(authorization.get("value"), (str, int)):
+            raise ValueError("invalid authorization value")
+        if str(authorization.get("value")) != amount:
+            raise ValueError("wrong amount")
+        payer = authorization.get("from")
+        _validate_address(payer, field_name="payer")
 
-    async def _settle(self, payload: dict, requirements: dict) -> dict:
-        """Call Circle Gateway settle() endpoint directly (skip verify).
-
-        Delegates to the same endpoint as X402SellerMiddleware._settle().
-        """
-        settle_url = f"{self._facilitator_url}/v1/x402/settle"
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                settle_url,
-                json={
-                    "paymentPayload": payload,
-                    "paymentRequirements": requirements,
-                },
-                headers={"Content-Type": "application/json"},
+        expected = self._build_settle_requirements(
+            str(amount), str(accepted.get("network", "")), networks
+        )
+        for key in ("scheme", "network", "asset", "amount", "payTo"):
+            if accepted.get(key) != expected.get(key):
+                raise ValueError(f"wrong {key}")
+        buyer_timeout = _validate_buyer_timeout(
+            accepted.get("maxTimeoutSeconds"), expected["maxTimeoutSeconds"]
+        )
+        if buyer_timeout != expected["maxTimeoutSeconds"]:
+            _log_timeout_compatibility(
+                buyer_max_timeout_seconds=buyer_timeout,
+                server_max_timeout_seconds=expected["maxTimeoutSeconds"],
             )
-            resp.raise_for_status()
-            return resp.json()
+        extra = accepted.get("extra")
+        if not isinstance(extra, dict):
+            raise ValueError("missing accepted extra")
+        expected_extra = expected["extra"]
+        for key in ("name", "version", "verifyingContract"):
+            if extra.get(key) != expected_extra.get(key):
+                raise ValueError(f"wrong extra.{key}")
+        _validate_address(accepted["asset"], field_name="asset")
+        _validate_address(accepted["payTo"], field_name="payTo")
+        _validate_address(extra["verifyingContract"], field_name="verifyingContract")
+        return accepted
+
+    async def _settle(
+        self, payload: dict[str, Any], requirements: dict[str, Any]
+    ) -> FacilitatorSettlementResult:
+        return await self._facilitator_client.settle(payload, requirements)
+
+    def _challenge_response(self, body: dict[str, Any]) -> web.Response:
+        return web.json_response(
+            body, status=402, headers={PAYMENT_REQUIRED_HEADER: _b64_json(body)}
+        )
 
 
-# ---------------------------------------------------------------------------
-# Public factory
-# ---------------------------------------------------------------------------
+async def _maybe_await(fn: Callable[..., Awaitable[None] | None] | None, *args: Any) -> None:
+    if fn is None:
+        return
+    result = fn(*args)
+    if hasattr(result, "__await__"):
+        await result  # type: ignore[misc]
+
+
+def _coerce_legacy_settle_result(value: dict[str, Any]) -> FacilitatorSettlementResult:
+    if value.get("success") is True:
+        tx = value.get("transaction") or value.get("txHash") or value.get("transactionHash") or ""
+        return FacilitatorSettlementResult(
+            FacilitatorOutcome.SUCCESS,
+            success=True,
+            transaction=str(tx),
+            payer=str(value.get("payer") or ""),
+        )
+    reason = str(value.get("errorReason") or value.get("error") or "payment rejected")
+    lower = reason.lower()
+    if any(term in lower for term in ("nonce", "replay", "duplicate", "conflict")):
+        return FacilitatorSettlementResult(FacilitatorOutcome.REPLAY_OR_CONFLICT, error=reason)
+    return FacilitatorSettlementResult(FacilitatorOutcome.PAYMENT_REJECTED, error=reason)
+
+
+def _validate_public_base_url(value: str, *, allow_http: bool) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SellerConfigurationError("X402_PUBLIC_BASE_URL is required for seller mode")
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+        raise SellerConfigurationError("X402_PUBLIC_BASE_URL must be an absolute URL")
+    if parsed.scheme != "https" and not allow_http:
+        raise SellerConfigurationError("X402_PUBLIC_BASE_URL must use HTTPS unless allow_http=True")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _validate_facilitator_url(value: str, networks: list[NetworkConfig]) -> str:
+    parsed = urlsplit(value.rstrip("/"))
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise SellerConfigurationError("facilitator_url must be an HTTPS absolute URL")
+    envs = {n.environment for n in networks}
+    if len(envs) != 1:
+        raise SellerConfigurationError("Cannot mix mainnet and testnet seller networks")
+    normalized = value.rstrip("/")
+    if envs == {"testnet"} and normalized == _MAINNET_FACILITATOR:
+        raise SellerConfigurationError("testnet seller networks must not use mainnet facilitator")
+    if envs == {"mainnet"} and normalized == _TESTNET_FACILITATOR:
+        raise SellerConfigurationError("mainnet seller networks must not use testnet facilitator")
+    return normalized
+
+
+def _resolve_seller_networks(networks: list[str] | None) -> list[NetworkConfig]:
+    if networks is None:
+        networks = ["arcTestnet"]
+    resolved: list[NetworkConfig] = []
+    environments: set[str] = set()
+    for net in networks:
+        try:
+            cfg = get_network(net)
+        except NetworkNotFoundError as exc:
+            raise SellerConfigurationError(f"Unknown network: {net!r}") from exc
+        if cfg.key != "arcTestnet" or not cfg.seller_supported:
+            raise SellerConfigurationError(f"Network {net!r} is not supported for seller mode")
+        if not cfg.gateway_supported or not cfg.usdc_address or not cfg.gateway_wallet:
+            raise SellerConfigurationError(f"Network {net!r} has incomplete seller constants")
+        environments.add(cfg.environment)
+        resolved.append(cfg)
+    if len(environments) > 1:
+        raise SellerConfigurationError("Cannot mix networks from different environments")
+    return resolved
 
 
 def create_aiohttp_gateway(
@@ -592,67 +1134,39 @@ def create_aiohttp_gateway(
     networks: list[str] | None = None,
     facilitator_url: str | None = None,
     default_description: str = "Paid resource",
+    *,
+    public_base_url: str | None = None,
+    allow_http: bool = False,
+    receipt_store: ReceiptStore | None = None,
+    after_settlement: Callable[[web.Request, PaymentResult], Awaitable[None] | None] | None = None,
+    on_settlement_ambiguous: Callable[[web.Request, dict[str, Any]], Awaitable[None] | None]
+    | None = None,
+    on_paid_handler_error: Callable[
+        [web.Request, PaymentResult, BaseException], Awaitable[None] | None
+    ]
+    | None = None,
+    facilitator_client: CircleFacilitatorClient | None = None,
 ) -> X402Gateway:
-    """Create an ergonomic x402 gateway for aiohttp routes.
+    """Create the canonical aiohttp x402 seller gateway.
 
-    Args:
-        seller_address: PayTo address.  Must be ``0x`` + 40 hex characters.
-        networks: Network keys or aliases (e.g. ``["base", "polygon"]``).
-            If ``None``, defaults to ``["base"]``.
-        facilitator_url: Circle Gateway facilitator URL.  If ``None``,
-            resolved from the first network's registry entry.
-        default_description: Default description for the 402 response body.
-
-    Returns:
-        An :class:`X402Gateway` instance whose :meth:`require` decorator
-        protects aiohttp route handlers.
-
-    Example::
-
-        gateway = create_aiohttp_gateway(
-            seller_address="0x1234...abcd",
-            networks=["base", "polygon"],
-        )
-
-        @gateway.require("$0.01")
-        async def premium_data(request):
-            return web.json_response({"data": "secret"})
+    Defaults to Arc Testnet.  Seller mode intentionally rejects unsupported or
+    unverified networks instead of silently falling back to mainnet.
     """
-    _validate_address(seller_address)
-
-    # Resolve networks from registry
-    if networks is None:
-        networks = ["base"]
-
-    resolved: list[NetworkConfig] = []
-    environments: set[str] = set()
-    for net in networks:
-        try:
-            nc = get_network(net)
-        except (NetworkNotFoundError, Exception) as e:
-            raise ValueError(f"Unknown network: {net!r}") from e
-        if not nc.seller_supported:
-            raise ValueError(
-                f"Network {net!r} is not supported for seller mode "
-                f"(seller_supported=False). Use an Arc Testnet network."
-            )
-        environments.add(nc.environment)
-        resolved.append(nc)
-
-    # Reject mixed mainnet/testnet configurations
-    if len(environments) > 1:
-        raise ValueError(
-            f"Cannot mix networks from different environments: {environments}. "
-            "Use either all mainnets or all testnets."
-        )
-
-    # Resolve facilitator URL from first network if not provided
+    resolved = _resolve_seller_networks(networks)
     if facilitator_url is None:
         facilitator_url = resolved[0].facilitator_url
-
+    if public_base_url is None:
+        public_base_url = os.environ.get("X402_PUBLIC_BASE_URL", "https://seller.local")
     return X402Gateway(
         seller_address=seller_address,
         networks=resolved,
         facilitator_url=facilitator_url,
         default_description=default_description,
+        public_base_url=public_base_url,
+        allow_http=allow_http,
+        receipt_store=receipt_store,
+        after_settlement=after_settlement,
+        on_settlement_ambiguous=on_settlement_ambiguous,
+        on_paid_handler_error=on_paid_handler_error,
+        facilitator_client=facilitator_client,
     )

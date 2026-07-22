@@ -12,6 +12,37 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _clear_runtime_x402_env(monkeypatch):
+    """Keep local operator env from changing deterministic unit tests."""
+    for name in (
+        "X402_ALLOW_CHAT_OTP",
+        "X402_ALLOW_HTTP",
+        "X402_BUYER_BACKEND",
+        "X402_DAILY_BUDGET_USDC",
+        "X402_DISCOVERY_HOST_ALLOWLIST",
+        "X402_DISCOVERY_PROVIDERS",
+        "X402_HOST_ALLOWLIST",
+        "X402_MAX_USDC_PER_PAYMENT",
+        "X402_NETWORK_POLICY",
+        "X402_NETWORK_PREFERENCE",
+        "X402_REQUIRE_APPROVAL_FOR_NEW_HOST",
+        "X402_REQUIRE_GATEWAY_BATCHING",
+        "X402_ROLE",
+        "X402_SELLER_ADDRESS",
+        "CIRCLE_AGENT_WALLET_ADDRESS",
+        "CIRCLE_AGENT_WALLET_NETWORK",
+        "CIRCLE_CLI_CWD",
+        "CIRCLE_CLI_EXECUTABLE",
+        "CIRCLE_DCW_BLOCKCHAIN",
+        "CIRCLE_DCW_WALLET_ADDRESS",
+        "CIRCLE_DCW_WALLET_ID",
+        "CIRCLE_ENTITY_SECRET",
+        "CIRCLE_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _mock_dns_validation():
     """Mock DNS validation to succeed for all tests by default.
 

@@ -1,12 +1,4 @@
-"""ContextVar bridge for x402 payment context propagation.
-
-When the seller middleware verifies a payment, the payment proof (payer, amount,
-network, transaction) is stored in a ContextVar. Tools executing later can read
-this to know who paid and how much — without passing the request object around.
-
-This solves the critical gap: aiohttp middleware runs before the handler, but
-Hermes tools execute in a separate context. ContextVars bridge the two.
-"""
+"""ContextVar bridge for x402 payment context propagation."""
 
 from __future__ import annotations
 
@@ -17,7 +9,7 @@ from typing import Optional
 
 @dataclass
 class PaymentContext:
-    """Payment context propagated from middleware to tools."""
+    """Payment context propagated from seller middleware to protected handlers/tools."""
 
     payer: str
     amount: str
@@ -25,7 +17,6 @@ class PaymentContext:
     transaction: Optional[str] = None
 
 
-# ContextVar — survives across async boundaries
 _PAYMENT_CONTEXT: contextvars.ContextVar[Optional[PaymentContext]] = contextvars.ContextVar(
     "hermes_x402_payment_context", default=None
 )
@@ -37,34 +28,45 @@ def set_payment_context(
     network: str,
     transaction: Optional[str] = None,
 ) -> PaymentContext:
-    """Set the current payment context (called by seller middleware)."""
+    """Set the current payment context and return the value.
+
+    Backward-compatible helper for callers that do not need token-based reset.
+    Request handlers should prefer :func:`set_payment_context_token` and reset
+    the returned token in a ``finally`` block.
+    """
     ctx = PaymentContext(payer=payer, amount=amount, network=network, transaction=transaction)
     _PAYMENT_CONTEXT.set(ctx)
     return ctx
 
 
+def set_payment_context_token(
+    payer: str,
+    amount: str,
+    network: str,
+    transaction: Optional[str] = None,
+) -> contextvars.Token[Optional[PaymentContext]]:
+    """Set payment context and return the ContextVar token for safe reset."""
+    ctx = PaymentContext(payer=payer, amount=amount, network=network, transaction=transaction)
+    return _PAYMENT_CONTEXT.set(ctx)
+
+
+def reset_payment_context(token: contextvars.Token[Optional[PaymentContext]]) -> None:
+    """Reset payment context using a token returned by set_payment_context_token()."""
+    _PAYMENT_CONTEXT.reset(token)
+
+
 def get_payment_context() -> Optional[PaymentContext]:
-    """Get the current payment context (called by buyer tools)."""
+    """Get the current payment context."""
     return _PAYMENT_CONTEXT.get()
 
 
 def clear_payment_context() -> None:
-    """Clear the current payment context."""
+    """Clear the current payment context without token restoration."""
     _PAYMENT_CONTEXT.set(None)
 
 
 class X402ContextBridge:
-    """Manages payment context lifecycle for a request.
-
-    Usage in middleware:
-        bridge = X402ContextBridge()
-        bridge.set(payer="0x...", amount="10000", network="eip155:5042002")
-
-    Usage in tool:
-        ctx = X402ContextBridge.current()
-        if ctx:
-            print(f"Paid by {ctx.payer}")
-    """
+    """Compatibility wrapper around the payment ContextVar."""
 
     @staticmethod
     def set(

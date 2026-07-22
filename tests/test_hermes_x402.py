@@ -65,8 +65,8 @@ def challenge(amount: str = "10000") -> dict[str, Any]:
                 "scheme": "exact",
                 "network": "eip155:5042002",
                 "amount": amount,
-                "payTo": "0xSeller",
-                "maxTimeoutSeconds": 604900,
+                "payTo": "0x" + "ab" * 20,
+                "maxTimeoutSeconds": 2592000,
                 "extra": {
                     "name": "GatewayWalletBatched",
                     "version": "1",
@@ -93,7 +93,7 @@ class TestConfig:
             "CIRCLE_AGENT_WALLET_NETWORK",
         ):
             monkeypatch.delenv(key, raising=False)
-        monkeypatch.setenv("X402_SELLER_ADDRESS", "0xSeller")
+        monkeypatch.setenv("X402_SELLER_ADDRESS", "0x" + "ab" * 20)
         monkeypatch.setenv("CIRCLE_DCW_WALLET_ID", "wallet-123")
         monkeypatch.setenv("CIRCLE_DCW_WALLET_ADDRESS", "0xBuyer")
         monkeypatch.setenv("CIRCLE_ENTITY_SECRET", "secret-abc")
@@ -105,7 +105,7 @@ class TestConfig:
     def test_roles_validate_expected_requirements(self, role):
         kwargs: dict[str, Any] = {"role": role}
         if role in {"seller", "dual"}:
-            kwargs["seller_address"] = "0xSeller"
+            kwargs["seller_address"] = "0x" + "ab" * 20
         if role in {"buyer", "dual"}:
             kwargs.update(
                 buyer_backend="dcw",
@@ -117,7 +117,9 @@ class TestConfig:
 
     def test_seller_rejects_buyer_configuration(self):
         with pytest.raises(BuyerConfigurationError):
-            X402Config(role="seller", seller_address="0xSeller", buyer_backend="dcw").validate()
+            X402Config(
+                role="seller", seller_address="0x" + "ab" * 20, buyer_backend="dcw"
+            ).validate()
 
     def test_buyer_requires_explicit_backend(self):
         with pytest.raises(BuyerConfigurationError):
@@ -141,14 +143,14 @@ class TestConfig:
 
     def test_legacy_agent_from_config_warns_and_constructs_dual_agent(self):
         config = X402Config(
-            seller_address="0xSeller",
+            seller_address="0x" + "ab" * 20,
             wallet_id="id",
             wallet_address="0xBuyer",
             entity_secret="0" * 64,
         )
         with pytest.warns(DeprecationWarning, match="legacy"):
             agent = X402HermesAgent.from_config(config)
-        assert agent.seller.seller_address == "0xSeller"
+        assert agent.seller.seller_address == "0x" + "ab" * 20
         assert agent.buyer.wallet_address == "0xBuyer"
 
     def test_explicit_dual_dcw_agent_from_config_succeeds(self):
@@ -156,7 +158,7 @@ class TestConfig:
             X402Config(
                 role="dual",
                 buyer_backend="dcw",
-                seller_address="0xSeller",
+                seller_address="0x" + "ab" * 20,
                 wallet_id="id",
                 wallet_address="0xBuyer",
                 entity_secret="0" * 64,
@@ -166,7 +168,7 @@ class TestConfig:
 
     @pytest.mark.parametrize("role", ["seller", "buyer"])
     def test_agent_from_config_rejects_non_dual_explicit_roles(self, role: str):
-        kwargs: dict[str, Any] = {"role": role, "seller_address": "0xSeller"}
+        kwargs: dict[str, Any] = {"role": role, "seller_address": "0x" + "ab" * 20}
         if role == "buyer":
             kwargs.update(
                 buyer_backend="dcw",
@@ -191,7 +193,7 @@ class TestContextAndSeller:
         assert get_payment_context() is None
 
     def test_seller_wire_format_unchanged(self):
-        middleware = X402SellerMiddleware(seller_address="0xSeller")
+        middleware = X402SellerMiddleware(seller_address="0x" + "ab" * 20)
         response = middleware._build_402_response("10000", "/api/test")
         assert response["status"] == 402
         assert response["body"]["x402Version"] == 2
@@ -410,8 +412,8 @@ class TestPublicApiAndDualRole:
         backend = CircleDcwBuyerBackend(
             wallet_id="id", wallet_address="0xBuyer", entity_secret="a" * 64
         )
-        agent = X402HermesAgent(seller_address="0xSeller", buyer_backend=backend)
-        assert agent.seller.seller_address == "0xSeller"
+        agent = X402HermesAgent(seller_address="0x" + "ab" * 20, buyer_backend=backend)
+        assert agent.seller.seller_address == "0x" + "ab" * 20
         assert agent.buyer.wallet_address == "0xBuyer"
         assert "a" * 64 not in repr(agent.buyer.backend)
         with pytest.raises(BuyerConfigurationError):
