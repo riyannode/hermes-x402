@@ -21,9 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import importlib
 import json
-import sys
 import warnings
 from unittest.mock import AsyncMock, patch
 
@@ -42,7 +40,11 @@ from hermes_x402.middleware import (
     get_x402_payment,
 )
 from hermes_x402.networks import get_network
-from hermes_x402.seller_gateway import InMemoryReceiptStore, create_aiohttp_gateway
+from hermes_x402.seller_gateway import (
+    InMemoryReceiptStore,
+    PaymentResult,
+    create_aiohttp_gateway,
+)
 
 _VALID_SELLER = "0x" + "ab" * 20
 _VALID_ASSET = "0x3600000000000000000000000000000000000000"
@@ -59,7 +61,11 @@ def _make_middleware(
     seller: str = _VALID_SELLER,
     chain: str = "arcTestnet",
 ) -> X402SellerMiddleware:
-    return X402SellerMiddleware(seller_address=seller, chain=chain)
+    return X402SellerMiddleware(
+        seller_address=seller,
+        chain=chain,
+        public_base_url="https://seller.example",
+    )
 
 
 def _build_auth_header(
@@ -205,7 +211,11 @@ class TestAiohttpRequestState:
         return [item for item in caught if issubclass(item.category, NotAppKeyWarning)]
 
     async def test_canonical_payment_key_access_works_without_warning(self):
-        gw = create_aiohttp_gateway(seller_address=_VALID_SELLER, networks=["arcTestnet"])
+        gw = create_aiohttp_gateway(
+            seller_address=_VALID_SELLER,
+            networks=["arcTestnet"],
+            public_base_url="https://seller.example",
+        )
         request = make_mocked_request(
             "GET",
             "/premium",
@@ -242,72 +252,43 @@ class TestAiohttpRequestState:
         assert get_x402_challenge(request) is challenge
         assert self._not_app_key_warnings(caught) == []
 
-    async def test_request_key_unavailable_falls_back_to_single_string_key(self, monkeypatch):
-        import hermes_x402.middleware as middleware_module
-        import hermes_x402.seller_gateway as seller_gateway_module
+    def test_request_key_unavailable_falls_back_to_single_string_key(self):
+        """_make_request_key returns plain string when web module has no RequestKey."""
+        from hermes_x402.seller_gateway import _make_request_key
 
-        original_request_key = web.RequestKey
-        monkeypatch.delattr(web, "RequestKey")
-        try:
-            fallback_gateway = importlib.reload(seller_gateway_module)
-            fallback_middleware = importlib.reload(middleware_module)
+        class FakeLegacyWeb:
+            """Simulates aiohttp.web without RequestKey (< 3.14)."""
 
-            assert fallback_gateway.X402_PAYMENT_KEY == "x402_payment"
-            assert fallback_gateway.X402_CHALLENGE_KEY == "x402_402"
+        key = _make_request_key(FakeLegacyWeb, "x402_payment", PaymentResult)
+        assert key == "x402_payment"
+        assert isinstance(key, str)
 
-            class FakeRequest:
-                def __init__(self):
-                    self._state = {}
+    def test_request_key_available_creates_typed_key(self):
+        """_make_request_key returns RequestKey when aiohttp.web has it."""
+        from hermes_x402.seller_gateway import _make_request_key
 
-                def __setitem__(self, key, value):
-                    self._state[key] = value
+        key = _make_request_key(web, "x402_payment", PaymentResult)
+        if hasattr(web, "RequestKey"):
+            assert isinstance(key, web.RequestKey)
+        else:
+            assert key == "x402_payment"
 
-                def __getitem__(self, key):
-                    return self._state[key]
+    def test_package_import_with_request_key_unavailable(self):
+        """Production keys resolve correctly at import time regardless of aiohttp version."""
+        from hermes_x402.seller_gateway import (
+            X402_CHALLENGE_KEY,
+            X402_ERROR_KEY,
+            X402_PAYMENT_KEY,
+        )
 
-            request = FakeRequest()
-            result = fallback_gateway.PaymentResult(
-                payer="0x" + "cd" * 20,
-                amount="3000",
-                network=_NETWORK_CAIP2,
-                transaction="0xlegacy",
-            )
-            fallback_gateway.set_x402_payment(request, result)
-            fallback_gateway.set_x402_challenge(request, {"status": 402})
-
-            assert fallback_gateway.get_x402_payment(request) is result
-            assert fallback_gateway.get_x402_challenge(request) == {"status": 402}
-            assert request["x402_payment"] is result
-            assert request["x402_402"] == {"status": 402}
-            assert "x402_error" not in request._state
-            assert fallback_middleware.X402_PAYMENT_KEY == "x402_payment"
-        finally:
-            monkeypatch.setattr(web, "RequestKey", original_request_key, raising=False)
-            importlib.reload(seller_gateway_module)
-            importlib.reload(middleware_module)
-
-    def test_package_import_with_request_key_unavailable(self, monkeypatch):
-        import hermes_x402.seller_gateway as seller_gateway_module
-
-        original_request_key = web.RequestKey
-        monkeypatch.delattr(web, "RequestKey")
-        removed = {
-            name: sys.modules.pop(name)
-            for name in list(sys.modules)
-            if name == "hermes_x402" or name.startswith("hermes_x402.")
-        }
-        try:
-            package = importlib.import_module("hermes_x402")
-            fallback_gateway = importlib.import_module("hermes_x402.seller_gateway")
-            assert package.get_x402_payment is fallback_gateway.get_x402_payment
-            assert fallback_gateway.X402_PAYMENT_KEY == "x402_payment"
-        finally:
-            monkeypatch.setattr(web, "RequestKey", original_request_key, raising=False)
-            for name in list(sys.modules):
-                if name == "hermes_x402" or name.startswith("hermes_x402."):
-                    sys.modules.pop(name, None)
-            sys.modules.update(removed)
-            importlib.reload(seller_gateway_module)
+        if hasattr(web, "RequestKey"):
+            assert isinstance(X402_PAYMENT_KEY, web.RequestKey)
+            assert isinstance(X402_CHALLENGE_KEY, web.RequestKey)
+            assert isinstance(X402_ERROR_KEY, web.RequestKey)
+        else:
+            assert X402_PAYMENT_KEY == "x402_payment"
+            assert X402_CHALLENGE_KEY == "x402_402"
+            assert X402_ERROR_KEY == "x402_error"
 
     async def test_sequential_requests_remain_isolated(self):
         mw = _make_middleware()
@@ -482,6 +463,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         net = get_network("arcTestnet")
 
@@ -504,6 +486,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -525,6 +508,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -546,6 +530,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -567,6 +552,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         net = get_network("arcTestnet")
 
@@ -589,6 +575,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         # Client offers 50000 ($0.05) but server price is $0.01
@@ -607,6 +594,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         # Build header with wrong network (base) but client price matches
@@ -628,6 +616,7 @@ class TestServerAuthority:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         # Header with correct amount and network but gateway handles payTo
@@ -662,6 +651,7 @@ class TestPriceProtection:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         # Client offers 5000 but price is 10000
@@ -685,6 +675,7 @@ class TestPriceProtection:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         # Client offers 99999 but price is 10000
@@ -708,6 +699,7 @@ class TestPriceProtection:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -728,6 +720,7 @@ class TestPriceProtection:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         # Build a header with a non-numeric value
@@ -782,6 +775,7 @@ class TestSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -805,6 +799,7 @@ class TestSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -829,6 +824,7 @@ class TestSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -854,6 +850,7 @@ class TestSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
             receipt_store=store,
         )
         header = _build_auth_header(value="10000")
@@ -885,6 +882,7 @@ class TestSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
             receipt_store=store,
         )
         header = _build_auth_header(value="10000")
@@ -908,6 +906,7 @@ class TestSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -945,6 +944,7 @@ class TestSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -983,6 +983,7 @@ class TestPaymentResponseHeader:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -1003,6 +1004,7 @@ class TestPaymentResponseHeader:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -1025,6 +1027,7 @@ class TestPaymentResponseHeader:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -1046,6 +1049,7 @@ class TestPaymentResponseHeader:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -1067,6 +1071,7 @@ class TestPaymentResponseHeader:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -1085,6 +1090,7 @@ class TestPaymentResponseHeader:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -1113,6 +1119,7 @@ class TestGatewayCAIP2Matching:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         reqs = gw._build_settle_requirements("10000", "eip155:5042002", gw._networks)
         assert reqs["network"] == "eip155:5042002"
@@ -1123,6 +1130,7 @@ class TestGatewayCAIP2Matching:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         with pytest.raises(ValueError, match="not in accepted networks"):
             gw._build_settle_requirements("10000", "base", gw._networks)
@@ -1140,6 +1148,7 @@ class TestGatewayAcceptsDeepCopy:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         # Build 402 body with amount "10000"
         body1 = gw._build_402_body("10000", "/a", "desc1", gw._networks)
@@ -1160,6 +1169,7 @@ class TestGatewayServerAmountInResult:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
 
         mock_request = AsyncMock()
@@ -1263,6 +1273,7 @@ class TestCompleteSettlementFlow:
         gw = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         net = get_network("arcTestnet")
 

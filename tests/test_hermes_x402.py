@@ -147,6 +147,7 @@ class TestConfig:
             wallet_id="id",
             wallet_address="0xBuyer",
             entity_secret="0" * 64,
+            public_base_url="https://seller.example",
         )
         with pytest.warns(DeprecationWarning, match="legacy"):
             agent = X402HermesAgent.from_config(config)
@@ -162,6 +163,7 @@ class TestConfig:
                 wallet_id="id",
                 wallet_address="0xBuyer",
                 entity_secret="0" * 64,
+                public_base_url="https://seller.example",
             )
         )
         assert agent.buyer.wallet_address == "0xBuyer"
@@ -193,7 +195,10 @@ class TestContextAndSeller:
         assert get_payment_context() is None
 
     def test_seller_wire_format_unchanged(self):
-        middleware = X402SellerMiddleware(seller_address="0x" + "ab" * 20)
+        middleware = X402SellerMiddleware(
+            seller_address="0x" + "ab" * 20,
+            public_base_url="https://seller.example",
+        )
         response = middleware._build_402_response("10000", "/api/test")
         assert response["status"] == 402
         assert response["body"]["x402Version"] == 2
@@ -412,7 +417,11 @@ class TestPublicApiAndDualRole:
         backend = CircleDcwBuyerBackend(
             wallet_id="id", wallet_address="0xBuyer", entity_secret="a" * 64
         )
-        agent = X402HermesAgent(seller_address="0x" + "ab" * 20, buyer_backend=backend)
+        agent = X402HermesAgent(
+            seller_address="0x" + "ab" * 20,
+            buyer_backend=backend,
+            public_base_url="https://seller.example",
+        )
         assert agent.seller.seller_address == "0x" + "ab" * 20
         assert agent.buyer.wallet_address == "0xBuyer"
         assert "a" * 64 not in repr(agent.buyer.backend)

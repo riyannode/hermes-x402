@@ -73,14 +73,26 @@ class PaymentResult:
 _RequestKey = getattr(web, "RequestKey", None)
 _HAS_REQUEST_KEY = _RequestKey is not None
 
-if _HAS_REQUEST_KEY:
-    X402_PAYMENT_KEY: Any = _RequestKey("x402_payment", PaymentResult)
-    X402_CHALLENGE_KEY: Any = _RequestKey("x402_402", dict)
-    X402_ERROR_KEY: Any = _RequestKey("x402_error", dict)
-else:  # aiohttp < 3.14 compatibility: RequestKey is unavailable.
-    X402_PAYMENT_KEY = "x402_payment"
-    X402_CHALLENGE_KEY = "x402_402"
-    X402_ERROR_KEY = "x402_error"
+
+def _make_request_key(
+    web_module: Any,
+    name: str,
+    value_type: type[Any],
+) -> Any:
+    """Create a RequestKey if available, fall back to plain string.
+
+    This is a pure helper so RequestKey compatibility can be tested
+    without reloading the production module.
+    """
+    request_key = getattr(web_module, "RequestKey", None)
+    if request_key is None:
+        return name
+    return request_key(name, value_type)
+
+
+X402_PAYMENT_KEY: Any = _make_request_key(web, "x402_payment", PaymentResult)
+X402_CHALLENGE_KEY: Any = _make_request_key(web, "x402_402", dict)
+X402_ERROR_KEY: Any = _make_request_key(web, "x402_error", dict)
 
 
 def _get_request_state(request: web.Request) -> Mapping[Any, Any]:
