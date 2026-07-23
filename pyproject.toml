@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-x402"
-version = "0.2.0"
+version = "0.2.1"
 description = "Circle x402 nanopayment integration for Hermes Agent — seller middleware (aiohttp) + buyer tool (DCW) + dual-role agent"
 readme = "README.md"
 license = "MIT"
@@ -31,16 +31,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dcw = [
-    "cryptography>=42.0",
+    "cryptography>=42.0,<47",
 ]
 all = [
-    "cryptography>=42.0",
+    "cryptography>=42.0,<47",
 ]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
-    "cryptography>=42.0",
+    "cryptography>=42.0,<47",
     "python-dotenv>=1.0",
 ]
 

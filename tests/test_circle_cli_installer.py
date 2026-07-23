@@ -231,7 +231,7 @@ class TestInstallerCIRCLE_CLI_EXECUTABLE:
             ),
             patch(
                 "hermes_x402.install._verify_installed_package_path",
-                return_value={"version": "0.2.0"},
+                return_value={"version": "0.2.1"},
             ),
         ):
             from hermes_x402.install import run_install
@@ -277,7 +277,7 @@ class TestInstallerCheckMode:
             ),
             patch(
                 "hermes_x402.install._verify_installed_package_path",
-                return_value={"version": "0.2.0"},
+                return_value={"version": "0.2.1"},
             ),
         ):
             from hermes_x402.install import run_install
@@ -327,7 +327,7 @@ class TestInstallerBootstrapFailurePropagation:
             ),
             patch(
                 "hermes_x402.install._verify_installed_package_path",
-                return_value={"version": "0.2.0"},
+                return_value={"version": "0.2.1"},
             ),
         ):
             from hermes_x402.install import run_install

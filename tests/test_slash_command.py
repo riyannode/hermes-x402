@@ -341,7 +341,7 @@ class TestConcurrentGuard:
                     "success": True,
                     "role": "buyer",
                     "backend": "cli",
-                    "version": "0.2.0",
+                    "version": "0.2.1",
                     "wallet_address": VALID_WALLET,
                     "network": "ARC-TESTNET",
                     "configured": True,
@@ -391,7 +391,7 @@ class TestHumanReadable:
                 "success": True,
                 "role": "buyer",
                 "backend": "cli",
-                "version": "0.2.0",
+                "version": "0.2.1",
                 "wallet_address": VALID_WALLET,
                 "network": "ARC-TESTNET",
                 "configured": True,
@@ -402,7 +402,7 @@ class TestHumanReadable:
         )
         result = format_status(raw)
         assert "**x402 Status**" in result
-        assert "hermes-x402 v0.2.0" in result
+        assert "hermes-x402 v0.2.1" in result
         assert "Circle CLI" in result
         assert "Arc Testnet" in result
         assert "Status: Ready" in result

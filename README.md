@@ -489,6 +489,28 @@ ruff format --check .
 python -m compileall hermes_x402
 ```
 
+## Hermes Compatibility
+
+hermes-x402 is designed as a plugin for Hermes Agent. The two projects share the `cryptography` dependency but may be constrained to different version ranges:
+
+| Project | Constraint |
+|---------|-----------|
+| **Hermes Agent** | `cryptography==46.0.7` (pinned) |
+| **hermes-x402** | `cryptography>=42.0,<47` (compatible range) |
+
+hermes-x402 uses `cryptography>=42.0,<47` for the DCW buyer backend and signing operations. This range includes the version that Hermes pins, so both can coexist without conflict.
+
+### Installation
+
+**Recommended:** Use the hermes-x402 installer, which installs with `--no-deps` to avoid touching any Hermes-managed packages:
+
+```bash
+python3 -m hermes_x402.install \
+  --hermes-python /usr/local/lib/hermes-agent/venv/bin/python
+```
+
+**Not recommended:** Running bare `pip install --upgrade hermes-x402` inside the Hermes venv. This may trigger pip to upgrade or replace shared dependencies (including `cryptography`), potentially breaking Hermes. Always use the installer for Hermes plugin updates.
+
 ## License
 
 MIT

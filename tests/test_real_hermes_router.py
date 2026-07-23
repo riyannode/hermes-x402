@@ -43,7 +43,7 @@ def real_hermes_x402_command_registry(monkeypatch: pytest.MonkeyPatch):
 
     manifest = PluginManifest(
         name="hermes-x402-test",
-        version="0.2.0",
+        version="0.2.1",
         description="test x402 plugin registration",
         source="entrypoint",
         key="hermes-x402-test",
@@ -57,7 +57,7 @@ def real_hermes_x402_command_registry(monkeypatch: pytest.MonkeyPatch):
                     "success": True,
                     "role": "buyer",
                     "backend": "cli",
-                    "version": "0.2.0",
+                    "version": "0.2.1",
                     "wallet": "0xabababababababababababababababababababab",
                     "network": "ARC-TESTNET",
                     "configured": True,
