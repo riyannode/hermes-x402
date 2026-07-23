@@ -69,6 +69,7 @@ from hermes_x402.seller_gateway import create_aiohttp_gateway
 gateway = create_aiohttp_gateway(
     seller_address="0xYourAddress1234567890abcdef1234567890abcdef",
     networks=["arctestnet", "base", "polygon"],
+    public_base_url="https://seller.example/x402",
 )
 
 @gateway.require("$0.01")
@@ -262,11 +263,12 @@ All configuration is via environment variables. No config files required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `X402_ROLE` | *(none)* | Agent role: `buyer`, `seller`, or `dual` |
-| `X402_BUYER_BACKEND` | *(none)* | Buyer backend: `dcw` or `cli` |
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `X402_SELLER_ADDRESS` | `""` | PayTo address for seller mode (`0x` + 40 hex) |
 | `X402_CHAIN` | `arcTestnet` | Chain key (legacy; network registry overrides) |
 | `X402_FACILITATOR_URL` | *(auto)* | Circle Gateway facilitator URL (auto-resolved from network) |
+| `X402_PUBLIC_BASE_URL` | *(required)* | Public seller URL — **must** be set via env or `public_base_url=` argument. HTTP requires `allow_http=True` |
 
 ### Network Policy
 

@@ -22,6 +22,7 @@ middleware = create_aiohttp_middleware(
     seller_address=os.environ.get("X402_SELLER_ADDRESS", "0xYOUR_WALLET_ADDRESS"),
     chain="arcTestnet",
     facilitator_url="https://gateway-api-testnet.circle.com",
+    public_base_url=os.environ.get("X402_PUBLIC_BASE_URL", "https://seller.example"),
 )
 
 

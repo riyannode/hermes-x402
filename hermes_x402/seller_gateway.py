@@ -428,20 +428,73 @@ def _normalize_path(path_qs: str) -> str:
     if not isinstance(path_qs, str) or not path_qs.startswith("/"):
         path_qs = "/" + str(path_qs or "")
     parts = urlsplit(path_qs)
-    path = quote(parts.path or "/", safe="/%:@")
+    path = parts.path
+    if ".." in path.split("/"):
+        raise PaymentParsingError("path traversal not allowed")
+    path = quote(path or "/", safe="/%:@")
     query = parts.query
     return urlunsplit(("", "", path, query, ""))
 
 
+def _join_public_resource_path(base_path: str, request_path: str) -> str:
+    """Join base URL path with request path, preserving the base prefix."""
+    base_prefix = "/" + base_path.strip("/") if base_path.strip("/") else ""
+    request_suffix = "/" + request_path.lstrip("/")
+
+    combined = f"{base_prefix}{request_suffix}"
+
+    normalized = _posixpath_normpath(combined)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+
+    # Preserve trailing slash where it is semantically present.
+    if combined.endswith("/") and not normalized.endswith("/"):
+        normalized += "/"
+
+    return normalized
+
+
+def _posixpath_normpath(path: str) -> str:
+    """Minimal posixpath-style normalization (split on /, collapse . and ..)."""
+    parts: list[str] = []
+    for segment in path.split("/"):
+        if segment == "." or segment == "":
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(segment)
+    return "/" + "/".join(parts)
+
+
 def _build_resource_url(
-    public_base_url: str, request: web.Request | None = None, path: str | None = None
+    public_base_url: str,
+    request: web.Request | None = None,
+    path: str | None = None,
 ) -> str:
     base = urlsplit(public_base_url)
-    rel = _normalize_path(
+
+    raw_relative = (
         path if path is not None else getattr(request, "path_qs", getattr(request, "path", "/"))
     )
-    rel_parts = urlsplit(rel)
-    return urlunsplit((base.scheme, base.netloc, rel_parts.path, rel_parts.query, ""))
+    relative = _normalize_path(raw_relative)
+    relative_parts = urlsplit(relative)
+
+    resource_path = _join_public_resource_path(
+        base.path,
+        relative_parts.path,
+    )
+
+    return urlunsplit(
+        (
+            base.scheme,
+            base.netloc,
+            resource_path,
+            relative_parts.query,
+            "",
+        )
+    )
 
 
 def _fingerprint(value: Any) -> str:
@@ -679,18 +732,17 @@ class X402Gateway:
         facilitator_client: CircleFacilitatorClient | None = None,
     ) -> None:
         _validate_address(seller_address, field_name="seller address")
-        if networks and isinstance(networks[0], str):
-            networks = _resolve_seller_networks(networks)  # type: ignore[arg-type]
-        resolved_networks = networks  # type: ignore[assignment]
+        resolved_networks = _resolve_seller_networks(networks)
         if not resolved_networks:
             raise SellerConfigurationError("At least one network must be specified")
         self._seller_address = seller_address
         self._networks = resolved_networks
         self._facilitator_url = _validate_facilitator_url(facilitator_url, resolved_networks)
         self._default_description = default_description
-        if public_base_url is None:
-            public_base_url = os.environ.get("X402_PUBLIC_BASE_URL", "https://seller.local")
-        self._public_base_url = _validate_public_base_url(public_base_url, allow_http=allow_http)
+        self._public_base_url = _resolve_public_base_url(
+            public_base_url,
+            allow_insecure_http=allow_http,
+        )
         self._allow_http = allow_http
         self._receipt_store = receipt_store
         self._after_settlement = after_settlement
@@ -699,7 +751,7 @@ class X402Gateway:
         self._facilitator_client = facilitator_client or CircleFacilitatorClient(
             self._facilitator_url
         )
-        self._default_accepts = self._build_accepts(networks, None)
+        self._default_accepts = self._build_accepts(resolved_networks, None)
 
     def require(
         self,
@@ -767,6 +819,7 @@ class X402Gateway:
         description: str,
         *,
         route_id: str | None = None,
+        preserve_payment_context: bool = False,
     ) -> web.Response:
         try:
             amount = self._resolve_amount(request, price_spec)
@@ -949,7 +1002,8 @@ class X402Gateway:
                 {"error": "paid_handler_failed", "retry_safe": False}, status=500
             )
         finally:
-            reset_payment_context(token)
+            if not preserve_payment_context:
+                reset_payment_context(token)
 
         if isinstance(response, web.Response):
             response.headers[PAYMENT_RESPONSE_HEADER] = _b64_json(
@@ -1153,7 +1207,37 @@ def _validate_public_base_url(value: str, *, allow_http: bool) -> str:
         raise SellerConfigurationError("X402_PUBLIC_BASE_URL must be an absolute URL")
     if parsed.scheme != "https" and not allow_http:
         raise SellerConfigurationError("X402_PUBLIC_BASE_URL must use HTTPS unless allow_http=True")
+    if parsed.query:
+        raise SellerConfigurationError("X402_PUBLIC_BASE_URL must not contain a query string")
+    if parsed.fragment:
+        raise SellerConfigurationError("X402_PUBLIC_BASE_URL must not contain a fragment")
+    if parsed.username or parsed.password:
+        raise SellerConfigurationError("X402_PUBLIC_BASE_URL must not contain userinfo")
+    # Preserve the path prefix — only strip trailing slash.
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _resolve_public_base_url(
+    explicit: str | None,
+    *,
+    allow_insecure_http: bool = False,
+) -> str:
+    """Resolve and validate the public base URL.
+
+    Uses *explicit* first, then ``X402_PUBLIC_BASE_URL`` env var.
+    Raises ``SellerConfigurationError`` when neither is set.
+    """
+    value = explicit or os.environ.get("X402_PUBLIC_BASE_URL")
+
+    if not value:
+        raise SellerConfigurationError(
+            "A public seller URL is required. Pass public_base_url=... or set X402_PUBLIC_BASE_URL."
+        )
+
+    return _validate_public_base_url(
+        value,
+        allow_http=allow_insecure_http,
+    )
 
 
 def _validate_facilitator_url(value: str, networks: list[NetworkConfig]) -> str:
@@ -1171,24 +1255,72 @@ def _validate_facilitator_url(value: str, networks: list[NetworkConfig]) -> str:
     return normalized
 
 
-def _resolve_seller_networks(networks: list[str] | None) -> list[NetworkConfig]:
-    if networks is None:
-        networks = ["arcTestnet"]
+def _validate_seller_network(cfg: NetworkConfig) -> NetworkConfig:
+    """Validate a single network config for seller capability."""
+    if not cfg.seller_supported:
+        raise SellerConfigurationError(f"Network {cfg.key!r} is not supported for seller mode")
+    missing: list[str] = []
+    if not cfg.caip2:
+        missing.append("caip2")
+    if not cfg.usdc_address:
+        missing.append("usdc_address")
+    if not cfg.gateway_wallet:
+        missing.append("gateway_wallet")
+    if not cfg.facilitator_url:
+        missing.append("facilitator_url")
+    if not cfg.environment:
+        missing.append("environment")
+    if not cfg.gateway_supported:
+        missing.append("gateway_supported")
+    if missing:
+        raise SellerConfigurationError(
+            f"Network {cfg.key!r} has incomplete seller configuration: " + ", ".join(missing)
+        )
+    return cfg
+
+
+def _resolve_seller_networks(
+    networks: list[str | NetworkConfig] | None,
+) -> list[NetworkConfig]:
+    """Resolve seller networks from string keys or NetworkConfig objects.
+
+    Defaults to Arc Testnet when *networks* is ``None``.  Accepts mixed
+    lists of strings and ``NetworkConfig`` instances — all inputs pass
+    through the same capability validation.
+    """
+    requested = networks if networks is not None else ["arcTestnet"]
+
+    if not requested:
+        raise SellerConfigurationError("At least one seller network must be configured")
+
     resolved: list[NetworkConfig] = []
-    environments: set[str] = set()
-    for net in networks:
-        try:
-            cfg = get_network(net)
-        except NetworkNotFoundError as exc:
-            raise SellerConfigurationError(f"Unknown network: {net!r}") from exc
-        if cfg.key != "arcTestnet" or not cfg.seller_supported:
-            raise SellerConfigurationError(f"Network {net!r} is not supported for seller mode")
-        if not cfg.gateway_supported or not cfg.usdc_address or not cfg.gateway_wallet:
-            raise SellerConfigurationError(f"Network {net!r} has incomplete seller constants")
-        environments.add(cfg.environment)
-        resolved.append(cfg)
-    if len(environments) > 1:
-        raise SellerConfigurationError("Cannot mix networks from different environments")
+    seen: set[str] = set()
+
+    for item in requested:
+        if isinstance(item, str):
+            try:
+                cfg = get_network(item)
+            except NetworkNotFoundError as exc:
+                raise SellerConfigurationError(f"Unknown seller network: {item!r}") from exc
+        elif isinstance(item, NetworkConfig):
+            cfg = item
+        else:
+            raise SellerConfigurationError(
+                "Seller networks must contain only network names or NetworkConfig instances"
+            )
+
+        cfg = _validate_seller_network(cfg)
+
+        if cfg.key not in seen:
+            resolved.append(cfg)
+            seen.add(cfg.key)
+
+    environments = {cfg.environment for cfg in resolved}
+    if len(environments) != 1:
+        raise SellerConfigurationError(
+            "Seller networks cannot mix mainnet and testnet environments"
+        )
+
     return resolved
 
 
@@ -1218,8 +1350,6 @@ def create_aiohttp_gateway(
     resolved = _resolve_seller_networks(networks)
     if facilitator_url is None:
         facilitator_url = resolved[0].facilitator_url
-    if public_base_url is None:
-        public_base_url = os.environ.get("X402_PUBLIC_BASE_URL", "https://seller.local")
     return X402Gateway(
         seller_address=seller_address,
         networks=resolved,

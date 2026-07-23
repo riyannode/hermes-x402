@@ -10,12 +10,20 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from aiohttp import web
 
+from hermes_x402.middleware import (
+    create_aiohttp_middleware,
+)
 from hermes_x402.networks import get_network
 from hermes_x402.seller_gateway import (
     BUYER_MAX_TIMEOUT_SECONDS,
     SERVER_MIN_TIMEOUT_SECONDS,
+    PaymentParsingError,
+    SellerConfigurationError,
     X402Gateway,
+    _build_resource_url,
     _parse_price,
+    _resolve_seller_networks,
+    _validate_public_base_url,
     create_aiohttp_gateway,
 )
 
@@ -42,6 +50,7 @@ def _make_gateway(**kwargs) -> X402Gateway:
         "networks": ["arcTestnet"],
         "facilitator_url": "https://gateway-api-testnet.circle.com",
         "default_description": "Test resource",
+        "public_base_url": "https://seller.example",
     }
     defaults.update(kwargs)
     return create_aiohttp_gateway(**defaults)
@@ -142,11 +151,11 @@ class TestMultiNetworkAccepts:
         gateway = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet", "arcTestnet", "arcTestnet"],
+            public_base_url="https://seller.example",
         )
-        assert len(gateway._networks) == 3
+        # Duplicate network keys are deduplicated by the resolver.
+        assert len(gateway._networks) == 1
         assert gateway._networks[0].key == "arcTestnet"
-        assert gateway._networks[1].key == "arcTestnet"
-        assert gateway._networks[2].key == "arcTestnet"
 
     def test_default_network_is_arcTestnet(self):
         gateway = _make_gateway()
@@ -204,6 +213,7 @@ class TestSellerAddressValidation:
         gateway = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         assert gateway._seller_address == _VALID_SELLER
 
@@ -216,7 +226,7 @@ class TestSellerAddressValidation:
 class TestInvalidNetwork:
     def test_unknown_network_in_require(self):
         gateway = _make_gateway()
-        with pytest.raises(ValueError, match="Unknown network"):
+        with pytest.raises(ValueError, match="Unknown seller network"):
             gateway.require(price="$0.01", networks=["nonexistent_chain"])
 
 
@@ -275,16 +285,18 @@ class TestCreateGateway:
             )
 
     def test_unknown_network_rejected(self):
-        with pytest.raises(ValueError, match="Unknown network"):
+        with pytest.raises(ValueError, match="Unknown seller network"):
             create_aiohttp_gateway(
                 seller_address=_VALID_SELLER,
                 networks=["nonexistent_chain"],
+                public_base_url="https://seller.example",
             )
 
     def test_facilitator_url_from_network(self):
         gateway = create_aiohttp_gateway(
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
+            public_base_url="https://seller.example",
         )
         # arcTestnet's facilitator_url
         assert gateway._facilitator_url == "https://gateway-api-testnet.circle.com"
@@ -294,6 +306,7 @@ class TestCreateGateway:
             seller_address=_VALID_SELLER,
             networks=["arcTestnet"],
             facilitator_url="https://custom.example.com",
+            public_base_url="https://seller.example",
         )
         assert gateway._facilitator_url == "https://custom.example.com"
 
@@ -602,3 +615,264 @@ class TestCircleCliPayloadCompatibility:
 
         mock_settle.assert_not_called()
         assert resp.status == 402
+
+
+# ===========================================================================
+# Regression tests for Codex review fixes
+# ===========================================================================
+
+
+def _make_valid_network_config(
+    *,
+    key: str = "supportedTestnet",
+    seller_supported: bool = True,
+    environment: str = "testnet",
+    gateway_wallet: str = "0x" + "ab" * 20,
+):
+    from hermes_x402.networks import NetworkConfig
+
+    return NetworkConfig(
+        key=key,
+        display_name=key,
+        aliases=(key,),
+        caip2="eip155:999999",
+        chain_id=999999,
+        environment=environment,
+        cli_chain=None,
+        usdc_address="0x" + "ab" * 20,
+        gateway_supported=True,
+        buyer_cli_supported=False,
+        buyer_dcw_supported=False,
+        seller_supported=seller_supported,
+        gateway_wallet=gateway_wallet,
+        facilitator_url="https://gateway-api-testnet.circle.com",
+        gateway_api="https://gateway-api-testnet.circle.com/v1",
+        provenance="test",
+    )
+
+
+def _make_mock_request(method: str = "GET", path: str = "/premium") -> web.Request:
+    from unittest.mock import AsyncMock
+
+    req = AsyncMock()
+    req.method = method
+    req.path = path
+    req.path_qs = path
+    req.headers = {}
+    req.match_info = {}
+    return req
+
+
+# --- Fix 1: Multi-network, default Arc Testnet ---
+
+
+class TestMultiNetworkCapabilityValidation:
+    def test_default_seller_network_is_arc_testnet(self):
+        gateway = create_aiohttp_gateway(
+            _VALID_SELLER,
+            public_base_url="https://seller.example",
+        )
+        assert [n.key for n in gateway._networks] == ["arcTestnet"]
+
+    def test_explicit_supported_non_arc_network_is_allowed(self):
+        cfg = _make_valid_network_config(
+            key="supportedTestnet",
+            seller_supported=True,
+        )
+        gateway = X402Gateway(
+            seller_address=_VALID_SELLER,
+            networks=[cfg],
+            facilitator_url=cfg.facilitator_url,
+            public_base_url="https://seller.example",
+            default_description="Paid resource",
+        )
+        assert gateway._networks == [cfg]
+
+    def test_unsupported_network_is_rejected(self):
+        cfg = _make_valid_network_config(
+            key="unsupported",
+            seller_supported=False,
+        )
+        with pytest.raises(SellerConfigurationError):
+            _resolve_seller_networks([cfg])
+
+    def test_mixed_environments_are_rejected(self):
+        from hermes_x402.networks import get_network
+
+        testnet = get_network("arcTestnet")
+        mainnet = get_network("base")
+        with pytest.raises(SellerConfigurationError):
+            _resolve_seller_networks([testnet, mainnet])
+
+    def test_network_config_missing_gateway_wallet_is_rejected(self):
+        from dataclasses import replace
+
+        from hermes_x402.networks import get_network
+
+        cfg = replace(
+            get_network("arcTestnet"),
+            gateway_wallet="",
+        )
+        with pytest.raises(SellerConfigurationError, match="gateway_wallet"):
+            _resolve_seller_networks([cfg])
+
+
+# --- Fix 2: Base URL path prefix preservation ---
+
+
+class TestResourceUrlPreservesBasePath:
+    @pytest.mark.parametrize(
+        ("base_url", "request_path", "expected"),
+        [
+            (
+                "https://example.com",
+                "/premium",
+                "https://example.com/premium",
+            ),
+            (
+                "https://example.com/x402",
+                "/premium",
+                "https://example.com/x402/premium",
+            ),
+            (
+                "https://example.com/x402/",
+                "/premium?format=json",
+                "https://example.com/x402/premium?format=json",
+            ),
+            (
+                "https://example.com/api/v1",
+                "/premium/",
+                "https://example.com/api/v1/premium/",
+            ),
+        ],
+    )
+    def test_resource_url_preserves_public_base_path(
+        self,
+        base_url,
+        request_path,
+        expected,
+    ):
+        request = _make_mock_request("GET", request_path)
+        assert _build_resource_url(base_url, request) == expected
+
+    def test_resource_path_cannot_escape_configured_prefix(self):
+        request = _make_mock_request("GET", "/../admin")
+        with pytest.raises(PaymentParsingError, match="path traversal"):
+            _build_resource_url(
+                "https://example.com/x402",
+                request,
+            )
+
+    def test_validate_public_base_url_rejects_query(self):
+        with pytest.raises(SellerConfigurationError, match="query string"):
+            _validate_public_base_url("https://example.com?foo=bar", allow_http=False)
+
+    def test_validate_public_base_url_rejects_fragment(self):
+        with pytest.raises(SellerConfigurationError, match="fragment"):
+            _validate_public_base_url("https://example.com#section", allow_http=False)
+
+    def test_validate_public_base_url_rejects_userinfo(self):
+        with pytest.raises(SellerConfigurationError, match="userinfo"):
+            _validate_public_base_url("https://user:pass@example.com", allow_http=False)
+
+    def test_validate_public_base_url_preserves_path_prefix(self):
+        result = _validate_public_base_url("https://example.com/x402", allow_http=False)
+        assert result == "https://example.com/x402"
+
+
+# --- Fix 3: Public base URL required, no seller.local fallback ---
+
+
+class TestPublicBaseUrlRequired:
+    def test_public_base_url_is_required(self, monkeypatch):
+        monkeypatch.delenv("X402_PUBLIC_BASE_URL", raising=False)
+        with pytest.raises(
+            SellerConfigurationError,
+            match="public seller URL is required",
+        ):
+            create_aiohttp_gateway(_VALID_SELLER)
+
+    def test_public_base_url_from_environment(self, monkeypatch):
+        monkeypatch.setenv(
+            "X402_PUBLIC_BASE_URL",
+            "https://seller.example/x402",
+        )
+        gateway = create_aiohttp_gateway(_VALID_SELLER)
+        assert gateway._public_base_url == "https://seller.example/x402"
+
+    def test_insecure_http_requires_explicit_opt_in(self):
+        with pytest.raises(SellerConfigurationError):
+            create_aiohttp_gateway(
+                _VALID_SELLER,
+                public_base_url="http://127.0.0.1:8080",
+            )
+
+    def test_seller_local_not_used_as_fallback(self, monkeypatch):
+        monkeypatch.delenv("X402_PUBLIC_BASE_URL", raising=False)
+        with pytest.raises(SellerConfigurationError):
+            create_aiohttp_gateway(_VALID_SELLER)
+
+
+# --- Fix 4: NetworkConfig objects validated through same resolver ---
+
+
+class TestNetworkConfigObjectValidation:
+    def test_network_config_object_is_validated(self):
+        from dataclasses import replace
+
+        from hermes_x402.networks import get_network
+
+        invalid = replace(
+            get_network("arcTestnet"),
+            seller_supported=False,
+        )
+        with pytest.raises(SellerConfigurationError):
+            X402Gateway(
+                seller_address=_VALID_SELLER,
+                networks=[invalid],
+                facilitator_url=invalid.facilitator_url,
+                public_base_url="https://seller.example",
+                default_description="Paid resource",
+            )
+
+    def test_mixed_string_and_object_inputs_are_validated(self):
+        another = _make_valid_network_config(key="anotherTestnet")
+        resolved = _resolve_seller_networks(["arcTestnet", another])
+        assert len(resolved) == 2
+
+
+# --- Fix 5: Decorator resets context; legacy process_request preserves ---
+
+
+class TestContextLifecycle:
+    @pytest.mark.asyncio
+    async def test_decorator_resets_context_after_handler(self):
+        from hermes_x402.context import get_payment_context
+
+        gw = _make_gateway()
+
+        async def handler(request):
+            return web.json_response({"ok": True})
+
+        protected = gw.require("$0.01")(handler)
+
+        mock_request = _make_mock_request("GET", "/premium")
+        mock_request.headers = {}  # no payment header
+
+        await protected(mock_request)
+        assert get_payment_context() is None
+
+    @pytest.mark.asyncio
+    async def test_failed_legacy_request_does_not_leave_context(self):
+        from hermes_x402.context import get_payment_context
+
+        middleware = create_aiohttp_middleware(
+            seller_address=_VALID_SELLER,
+            public_base_url="https://seller.example",
+        )
+        mock_request = _make_mock_request("GET", "/premium")
+        mock_request.headers = {}  # no payment
+
+        result = await middleware.process_request(mock_request, "$0.003")
+        assert result is None
+        assert get_payment_context() is None

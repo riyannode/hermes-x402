@@ -14,6 +14,7 @@ from typing import Optional
 
 from aiohttp import web
 
+from hermes_x402.context import clear_payment_context
 from hermes_x402.seller_gateway import (
     CIRCLE_BATCHING_NAME,
     CIRCLE_BATCHING_SCHEME,
@@ -46,6 +47,9 @@ class X402SellerMiddleware:
     Historical usage called ``process_request(request, price)`` and then read
     ``request["x402_402"]`` when it returned ``None``.  That contract is kept,
     but the underlying behavior is canonical gateway behavior.
+
+    The payment context is preserved after ``process_request`` until the caller
+    explicitly clears it via :meth:`clear_payment_context`.
     """
 
     def __init__(
@@ -69,8 +73,7 @@ class X402SellerMiddleware:
             networks=resolved_networks,
             facilitator_url=facilitator_url,
             default_description=description,
-            public_base_url=public_base_url
-            or os.environ.get("X402_PUBLIC_BASE_URL", "https://seller.local"),
+            public_base_url=public_base_url or os.environ.get("X402_PUBLIC_BASE_URL"),
             allow_http=allow_http,
             receipt_store=receipt_store,
         )
@@ -108,6 +111,14 @@ class X402SellerMiddleware:
         request: web.Request,
         price: str | Decimal,
     ) -> Optional[PaymentResult]:
+        """Process an x402 payment request via the canonical gateway.
+
+        The payment context is preserved until the caller explicitly clears it
+        via :meth:`clear_payment_context`.  This supports the legacy
+        ``process_request`` contract where callers read payment context after
+        the call returns.
+        """
+
         async def _sentinel_handler(req: web.Request) -> web.Response:
             return web.Response(status=204)
 
@@ -120,6 +131,7 @@ class X402SellerMiddleware:
             None,
             None,
             self.description,
+            preserve_payment_context=True,
         )
         if response.status == 204:
             candidate = get_x402_payment(request)
@@ -146,6 +158,14 @@ class X402SellerMiddleware:
             return None
         request[X402_ERROR_KEY] = {"status": response.status}  # type: ignore[index]
         return None
+
+    def clear_payment_context(self) -> None:
+        """Clear the payment context after the caller is done with it.
+
+        This should be called after the caller has finished reading the
+        payment context in the legacy ``process_request`` flow.
+        """
+        clear_payment_context()
 
     @staticmethod
     def _price_to_amount(price: str | Decimal) -> str:
