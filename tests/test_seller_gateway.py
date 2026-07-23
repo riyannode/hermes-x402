@@ -876,3 +876,149 @@ class TestContextLifecycle:
         result = await middleware.process_request(mock_request, "$0.003")
         assert result is None
         assert get_payment_context() is None
+
+
+# --- Fix: payment_fingerprint hashes settlement identity only ---
+
+
+class TestPaymentFingerprintSettlementIdentity:
+    """Payment fingerprint must be stable across different accepted timeouts."""
+
+    def _build_payload(self, *, max_timeout: int = 604900, nonce: str = "0x" + "01" * 32) -> str:
+        import base64
+        import json
+
+        from hermes_x402.networks import get_network
+
+        net = get_network("arcTestnet")
+        payload = {
+            "x402Version": 2,
+            "payload": {
+                "authorization": {
+                    "from": "0x" + "cd" * 20,
+                    "to": net.gateway_wallet,
+                    "value": "3000",
+                    "validAfter": "0",
+                    "validBefore": "9999999999",
+                    "nonce": nonce,
+                },
+                "signature": "0x" + "02" * 65,
+            },
+            "accepted": {
+                "scheme": "exact",
+                "network": net.caip2,
+                "asset": net.usdc_address,
+                "amount": "3000",
+                "payTo": _VALID_SELLER,
+                "maxTimeoutSeconds": max_timeout,
+                "extra": {
+                    "name": "GatewayWalletBatched",
+                    "version": "1",
+                    "verifyingContract": net.gateway_wallet,
+                },
+            },
+        }
+        return base64.b64encode(json.dumps(payload).encode()).decode()
+
+    def test_same_auth_different_timeout_produces_same_fingerprint(self):
+        from hermes_x402.seller_gateway import (
+            _decode_payment_header,
+            _fingerprint,
+            _settlement_identity,
+        )
+
+        header_604900 = self._build_payload(max_timeout=604900)
+        header_2592000 = self._build_payload(max_timeout=2592000)
+
+        decoded_1 = _decode_payment_header(header_604900)
+        decoded_2 = _decode_payment_header(header_2592000)
+
+        fp1 = _fingerprint(_settlement_identity(decoded_1))
+        fp2 = _fingerprint(_settlement_identity(decoded_2))
+        assert fp1 == fp2
+
+    def test_different_nonce_produces_different_fingerprint(self):
+        from hermes_x402.seller_gateway import (
+            _decode_payment_header,
+            _fingerprint,
+            _settlement_identity,
+        )
+
+        header_a = self._build_payload(nonce="0x" + "01" * 32)
+        header_b = self._build_payload(nonce="0x" + "02" * 32)
+
+        decoded_a = _decode_payment_header(header_a)
+        decoded_b = _decode_payment_header(header_b)
+
+        fp_a = _fingerprint(_settlement_identity(decoded_a))
+        fp_b = _fingerprint(_settlement_identity(decoded_b))
+        assert fp_a != fp_b
+
+    def test_different_value_produces_different_fingerprint(self):
+        import base64
+        import json
+
+        from hermes_x402.networks import get_network
+        from hermes_x402.seller_gateway import (
+            _decode_payment_header,
+            _fingerprint,
+            _settlement_identity,
+        )
+
+        net = get_network("arcTestnet")
+        payload_a = {
+            "x402Version": 2,
+            "payload": {
+                "authorization": {
+                    "from": "0x" + "cd" * 20,
+                    "to": net.gateway_wallet,
+                    "value": "3000",
+                    "validAfter": "0",
+                    "validBefore": "9999999999",
+                    "nonce": "0x" + "01" * 32,
+                },
+                "signature": "0x" + "02" * 65,
+            },
+            "accepted": {
+                "scheme": "exact",
+                "network": net.caip2,
+                "asset": net.usdc_address,
+                "amount": "3000",
+                "payTo": _VALID_SELLER,
+                "maxTimeoutSeconds": 604900,
+                "extra": {
+                    "name": "GatewayWalletBatched",
+                    "version": "1",
+                    "verifyingContract": net.gateway_wallet,
+                },
+            },
+        }
+        payload_b = {
+            **payload_a,
+            "payload": {
+                **payload_a["payload"],
+                "authorization": {**payload_a["payload"]["authorization"], "value": "5000"},
+            },
+        }
+        header_a = base64.b64encode(json.dumps(payload_a).encode()).decode()
+        header_b = base64.b64encode(json.dumps(payload_b).encode()).decode()
+
+        decoded_a = _decode_payment_header(header_a)
+        decoded_b = _decode_payment_header(header_b)
+
+        fp_a = _fingerprint(_settlement_identity(decoded_a))
+        fp_b = _fingerprint(_settlement_identity(decoded_b))
+        assert fp_a != fp_b
+
+    @pytest.mark.asyncio
+    async def test_receipt_store_treats_same_settlement_as_replay(self):
+        from hermes_x402.seller_gateway import InMemoryReceiptStore
+
+        store = InMemoryReceiptStore()
+        fp = "same_fingerprint"
+        begin1 = await store.begin(fp, "req1", "route1")
+        assert begin1.action == "owner"
+
+        # Same payment fingerprint, different request fingerprint → conflict
+        begin2 = await store.begin(fp, "req2", "route1")
+        assert begin2.action == "conflict"

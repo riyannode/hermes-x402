@@ -501,6 +501,28 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
+def _settlement_identity(decoded: dict[str, Any]) -> dict[str, Any]:
+    """Extract immutable, settlement-relevant fields for payment fingerprinting.
+
+    Excludes mutable buyer-normalized metadata (accepted.maxTimeoutSeconds,
+    resource description, equivalent accepted-option metadata) so that the
+    same authorization with different timeout choices produces an identical
+    fingerprint.
+    """
+    auth = decoded.get("payload", {}).get("authorization", {})
+    accepted = decoded.get("accepted", {})
+    return {
+        "network": accepted.get("network"),
+        "from": auth.get("from"),
+        "to": auth.get("to"),
+        "value": auth.get("value"),
+        "validAfter": auth.get("validAfter"),
+        "validBefore": auth.get("validBefore"),
+        "nonce": auth.get("nonce"),
+        "signature": decoded.get("payload", {}).get("signature"),
+    }
+
+
 def _log_seller_rejection(stage: str, reason: str, **fields: Any) -> None:
     """Log only structural payment validation diagnostics.
 
@@ -861,7 +883,7 @@ class X402Gateway:
             _log_seller_rejection(_validation_stage_from_error(exc), str(exc))
             return self._challenge_response(challenge)
 
-        payment_fingerprint = _fingerprint(decoded)
+        payment_fingerprint = _fingerprint(_settlement_identity(decoded))
         raw_method = getattr(request, "method", "GET")
         method = raw_method if isinstance(raw_method, str) else "GET"
         request_fingerprint = _fingerprint(

@@ -83,6 +83,7 @@ class X402Config:
     daily_budget_usdc: str | None = None
     allow_http: bool = False
     allow_chat_otp: bool = False
+    public_base_url: str | None = None
 
     def validate(self) -> None:
         if self.role is None:
@@ -225,6 +226,7 @@ class X402Config:
             daily_budget_usdc=os.environ.get("X402_DAILY_BUDGET_USDC") or None,
             allow_http=allow_http,
             allow_chat_otp=allow_chat_otp,
+            public_base_url=os.environ.get("X402_PUBLIC_BASE_URL") or None,
         )
         config.validate()
         return config

@@ -158,7 +158,7 @@ class TestMiddlewareServerAmount:
         assert challenge is not None
         assert challenge["status"] == 402
         body = challenge["body"]
-        assert body["resource"]["url"] == "https://seller.local/premium?item=1"
+        assert body["resource"]["url"] == "https://seller.example/premium?item=1"
         assert body["accepts"][0]["network"] == _NETWORK_CAIP2
         assert body["accepts"][0]["amount"] == "3000"
 
@@ -1216,7 +1216,7 @@ class TestGatewaySellerSupported:
 class TestGatewayMixedEnvironment:
     def test_mixed_mainnet_testnet_rejected(self):
         """Cannot mix mainnet and testnet networks."""
-        with pytest.raises(ValueError, match="not supported for seller mode"):
+        with pytest.raises(ValueError, match="cannot mix mainnet and testnet"):
             create_aiohttp_gateway(
                 seller_address=_VALID_SELLER,
                 networks=["base", "arcTestnet"],

@@ -40,6 +40,9 @@ def _clear_runtime_x402_env(monkeypatch):
         "CIRCLE_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
+    # Ensure every test has a deterministic public_base_url so gateway
+    # construction does not depend on the operator's shell environment.
+    monkeypatch.setenv("X402_PUBLIC_BASE_URL", "https://seller.example")
 
 
 @pytest.fixture(autouse=True)
