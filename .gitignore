@@ -25,6 +25,14 @@ ENV/
 .coverage
 htmlcov/
 
+# Local-only artifacts and captured payment/debug material
+artifacts/
+.circle-cli/
+payment-*.json
+*.payment.json
+*.debug.json
+*.payment.snapshot.json
+
 # Environment
 .env
 .env.local

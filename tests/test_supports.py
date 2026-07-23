@@ -51,7 +51,7 @@ def _make_accept_entry(
         "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
         "amount": amount,
         "payTo": "0xSeller",
-        "maxTimeoutSeconds": 604900,
+        "maxTimeoutSeconds": 2592000,
         "extra": {
             "name": extra_name,
             "version": "1",
@@ -381,7 +381,7 @@ class TestSupportResultDict:
             asset="0xabc",
             supported_by_backend=True,
             pay_to="0xSeller",
-            max_timeout_seconds=604900,
+            max_timeout_seconds=2592000,
         )
         result = SupportResult(
             supported=True,

@@ -41,7 +41,12 @@ from hermes_x402.circle_cli.errors import (
 )
 from hermes_x402.config import ARC_MAINNET, ARC_TESTNET, X402Config
 from hermes_x402.context import X402ContextBridge, get_payment_context, set_payment_context
-from hermes_x402.middleware import X402SellerMiddleware, create_aiohttp_middleware
+from hermes_x402.middleware import (
+    X402SellerMiddleware,
+    create_aiohttp_middleware,
+    get_x402_challenge,
+    get_x402_payment,
+)
 from hermes_x402.network_policy import NetworkPolicy, parse_network_policy
 from hermes_x402.networks import NetworkConfig, get_network, list_networks, normalize_network
 from hermes_x402.seller_gateway import X402Gateway, create_aiohttp_gateway
@@ -95,6 +100,8 @@ __all__ = [
     "create_buyer_tool",
     "get_network",
     "get_payment_context",
+    "get_x402_challenge",
+    "get_x402_payment",
     "list_networks",
     "normalize_network",
     "parse_network_policy",

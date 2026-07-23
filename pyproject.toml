@@ -41,6 +41,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "cryptography>=42.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.entry-points."hermes_agent.plugins"]
@@ -66,3 +67,21 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.hatch.build]
+exclude = [
+    ".env",
+    ".env.*",
+    "*.env",
+    "SOUL.md",
+    "artifacts/",
+    ".circle-cli/",
+    "payment-*.json",
+    "*.payment.json",
+    "*.payment.snapshot.json",
+    "*.debug.json",
+    "docs/superpowers/plans/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    "__pycache__/",
+]

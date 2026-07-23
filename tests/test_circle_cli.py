@@ -540,6 +540,7 @@ class TestCliConfigAndAgent:
             circle_cli_wallet_address=ADDRESS,
             circle_cli_network="BASE",
             max_usdc_per_payment="0.01",
+            public_base_url="https://seller.example",
         )
         agent = X402HermesAgent.from_config(dual)
         assert isinstance(agent.buyer.backend, CircleCliBuyerBackend)

@@ -12,7 +12,7 @@ from hermes_x402.buyer.policy import PaymentPolicy
 from hermes_x402.circle_cli import CircleCliClient, CircleCliRunner
 from hermes_x402.config import X402Config
 from hermes_x402.context import X402ContextBridge
-from hermes_x402.middleware import create_aiohttp_middleware
+from hermes_x402.middleware import create_aiohttp_middleware, get_x402_challenge
 
 
 class X402HermesAgent:
@@ -34,6 +34,8 @@ class X402HermesAgent:
         *,
         buyer_backend: BuyerBackend | None = None,
         buyer_service: X402BuyerService | None = None,
+        public_base_url: str | None = None,
+        allow_http: bool = False,
     ):
         if buyer_backend is not None and buyer_service is not None:
             raise BuyerConfigurationError("Provide buyer_backend or buyer_service, not both")
@@ -75,6 +77,8 @@ class X402HermesAgent:
             chain=chain,
             facilitator_url=facilitator_url,
             description=description,
+            public_base_url=public_base_url,
+            allow_http=allow_http,
         )
 
     @classmethod
@@ -132,6 +136,8 @@ class X402HermesAgent:
             buyer_backend=backend,
             buyer_max_usdc=config.max_usdc_per_payment,
             buyer_host_allowlist=config.host_allowlist,
+            public_base_url=config.public_base_url,
+            allow_http=config.allow_http,
         )
 
     async def handle_request(self, request: web.Request, price: str) -> dict | None:
@@ -139,7 +145,8 @@ class X402HermesAgent:
         return (
             None
             if result is not None
-            else request.get("x402_402", {"status": 402, "body": {"error": "Payment required"}})
+            else get_x402_challenge(request)
+            or {"status": 402, "body": {"error": "Payment required"}}
         )
 
     async def pay(

@@ -223,6 +223,7 @@ class TestCAIP2Networks:
             networks=[get_network("base")],
             facilitator_url="https://gateway-api.circle.com",
             default_description="Test",
+            public_base_url="https://seller.example",
         )
         accepts = gw._build_accepts([get_network("base")], None)
         assert len(accepts) == 1
