@@ -53,9 +53,13 @@ class PaymentPolicy:
             raise PaymentPolicyError("Payment amount is invalid") from exc
         if atomic_amount < 0:
             raise PaymentPolicyError("Payment amount must not be negative")
-        cap = override_max_usdc if override_max_usdc is not None else self.max_usdc
-        if cap is None:
+
+        caps = []
+        for cap in (self.max_usdc, override_max_usdc):
+            if cap is not None:
+                caps.append(int(Decimal(self.normalize_max_usdc(cap)) * Decimal(1_000_000)))
+        if not caps:
             return
-        max_atomic = int(Decimal(self.normalize_max_usdc(cap)) * Decimal(1_000_000))
+        max_atomic = min(caps)
         if atomic_amount > max_atomic:
             raise PaymentPolicyError(f"Payment {atomic_amount} exceeds max {max_atomic} USDC")
