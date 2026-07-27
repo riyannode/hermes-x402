@@ -86,7 +86,7 @@ X402_NETWORKS_SCHEMA: dict[str, Any] = {
 X402_SERVICE_SEARCH_SCHEMA: dict[str, Any] = {
     "name": "x402_service_search",
     "description": (
-        "Search the Circle service marketplace for x402-enabled services. "
+        "Search public x402 service marketplaces. "
         "Returns bounded results without payment. Read-only."
     ),
     "parameters": {
@@ -99,6 +99,14 @@ X402_SERVICE_SEARCH_SCHEMA: dict[str, Any] = {
             "limit": {
                 "type": "integer",
                 "description": "Maximum results to return (1-25, default 10).",
+            },
+            "marketplace_url": {
+                "type": "string",
+                "description": (
+                    "Optional public HTTPS JSON marketplace endpoint. If set, search uses this "
+                    "endpoint instead of Circle Marketplace. Supports {query}/{limit} templates "
+                    "or appends query and limit params."
+                ),
             },
         },
         "required": ["query"],

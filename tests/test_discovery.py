@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 
 from hermes_x402.circle_cli.errors import CircleCliOutputError, CircleCliReadError
@@ -19,6 +20,7 @@ from hermes_x402.discovery.provider import (
     parse_discovery_host_allowlist,
     parse_discovery_providers,
 )
+from hermes_x402.discovery.public_marketplace import PublicHttpMarketplaceProvider
 
 # ---------------------------------------------------------------------------
 # DiscoveredService
@@ -119,6 +121,16 @@ class _FakeRunner:
             stderr="",
             parsed=self.parsed,
         )
+
+
+class _FakeHttpClient:
+    def __init__(self, response: httpx.Response):
+        self.response = response
+        self.calls: list[str] = []
+
+    async def get(self, url: str, **_: Any) -> httpx.Response:
+        self.calls.append(url)
+        return self.response
 
 
 # ---------------------------------------------------------------------------
@@ -405,3 +417,63 @@ class TestDiscoveryNoAutoTrust:
 
         store = _get_store()
         assert not store.is_trusted("discovered.example.com")
+
+
+# ---------------------------------------------------------------------------
+# PublicHttpMarketplaceProvider — public, non-Circle marketplace discovery
+# ---------------------------------------------------------------------------
+
+
+class TestPublicHttpMarketplaceProvider:
+    async def test_search_public_json_marketplace_without_allowlist(self):
+        response = httpx.Response(
+            200,
+            json={
+                "services": [
+                    {
+                        "name": "Weather API",
+                        "endpoint": "https://weather.example/x402",
+                        "summary": "paid forecast",
+                        "price_usdc": "0.001",
+                        "chains": ["base"],
+                    }
+                ]
+            },
+            headers={"content-type": "application/json"},
+        )
+        client = _FakeHttpClient(response)
+
+        provider = PublicHttpMarketplaceProvider(
+            "https://market.example/search",
+            client=client,  # type: ignore[arg-type]
+        )
+        results = await provider.search("weather api", limit=5)
+
+        assert len(results) == 1
+        assert results[0].provider == "public-marketplace"
+        assert results[0].name == "Weather API"
+        assert results[0].url == "https://weather.example/x402"
+        assert results[0].advertised_price_usdc == "0.001"
+        assert results[0].advertised_networks == ("base",)
+        assert client.calls == ["https://market.example/search?query=weather+api&limit=5"]
+
+    async def test_search_template_marketplace_url(self):
+        response = httpx.Response(
+            200,
+            json={"items": []},
+            headers={"content-type": "application/json"},
+        )
+        client = _FakeHttpClient(response)
+
+        provider = PublicHttpMarketplaceProvider(
+            "https://market.example/find/{query}/{limit}",
+            client=client,  # type: ignore[arg-type]
+        )
+        results = await provider.search("agent tools", limit=2)
+
+        assert results == []
+        assert client.calls == ["https://market.example/find/agent+tools/2"]
+
+    async def test_private_marketplace_url_rejected(self):
+        with pytest.raises(ValueError):
+            PublicHttpMarketplaceProvider("https://127.0.0.1/search")
