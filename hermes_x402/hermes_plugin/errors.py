@@ -68,8 +68,8 @@ _ERROR_MAPPINGS: tuple[tuple[type[BaseException], str, bool], ...] = (
     (PaidResourceRequestError, "resource_failure_after_payment", False),
     # CLI errors — subclasses first
     (CircleCliExecutableNotFoundError, "circle_cli_executable_not_found", False),
-    (CircleCliNotSpawnedError, "circle_cli_not_spawned", False),
     (CircleCliNotInstalledError, "cli_missing", False),
+    (CircleCliNotSpawnedError, "circle_cli_not_spawned", False),
     (CircleCliVersionError, "cli_version_unsupported", False),
     (CircleCliAuthenticationRequiredError, "authentication_required", False),
     (CircleCliTermsRequiredError, "terms_action_required", False),

@@ -223,6 +223,48 @@ async def test_all_attempts_timeout_has_retry_safe_true(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcomes", "expected_error"),
+    [
+        (
+            [
+                asyncio.TimeoutError(),
+                socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+                socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+            ],
+            "dns_resolution_failed",
+        ),
+        (
+            [
+                socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+                asyncio.TimeoutError(),
+                asyncio.TimeoutError(),
+            ],
+            "dns_resolution_timeout",
+        ),
+        (
+            [
+                asyncio.TimeoutError(),
+                asyncio.TimeoutError(),
+                asyncio.TimeoutError(),
+            ],
+            "dns_resolution_timeout",
+        ),
+    ],
+)
+async def test_final_dns_failure_kind_controls_mixed_sequence_classification(
+    monkeypatch, outcomes, expected_error
+) -> None:
+    monkeypatch.setattr(mod, "_RESOLUTION_ATTEMPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(mod, "_RESOLUTION_BACKOFFS", (0, 0))
+    resolver = _SequenceResolver(outcomes)
+    with pytest.raises(mod.DnsValidationError) as raised:
+        await mod.resolve_and_validate_destination("https://example.com/", resolver=resolver)
+    assert raised.value.error_code == expected_error
+    assert raised.value.attempts == 3
+
+
+@pytest.mark.asyncio
 async def test_permanent_nxdomain_gaierror_classification() -> None:
     resolver = _SequenceResolver([socket.gaierror(socket.EAI_NONAME, "Name or service not known")])
     with pytest.raises(mod.DnsValidationError) as raised:

@@ -29,7 +29,7 @@ import asyncio
 import ipaddress
 import logging
 import time
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -302,7 +302,7 @@ async def _resolve_with_retries(
 ) -> tuple[list[tuple[int, str]], int, int]:
     """Resolve with bounded retries for transient DNS failures only."""
     started = time.monotonic()
-    last_timeout = False
+    final_failure_kind: Literal["timeout", "transient_dns"] | None = None
     last_exc: BaseException | None = None
 
     for attempt in range(1, _MAX_RESOLUTION_ATTEMPTS + 1):
@@ -321,7 +321,7 @@ async def _resolve_with_retries(
             )
             return resolved, attempt, elapsed_ms
         except asyncio.TimeoutError as exc:
-            last_timeout = True
+            final_failure_kind = "timeout"
             last_exc = exc
             logger.warning(
                 "DNS resolution attempt hostname=%s attempt=%d elapsed_ms=%d exception_class=%s",
@@ -331,6 +331,7 @@ async def _resolve_with_retries(
                 type(exc).__name__,
             )
         except _socket_mod.gaierror as exc:
+            final_failure_kind = "transient_dns"
             last_exc = exc
             logger.warning(
                 "DNS resolution attempt hostname=%s attempt=%d elapsed_ms=%d exception_class=%s",
@@ -386,7 +387,7 @@ async def _resolve_with_retries(
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     attempts = _MAX_RESOLUTION_ATTEMPTS
-    if last_timeout:
+    if final_failure_kind == "timeout":
         logger.info(
             "DNS validation failed hostname=%s attempts=%d elapsed_ms=%d "
             "classification=dns_resolution_timeout",

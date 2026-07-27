@@ -340,8 +340,12 @@ class CircleCliClient:
             ) from exc
         except CircleCliTimeoutBeforePaymentLogError:
             raise
-        except CircleCliInvalidJsonOutputError:
-            raise
+        except CircleCliInvalidJsonOutputError as exc:
+            raise CircleCliPaymentOutcomeUnknownError(
+                "Circle CLI services pay returned malformed JSON after the payment "
+                "command ran; payment may have been submitted and the operation "
+                "must not be retried automatically"
+            ) from exc
         except CircleCliExitNonzeroError:
             raise
         except CircleCliTimeoutError:

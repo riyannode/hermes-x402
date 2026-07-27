@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import os
 import re
@@ -27,7 +28,24 @@ _MAX_OUTPUT_BYTES = 256 * 1024
 _TERMINATE_GRACE_SECONDS = 3
 _SAFE_ENV_KEYS = ("HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE")
 _DIAGNOSTIC_TAIL_CHARS = 4000
+# Keep payment-log diagnostics bounded even for long-lived wallets.
+_MAX_PAYMENT_LOG_SNAPSHOT = 200
+_PAYMENT_TIMEOUT_GRACE_SECONDS = 30
+_SENSITIVE_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "payment-signature",
+        "x-payment",
+    }
+)
 _SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)((?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|payment-signature|x-payment)\s*[:=]\s*)([^\r\n]+)"
+    ),
     re.compile(r"(?i)(payment-signature\s*[:=]\s*)([^\s,'\"}]+)"),
     re.compile(r"(?i)(x-payment\s*[:=]\s*)([^\s,'\"}]+)"),
     re.compile(r'(?i)("paymentHeader"\s*:\s*")([^"]+)(")'),
@@ -51,15 +69,36 @@ class CircleCliRunner:
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
         read_timeout_seconds: float = 30,
-        cli_payment_timeout_seconds: float = 120,
-        payment_timeout_seconds: float = 150,
+        payment_timeout_seconds: float = 120,
+        cli_payment_timeout_seconds: float | None = None,
+        outer_payment_timeout_seconds: float | None = None,
+        payment_timeout_grace_seconds: float = _PAYMENT_TIMEOUT_GRACE_SECONDS,
     ):
         self.executable = executable
         self.cwd = cwd
         self.env = dict(env or {})
         self.read_timeout_seconds = read_timeout_seconds
-        self.cli_payment_timeout_seconds = cli_payment_timeout_seconds
-        self.payment_timeout_seconds = payment_timeout_seconds
+        cli_timeout = (
+            payment_timeout_seconds
+            if cli_payment_timeout_seconds is None
+            else cli_payment_timeout_seconds
+        )
+        outer_timeout = (
+            cli_timeout + payment_timeout_grace_seconds
+            if outer_payment_timeout_seconds is None
+            else outer_payment_timeout_seconds
+        )
+        if cli_timeout <= 0:
+            raise ValueError("Circle CLI payment timeout must be positive")
+        if payment_timeout_grace_seconds < 0:
+            raise ValueError("Circle CLI payment timeout grace must be non-negative")
+        if outer_timeout <= cli_timeout:
+            raise ValueError(
+                "Outer Circle CLI payment deadline must be greater than the CLI --timeout"
+            )
+        self.cli_payment_timeout_seconds = cli_timeout
+        self.payment_timeout_seconds = outer_timeout
+        self.payment_timeout_grace_seconds = payment_timeout_grace_seconds
         self.last_diagnostics: CircleCliDiagnostics | None = None
 
     @staticmethod
@@ -85,19 +124,53 @@ class CircleCliRunner:
         return argv
 
     @staticmethod
+    def _redact_header_value(value: str) -> str:
+        header = value.strip()
+        if ":" in header:
+            name, _raw_value = header.split(":", 1)
+        elif "=" in header:
+            name, _raw_value = header.split("=", 1)
+        else:
+            return "[REDACTED]"
+        safe_name = CircleCliRunner._sanitize_text(name.strip())
+        if not safe_name:
+            return "[REDACTED]"
+        # Header argv diagnostics should never retain values. Keeping only the
+        # name is enough to debug CLI shape without leaking auth/payment proofs.
+        return f"{safe_name}: [REDACTED]"
+
+    @staticmethod
     def _redact_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
-        """Return a copy of *argv* with any sensitive value replaced by [REDACTED]."""
+        """Return a copy of *argv* with sensitive values replaced by [REDACTED]."""
         redacted: list[str] = []
         redact_next_for = {"--otp"}
-        skip_next = False
+        header_flags = {"-H", "--header"}
+        skip_next_sensitive = False
+        skip_next_header = False
         for token in argv:
-            if skip_next:
+            if skip_next_sensitive:
                 redacted.append("[REDACTED]")
-                skip_next = False
+                skip_next_sensitive = False
                 continue
+            if skip_next_header:
+                redacted.append(CircleCliRunner._redact_header_value(token))
+                skip_next_header = False
+                continue
+
+            if token in header_flags:
+                redacted.append(token)
+                skip_next_header = True
+                continue
+            if token.startswith("-H="):
+                redacted.append("-H=" + CircleCliRunner._redact_header_value(token[3:]))
+                continue
+            if token.startswith("--header="):
+                redacted.append("--header=" + CircleCliRunner._redact_header_value(token[9:]))
+                continue
+
             redacted.append(CircleCliRunner._sanitize_text(token))
             if token in redact_next_for:
-                skip_next = True
+                skip_next_sensitive = True
         return tuple(redacted)
 
     @staticmethod
@@ -122,13 +195,21 @@ class CircleCliRunner:
         return environment
 
     @staticmethod
-    async def _read_limited(stream: asyncio.StreamReader) -> str:
-        collected = bytearray()
+    def _decode_buffer(collected: bytearray) -> str:
+        return bytes(collected).decode("utf-8", errors="replace")
+
+    @staticmethod
+    async def _read_limited(
+        stream: asyncio.StreamReader, collected: bytearray | None = None
+    ) -> str:
+        if collected is None:
+            collected = bytearray()
         while chunk := await stream.read(64 * 1024):
             collected.extend(chunk)
             if len(collected) > _MAX_OUTPUT_BYTES:
+                del collected[:-_MAX_OUTPUT_BYTES]
                 raise CircleCliOutputError("Circle CLI output exceeded the safe diagnostic limit")
-        return collected.decode("utf-8", errors="replace")
+        return CircleCliRunner._decode_buffer(collected)
 
     @staticmethod
     async def _stop(process: asyncio.subprocess.Process) -> None:
@@ -148,13 +229,34 @@ class CircleCliRunner:
 
     @classmethod
     def _payment_logs(cls, env: Mapping[str, str], operation: Operation) -> tuple[str, ...]:
+        """Return a bounded deterministic snapshot of newest payment log names.
+
+        The Circle CLI payment directory can contain thousands of historical
+        entries. Diagnostics only need enough recent names to detect whether
+        this process created a new log, so retain at most
+        ``_MAX_PAYMENT_LOG_SNAPSHOT`` newest ``payment-*.json`` filenames by
+        ``(mtime_ns, name)`` without reading file contents. Filesystem errors
+        fail closed to an empty snapshot so diagnostics never block payment
+        error handling.
+        """
         if operation != "payment":
             return ()
         log_dir = cls._payment_log_dir(env)
         try:
-            return tuple(sorted(path.name for path in log_dir.glob("payment-*.json")))
+            with os.scandir(log_dir) as entries:
+                newest = heapq.nlargest(
+                    _MAX_PAYMENT_LOG_SNAPSHOT,
+                    (
+                        (entry.stat().st_mtime_ns, entry.name)
+                        for entry in entries
+                        if entry.is_file()
+                        and entry.name.startswith("payment-")
+                        and entry.name.endswith(".json")
+                    ),
+                )
         except OSError:
             return ()
+        return tuple(name for _mtime, name in sorted(newest))
 
     def _diagnostics(
         self,
@@ -261,25 +363,42 @@ class CircleCliRunner:
             pid=getattr(process, "pid", None),
             logs_before=logs_before,
         )
-        stdout_task = asyncio.create_task(self._read_limited(process.stdout))
-        stderr_task = asyncio.create_task(self._read_limited(process.stderr))
+        stdout_buffer = bytearray()
+        stderr_buffer = bytearray()
+        stdout_task = asyncio.create_task(self._read_limited(process.stdout, stdout_buffer))
+        stderr_task = asyncio.create_task(self._read_limited(process.stderr, stderr_buffer))
         exit_task = asyncio.create_task(process.wait())
         try:
-            # Readers and process exit share one deadline. In particular, closed pipes
-            # do not imply that the CLI (or a child it left behind) has exited.
-            stdout, stderr, _ = await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task, exit_task), timeout=timeout_seconds
+            # Readers and process exit share one deadline. Use asyncio.wait()
+            # instead of wait_for(gather(...)) so a timeout does not cancel the
+            # pipe readers before their bounded buffers can be used in diagnostics.
+            _done, pending = await asyncio.wait(
+                {stdout_task, stderr_task, exit_task},
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_EXCEPTION,
             )
+            for completed in _done:
+                completed.result()
+            if pending:
+                raise asyncio.TimeoutError
+            stdout = stdout_task.result()
+            stderr = stderr_task.result()
+            exit_task.result()
         except asyncio.TimeoutError as exc:
             await self._stop(process)
-            stdout_task.cancel()
-            stderr_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(stdout_task, stderr_task, return_exceptions=True),
+                    timeout=_TERMINATE_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                stdout_task.cancel()
+                stderr_task.cancel()
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             exit_task.cancel()
-            output = await asyncio.gather(
-                stdout_task, stderr_task, exit_task, return_exceptions=True
-            )
-            stdout = output[0] if isinstance(output[0], str) else ""
-            stderr = output[1] if isinstance(output[1], str) else ""
+            await asyncio.gather(exit_task, return_exceptions=True)
+            stdout = self._decode_buffer(stdout_buffer)
+            stderr = self._decode_buffer(stderr_buffer)
             diag = self._diagnostics(
                 stage="cli_timed_out",
                 start=start,
