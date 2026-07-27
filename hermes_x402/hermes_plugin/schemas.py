@@ -125,6 +125,7 @@ X402_SERVICE_INSPECT_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },
@@ -151,6 +152,7 @@ X402_SUPPORTS_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },
@@ -178,6 +180,7 @@ X402_FETCH_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },
@@ -209,6 +212,7 @@ X402_PAY_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
             "max_usdc": {
@@ -325,6 +329,7 @@ X402_GATEWAY_DEPOSIT_PREVIEW_SCHEMA: dict[str, Any] = {
                 "description": "USDC amount to preview depositing.",
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },

@@ -22,6 +22,7 @@ Registered tools (14 total):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -93,6 +94,24 @@ def _service_option_fingerprint(option: Any, x402_version: str | int) -> str:
         "x402_version": x402_version,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _format_dns_validation_error(exc: ValueError) -> str:
+    """Return structured, retry-aware DNS validation failure JSON."""
+    payload: dict[str, Any] = {
+        "success": False,
+        "error": getattr(exc, "error_code", "destination_not_allowed"),
+        "message": str(exc),
+    }
+    if hasattr(exc, "retry_safe"):
+        payload["retry_safe"] = bool(exc.retry_safe)  # type: ignore[attr-defined]
+    attempts = getattr(exc, "attempts", 0)
+    if attempts:
+        payload["attempts"] = attempts
+    elapsed_ms = getattr(exc, "elapsed_ms", 0)
+    if elapsed_ms:
+        payload["elapsed_ms"] = elapsed_ms
+    return format_success_result(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -968,9 +987,7 @@ def register_supports_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         try:
             from hermes_x402.buyer.supports import check_supports
@@ -1087,9 +1104,7 @@ def register_service_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -1203,9 +1218,7 @@ def register_payment_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -1329,6 +1342,9 @@ def register_payment_tools(ctx: Any) -> None:
         url = args.get("url", "")
         method = (args.get("method") or "GET").upper()
         body = args.get("body")
+        if isinstance(body, str):
+            with contextlib.suppress(ValueError, TypeError):
+                body = json.loads(body)
         max_usdc = args.get("max_usdc")
 
         err = _validate_url(url)
@@ -1419,9 +1435,7 @@ def register_payment_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         buyer = runtime.buyer_tool
         if buyer is None:
@@ -2013,9 +2027,7 @@ def register_gateway_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(service_url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         # Use the existing x402 challenge parser (check_supports)
         # This handles v2 header, v1 body, GatewayWalletBatched detection,

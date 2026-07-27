@@ -9,8 +9,16 @@ class CircleCliError(BuyerError):
     """Base Circle CLI failure with no raw process output attached."""
 
 
-class CircleCliNotInstalledError(CircleCliError):
+class CircleCliNotSpawnedError(CircleCliError):
+    """Circle CLI subprocess was not spawned."""
+
+
+class CircleCliNotInstalledError(CircleCliNotSpawnedError):
     """The configured Circle executable cannot be started."""
+
+
+class CircleCliExecutableNotFoundError(CircleCliNotInstalledError):
+    """The configured Circle executable was not found."""
 
 
 class CircleCliVersionError(CircleCliError):
@@ -18,11 +26,23 @@ class CircleCliVersionError(CircleCliError):
 
 
 class CircleCliTimeoutError(CircleCliError):
-    """A non-payment Circle CLI operation timed out."""
+    """A Circle CLI operation timed out."""
+
+
+class CircleCliTimeoutBeforePaymentLogError(CircleCliTimeoutError):
+    """Payment command timed out before Circle CLI persisted a payment log."""
+
+
+class CircleCliTimeoutAfterPaymentLogError(CircleCliTimeoutError):
+    """Payment command timed out after Circle CLI persisted a payment log."""
 
 
 class CircleCliOutputError(CircleCliError):
     """Circle CLI emitted malformed, oversized, or unexpected output."""
+
+
+class CircleCliInvalidJsonOutputError(CircleCliOutputError):
+    """Circle CLI emitted output that could not be parsed as JSON."""
 
 
 class CircleCliAuthenticationRequiredError(CircleCliError):
@@ -55,6 +75,10 @@ class CircleCliPaymentRejectedError(CircleCliError):
 
 class CircleCliPaymentFailedError(CircleCliError):
     """Circle CLI reported a definite payment failure."""
+
+
+class CircleCliExitNonzeroError(CircleCliPaymentFailedError):
+    """Circle CLI exited non-zero without evidence of payment submission."""
 
 
 class CircleCliPaymentOutcomeUnknownError(CircleCliError):

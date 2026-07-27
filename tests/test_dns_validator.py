@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import socket
 from unittest.mock import AsyncMock
@@ -156,3 +157,196 @@ async def test_max_records_bound() -> None:
         "https://example.com/", resolver=_mock_resolver(ips)
     )
     assert len(result) == 10
+
+
+# ── DNS retry / classification regressions ───────────────────────────────
+
+
+class _SequenceResolver:
+    def __init__(self, outcomes: list[object], family: int = socket.AF_INET):
+        self.outcomes = list(outcomes)
+        self.family = family
+        self.calls = 0
+
+    async def resolve(self, host: str, family: int = 0) -> list[tuple[int, str]]:
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return [(self.family, ip) for ip in outcome]
+
+
+@pytest.mark.asyncio
+async def test_first_timeout_second_attempt_success(monkeypatch) -> None:
+    monkeypatch.setattr(mod, "_RESOLUTION_ATTEMPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(mod, "_RESOLUTION_BACKOFFS", (0, 0))
+    resolver = _SequenceResolver([asyncio.TimeoutError(), ["93.184.216.34"]])
+    result = await mod.resolve_and_validate_destination("https://example.com/", resolver=resolver)
+    assert result == ("93.184.216.34",)
+    assert resolver.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_two_timeouts_third_attempt_success(monkeypatch) -> None:
+    monkeypatch.setattr(mod, "_RESOLUTION_ATTEMPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(mod, "_RESOLUTION_BACKOFFS", (0, 0))
+    resolver = _SequenceResolver(
+        [
+            asyncio.TimeoutError(),
+            asyncio.TimeoutError(),
+            ["93.184.216.34"],
+        ]
+    )
+    result = await mod.resolve_and_validate_destination("https://example.com/", resolver=resolver)
+    assert result == ("93.184.216.34",)
+    assert resolver.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_all_attempts_timeout_has_retry_safe_true(monkeypatch) -> None:
+    monkeypatch.setattr(mod, "_RESOLUTION_ATTEMPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(mod, "_RESOLUTION_BACKOFFS", (0, 0))
+    resolver = _SequenceResolver(
+        [
+            asyncio.TimeoutError(),
+            asyncio.TimeoutError(),
+            asyncio.TimeoutError(),
+        ]
+    )
+    with pytest.raises(mod.DnsValidationError) as raised:
+        await mod.resolve_and_validate_destination("https://example.com/", resolver=resolver)
+    exc = raised.value
+    assert exc.error_code == "dns_resolution_timeout"
+    assert exc.retry_safe is True
+    assert exc.attempts == 3
+    assert "3 attempts" in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_permanent_nxdomain_gaierror_classification() -> None:
+    resolver = _SequenceResolver([socket.gaierror(socket.EAI_NONAME, "Name or service not known")])
+    with pytest.raises(mod.DnsValidationError) as raised:
+        await mod.resolve_and_validate_destination("https://missing.example/", resolver=resolver)
+    exc = raised.value
+    assert exc.error_code == "dns_resolution_failed"
+    assert exc.retry_safe is True
+    assert exc.attempts == 1
+    assert resolver.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_temporary_gaierror_retries_then_success(monkeypatch) -> None:
+    monkeypatch.setattr(mod, "_RESOLUTION_BACKOFFS", (0, 0))
+    resolver = _SequenceResolver(
+        [
+            socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+            ["93.184.216.34"],
+        ]
+    )
+    result = await mod.resolve_and_validate_destination("https://example.com/", resolver=resolver)
+    assert result == ("93.184.216.34",)
+    assert resolver.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_getaddrinfo_results_deduplicated() -> None:
+    resolver = _SequenceResolver(
+        [
+            [
+                "43.156.11.37",
+                "43.156.11.37",
+                "43.156.11.37",
+            ]
+        ]
+    )
+    result = await mod.resolve_and_validate_destination(
+        "https://api.flowvidence.my.id/", resolver=resolver
+    )
+    assert result == ("43.156.11.37",)
+
+
+@pytest.mark.asyncio
+async def test_public_ipv4_success() -> None:
+    result = await mod.resolve_and_validate_destination(
+        "https://public.example/", resolver=_mock_resolver(["93.184.216.34"])
+    )
+    assert result == ("93.184.216.34",)
+
+
+@pytest.mark.asyncio
+async def test_private_reserved_ip_rejected_without_retry() -> None:
+    resolver = _SequenceResolver([["10.0.0.1"], ["93.184.216.34"]])
+    with pytest.raises(mod.DnsValidationError) as raised:
+        await mod.resolve_and_validate_destination("https://private.example/", resolver=resolver)
+    exc = raised.value
+    assert exc.error_code == "destination_ip_rejected"
+    assert exc.retry_safe is False
+    assert resolver.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_public_private_results_rejected_without_retry() -> None:
+    resolver = _SequenceResolver([["93.184.216.34", "192.168.1.1"], ["93.184.216.34"]])
+    with pytest.raises(mod.DnsValidationError) as raised:
+        await mod.resolve_and_validate_destination("https://mixed.example/", resolver=resolver)
+    exc = raised.value
+    assert exc.error_code == "destination_ip_rejected"
+    assert exc.retry_safe is False
+    assert resolver.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pay_handler_dns_failure_does_not_call_backend(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from hermes_x402.dns_validator import DnsValidationError
+    from hermes_x402.hermes_plugin import tools as plugin_tools
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.tools = {}
+
+        def register_tool(self, **kwargs):
+            self.tools[kwargs["name"]] = kwargs["handler"]
+
+    buyer = SimpleNamespace(pay=AsyncMock())
+    runtime = SimpleNamespace(
+        ensure_initialized=lambda: None,
+        is_available=True,
+        config=SimpleNamespace(
+            network_policy="public",
+            host_allowlist=(),
+            allow_http=False,
+            max_usdc_per_payment="0.003",
+            require_approval_for_new_host=False,
+        ),
+        buyer_tool=buyer,
+    )
+    monkeypatch.setattr(plugin_tools, "get_runtime", lambda: runtime)
+
+    async def _fail_dns(url: str):
+        raise DnsValidationError(
+            "DNS resolution for api.flowvidence.my.id timed out after 3 attempts in 1000ms.",
+            error_code="dns_resolution_timeout",
+            retry_safe=True,
+            attempts=3,
+            elapsed_ms=1000,
+        )
+
+    monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", _fail_dns)
+    ctx = _Ctx()
+    plugin_tools.register_payment_tools(ctx)
+    result = await ctx.tools["x402_pay"](
+        {
+            "url": "https://api.flowvidence.my.id/v1/intelligence/addresses",
+            "method": "POST",
+            "body": {
+                "addresses": ["0x3c46624b62fa4cf3d63e6bdd60dc1b79a43ceb22"],
+                "network": "arcTestnet",
+            },
+            "max_usdc": "0.000250",
+        }
+    )
+    assert '"error": "dns_resolution_timeout"' in result
+    assert '"retry_safe": true' in result
+    buyer.pay.assert_not_awaited()

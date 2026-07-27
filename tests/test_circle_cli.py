@@ -30,7 +30,16 @@ from hermes_x402 import (
     X402Config,
     X402HermesAgent,
 )
+from hermes_x402.circle_cli.errors import (
+    CircleCliExecutableNotFoundError,
+    CircleCliExitNonzeroError,
+    CircleCliInvalidJsonOutputError,
+    CircleCliNotInstalledError,
+    CircleCliTimeoutAfterPaymentLogError,
+    CircleCliTimeoutBeforePaymentLogError,
+)
 from hermes_x402.circle_cli.models import CircleCliResult
+from hermes_x402.hermes_plugin.errors import format_error_result
 
 ADDRESS = "0x1111111111111111111111111111111111111111"
 SELLER = "0x2222222222222222222222222222222222222222"
@@ -42,6 +51,7 @@ def result(args: tuple[str, ...], data: dict[str, Any], exit_code: int = 0) -> C
 
 class FakeRunner:
     read_timeout_seconds = 1
+    cli_payment_timeout_seconds = 1
     payment_timeout_seconds = 1
 
     def __init__(self, *, pay_result: CircleCliResult | Exception | None = None):
@@ -194,10 +204,162 @@ class TestCircleCliRunner:
             await runner.run_json(
                 ("services", "pay", "large"), timeout_seconds=2, operation="payment"
             )
-        with pytest.raises(CircleCliOutputError):
+        with pytest.raises(CircleCliInvalidJsonOutputError):
             await runner.run_json(
                 ("services", "pay", "badjson"), timeout_seconds=2, operation="payment"
             )
+
+    @pytest.mark.asyncio
+    async def test_executable_not_found_is_classified_before_spawn(self, tmp_path):
+        runner = CircleCliRunner(executable=str(tmp_path / "missing-circle"))
+        with pytest.raises(CircleCliExecutableNotFoundError):
+            await runner.run_json(
+                ("wallet", "status", "--output", "json"), timeout_seconds=1, operation="read"
+            )
+        assert runner.last_diagnostics is not None
+        assert runner.last_diagnostics.stage == "cli_not_spawned"
+        assert runner.last_diagnostics.pid is None
+
+    @pytest.mark.asyncio
+    async def test_spawn_oserror_is_not_spawned(self, monkeypatch):
+        async def fail_spawn(*_, **__):
+            raise OSError("spawn denied")
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fail_spawn)
+        runner = CircleCliRunner()
+        with pytest.raises(CircleCliNotInstalledError):
+            await runner.run_json(
+                ("wallet", "status", "--output", "json"), timeout_seconds=1, operation="read"
+            )
+        assert runner.last_diagnostics is not None
+        assert runner.last_diagnostics.stage == "cli_not_spawned"
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_retains_sanitized_stderr_and_exit_code(self, tmp_path):
+        executable = tmp_path / "circle-fail"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stderr.write('boom Payment-Signature: secret-token\\n')\n"
+            "raise SystemExit(7)\n"
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        runner = CircleCliRunner(executable=str(executable))
+        result_obj = await runner.run_json(
+            ("services", "pay", "https://example.test", "--output", "json"),
+            timeout_seconds=1,
+            operation="payment",
+        )
+        assert result_obj.exit_code == 7
+        assert runner.last_diagnostics is not None
+        assert runner.last_diagnostics.return_code == 7
+        assert "secret-token" not in runner.last_diagnostics.stderr_tail
+        assert "[REDACTED]" in runner.last_diagnostics.stderr_tail
+
+    @pytest.mark.asyncio
+    async def test_timeout_before_payment_log_is_distinct(self, fake_cli, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        runner = CircleCliRunner(executable=str(fake_cli), env={"HOME": str(home)})
+        with pytest.raises(CircleCliTimeoutBeforePaymentLogError):
+            await runner.run_json(
+                ("services", "pay", "sleep"), timeout_seconds=0.01, operation="payment"
+            )
+        assert runner.last_diagnostics is not None
+        assert runner.last_diagnostics.timed_out is True
+        assert runner.last_diagnostics.new_payment_logs == ()
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_payment_log_is_ambiguous(self, tmp_path):
+        executable = tmp_path / "circle-log-then-sleep"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            "import os, time\n"
+            "d = Path(os.environ['HOME']) / '.circle-cli' / 'payments'\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'payment-test.json').write_text('{}')\n"
+            "time.sleep(5)\n"
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        home = tmp_path / "home"
+        home.mkdir()
+        runner = CircleCliRunner(executable=str(executable), env={"HOME": str(home)})
+        with pytest.raises(CircleCliTimeoutAfterPaymentLogError):
+            await runner.run_json(
+                ("services", "pay", "https://example.test"),
+                timeout_seconds=0.2,
+                operation="payment",
+            )
+        assert runner.last_diagnostics is not None
+        assert runner.last_diagnostics.new_payment_logs == ("payment-test.json",)
+
+    @pytest.mark.asyncio
+    async def test_success_json_output_records_pid_elapsed_and_parse_status(self, fake_cli):
+        runner = CircleCliRunner(executable=str(fake_cli))
+        result_obj = await runner.run_json(
+            ("wallet", "status", "--output", "json"), timeout_seconds=1, operation="read"
+        )
+        assert result_obj.parsed == {"data": {"ok": True}}
+        assert result_obj.diagnostics is not None
+        assert result_obj.diagnostics.pid is not None
+        assert result_obj.diagnostics.elapsed_seconds is not None
+        assert result_obj.diagnostics.json_parse_ok is True
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_redact_payment_signature_and_json_signature(self, tmp_path):
+        executable = tmp_path / "circle-redact"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "signature = '{\"signature\":\"0x' + 'a'*130 + '\"}'\n"
+            "sys.stderr.write(signature + ' Payment-Signature: secret-token\\n')\n"
+            "print(json.dumps({'data': {'ok': True}}))\n"
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        runner = CircleCliRunner(executable=str(executable))
+        result_obj = await runner.run_json(
+            (
+                "services",
+                "pay",
+                "https://example.test",
+                "-H",
+                "Payment-Signature: secret-token",
+                "--output",
+                "json",
+            ),
+            timeout_seconds=1,
+            operation="payment",
+        )
+        assert result_obj.diagnostics is not None
+        diagnostic_blob = (
+            " ".join(result_obj.diagnostics.sanitized_argv) + result_obj.diagnostics.stderr_tail
+        )
+        assert "secret-token" not in diagnostic_blob
+        assert "a" * 130 not in diagnostic_blob
+        assert "[REDACTED]" in diagnostic_blob
+
+    def test_error_mapping_only_ambiguous_evidence_uses_payment_outcome_unknown(self):
+        assert (
+            json.loads(format_error_result(CircleCliExitNonzeroError("exit")))["error"]
+            == "circle_cli_exit_nonzero"
+        )
+        assert (
+            json.loads(format_error_result(CircleCliTimeoutBeforePaymentLogError("timeout")))[
+                "error"
+            ]
+            == "circle_cli_timeout_before_payment_log"
+        )
+        assert (
+            json.loads(format_error_result(CircleCliInvalidJsonOutputError("json")))["error"]
+            == "circle_cli_invalid_json_output"
+        )
+        assert (
+            json.loads(format_error_result(CircleCliTimeoutAfterPaymentLogError("timeout")))[
+                "error"
+            ]
+            == "payment_outcome_unknown"
+        )
 
 
 class TestCircleCliClientAndBackend:
@@ -487,10 +649,10 @@ class TestCircleCliClientAndBackend:
             )
 
     @pytest.mark.asyncio
-    async def test_timeout_is_ambiguous_and_not_retried(self):
+    async def test_timeout_without_payment_log_is_not_ambiguous(self):
         runner = FakeRunner(pay_result=CircleCliTimeoutError("timeout"))
         client = CircleCliClient(runner)
-        with pytest.raises(CircleCliPaymentOutcomeUnknownError):
+        with pytest.raises(CircleCliTimeoutError):
             await client.pay_x402(
                 url="https://example.test",
                 method="GET",
@@ -592,6 +754,7 @@ class TestChainIdentityComparison:
         """Return a FakeRunner whose blockchain list includes ARC-TESTNET."""
         runner = FakeRunner.__new__(FakeRunner)
         runner.read_timeout_seconds = 1
+        runner.cli_payment_timeout_seconds = 1
         runner.payment_timeout_seconds = 1
         runner.calls = []
         runner.pay_result = result(

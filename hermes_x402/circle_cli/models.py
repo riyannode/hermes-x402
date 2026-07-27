@@ -7,12 +7,35 @@ from typing import Any, Literal
 
 
 @dataclass(frozen=True)
+class CircleCliDiagnostics:
+    stage: str
+    monotonic_start: float
+    elapsed_seconds: float | None = None
+    executable: str = ""
+    cwd: str | None = None
+    sanitized_argv: tuple[str, ...] = ()
+    pid: int | None = None
+    return_code: int | None = None
+    termination_signal: int | None = None
+    timed_out: bool = False
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    json_parse_ok: bool | None = None
+    json_parse_error: str | None = None
+    payment_log_dir: str | None = None
+    payment_logs_before: tuple[str, ...] = ()
+    payment_logs_after: tuple[str, ...] = ()
+    new_payment_logs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CircleCliResult:
     argv: tuple[str, ...]  # OTP values are redacted to [REDACTED] for safety
     exit_code: int
     stdout: str
     stderr: str
     parsed: dict[str, Any] | list[Any] | None
+    diagnostics: CircleCliDiagnostics | None = None
 
 
 @dataclass(frozen=True)
