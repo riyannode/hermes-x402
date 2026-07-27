@@ -72,9 +72,11 @@ gateway = create_aiohttp_gateway(
     public_base_url="https://seller.example/x402",
 )
 
+
 @gateway.require("$0.01")
 async def premium_data(request):
     return web.json_response({"secret": 42})
+
 
 app = web.Application()
 app.router.add_get("/premium", premium_data)
@@ -99,6 +101,7 @@ export CIRCLE_API_KEY="your-api-key"
 # Or CLI credentials (for cli backend)
 export CIRCLE_AGENT_WALLET_ADDRESS="0xYourAgentWallet..."
 export CIRCLE_AGENT_WALLET_NETWORK="ARC-TESTNET"
+# Optional stricter local override; Circle CLI still receives the fresh challenge amount as --max-amount when omitted.
 export X402_MAX_USDC_PER_PAYMENT="0.10"
 
 # Network preference
@@ -263,8 +266,6 @@ All configuration is via environment variables. No config files required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| Variable | Default | Description |
-|----------|---------|-------------|
 | `X402_SELLER_ADDRESS` | `""` | PayTo address for seller mode (`0x` + 40 hex) |
 | `X402_CHAIN` | `arcTestnet` | Chain key (legacy; network registry overrides) |
 | `X402_FACILITATOR_URL` | *(auto)* | Circle Gateway facilitator URL (auto-resolved from network) |
@@ -293,7 +294,7 @@ All configuration is via environment variables. No config files required.
 | `X402_REQUIRE_GATEWAY_BATCHING` | `true` | Require Circle Gateway batching scheme |
 | `X402_REQUIRE_APPROVAL_FOR_NEW_HOST` | `false` | Require user approval before paying new hosts |
 | `X402_DAILY_BUDGET_USDC` | *(none)* | Daily USDC spending cap |
-| `X402_MAX_USDC_PER_PAYMENT` | *(none)* | Max USDC per single payment (CLI backend requires this) |
+| `X402_MAX_USDC_PER_PAYMENT` | *(none)* | Optional stricter local max USDC per single CLI payment |
 | `X402_ALLOW_CHAT_OTP` | `false` | Allow OTP through chat (not secure/private — OTP passes through conversation history) |
 
 ### Circle Credentials
@@ -322,6 +323,21 @@ Any public HTTPS destination may be inspected or paid. The following are **alway
 - Metadata endpoints (`metadata.google.internal`, `169.254.169.254`)
 - URLs with embedded credentials (userinfo)
 - HTTP URLs (unless `X402_ALLOW_HTTP=true`)
+
+Direct public payment without permanent host registration:
+
+```bash
+export X402_NETWORK_POLICY=public
+export X402_HOST_ALLOWLIST=
+export X402_REQUIRE_APPROVAL_FOR_NEW_HOST=false
+export X402_ALLOW_HTTP=false
+```
+
+With this setup, a user-supplied public HTTPS `x402_pay` URL does not need `trust_host()`, `x402_trusted_hosts.json`, `X402_HOST_ALLOWLIST`, or `X402_DISCOVERY_HOST_ALLOWLIST`. Each payment still goes through the native Hermes approval for the payment-capable `x402_pay` tool, then obtains a fresh 402 challenge. DNS and SSRF validation remain active, and ambiguous outcomes stay non-retryable.
+
+For the Circle CLI backend, `X402_MAX_USDC_PER_PAYMENT` is optional. When neither the configured cap nor caller `max_usdc` is supplied, the validated fresh challenge amount is still passed to Circle CLI as `--max-amount`; the CLI is never invoked with an unlimited or omitted effective payment limit.
+
+Public marketplace discovery (`x402_service_search` with `marketplace_url`) is informational only. It does not trust, persist, or automatically pay discovered endpoints; a later `x402_pay` independently repeats policy checks, DNS validation, fresh challenge acquisition, native manual approval, and exactly-once payment handling.
 
 ### `strict_allowlist` Mode (Opt-in)
 Only hosts listed in `X402_HOST_ALLOWLIST` are permitted. An empty allowlist means **nothing** is allowed.
