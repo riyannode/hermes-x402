@@ -847,6 +847,7 @@ def register_discovery_tools(ctx: Any) -> None:
     async def service_search_handler(args: dict, **kwargs: Any) -> str:
         query = args.get("query", "")
         limit = args.get("limit", 10)
+        marketplace_url = args.get("marketplace_url")
 
         err = _validate_query(query)
         if err:
@@ -866,6 +867,63 @@ def register_discovery_tools(ctx: Any) -> None:
 
         runtime = get_runtime()
         runtime.ensure_initialized()
+
+        if marketplace_url is not None:
+            if not isinstance(marketplace_url, str) or not marketplace_url.strip():
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "invalid_input",
+                        "message": "marketplace_url must be a non-empty string.",
+                    }
+                )
+            if runtime.config is None:
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "configuration_error",
+                        "message": "x402 configuration is not initialized.",
+                    }
+                )
+            try:
+                from hermes_x402.discovery.circle_marketplace import PublicMarketplaceProvider
+
+                provider = PublicMarketplaceProvider(
+                    marketplace_url=marketplace_url.strip(),
+                    network_policy=runtime.config.network_policy,
+                    discovery_host_allowlist=runtime.config.discovery_host_allowlist,
+                    allow_http=runtime.config.allow_http,
+                )
+                services = await provider.search(query, limit=limit)
+                results = [
+                    {
+                        "name": svc.name,
+                        "description": svc.description or "",
+                        "url": svc.url,
+                        "advertised_price_usdc": svc.advertised_price_usdc or "",
+                        "advertised_networks": list(svc.advertised_networks),
+                    }
+                    for svc in services[:MAX_SEARCH_RESULTS]
+                ]
+                return format_success_result(
+                    {
+                        "success": True,
+                        "provider": "public_marketplace",
+                        "marketplace_url": marketplace_url.strip(),
+                        "query": query,
+                        "count": len(results),
+                        "services": results,
+                        "trust_boundary": (
+                            "Discovery is informational only; x402_pay independently repeats "
+                            "policy, DNS, fresh challenge, manual approval, and exactly-once "
+                            "payment handling."
+                        ),
+                    }
+                )
+            except ValueError as exc:
+                return _format_dns_validation_error(exc)
+            except Exception as exc:
+                return format_error_result(exc)
 
         if runtime.cli_client is None:
             return format_success_result(

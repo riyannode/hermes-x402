@@ -100,6 +100,13 @@ X402_SERVICE_SEARCH_SCHEMA: dict[str, Any] = {
                 "type": "integer",
                 "description": "Maximum results to return (1-25, default 10).",
             },
+            "marketplace_url": {
+                "type": "string",
+                "description": (
+                    "Optional public marketplace URL for read-only GET discovery. "
+                    "When absent, uses the Circle CLI marketplace search."
+                ),
+            },
         },
         "required": ["query"],
     },
