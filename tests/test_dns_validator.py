@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import socket
 from unittest.mock import AsyncMock
 
@@ -391,4 +392,198 @@ async def test_pay_handler_dns_failure_does_not_call_backend(monkeypatch) -> Non
     )
     assert '"error": "dns_resolution_timeout"' in result
     assert '"retry_safe": true' in result
+    buyer.pay.assert_not_awaited()
+
+
+class _ToolCtx:
+    def __init__(self) -> None:
+        self.tools = {}
+
+    def register_tool(self, **kwargs):
+        self.tools[kwargs["name"]] = kwargs["handler"]
+
+
+def _payment_runtime(*, mode="public", allowlist=(), require_approval=False, buyer=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        ensure_initialized=lambda: None,
+        is_available=True,
+        config=SimpleNamespace(
+            network_policy=mode,
+            host_allowlist=allowlist,
+            allow_http=False,
+            max_usdc_per_payment=None,
+            require_approval_for_new_host=require_approval,
+        ),
+        buyer_tool=buyer
+        or SimpleNamespace(
+            pay=AsyncMock(
+                return_value=SimpleNamespace(
+                    payment_status="resource_succeeded",
+                    status=200,
+                    payer="0x1111111111111111111111111111111111111111",
+                    amount="1000",
+                    network="eip155:8453",
+                    transaction_id=None,
+                    data={"ok": True},
+                )
+            )
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_mode_empty_allowlist_permits_direct_public_pay(monkeypatch) -> None:
+    from hermes_x402.hermes_plugin import tools as plugin_tools
+
+    buyer = _payment_runtime().buyer_tool
+    runtime = _payment_runtime(mode="public", allowlist=(), buyer=buyer)
+    monkeypatch.setattr(plugin_tools, "get_runtime", lambda: runtime)
+
+    async def _dns_ok(url: str):
+        return ("93.184.216.34",)
+
+    monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", _dns_ok)
+    ctx = _ToolCtx()
+    plugin_tools.register_payment_tools(ctx)
+
+    result = json.loads(await ctx.tools["x402_pay"]({"url": "https://arbitrary.example/pay"}))
+
+    assert result["success"] is True
+    buyer.pay.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_strict_allowlist_empty_rejects_same_direct_public_pay(monkeypatch) -> None:
+    from hermes_x402.hermes_plugin import tools as plugin_tools
+
+    buyer = _payment_runtime().buyer_tool
+    runtime = _payment_runtime(mode="strict_allowlist", allowlist=(), buyer=buyer)
+    monkeypatch.setattr(plugin_tools, "get_runtime", lambda: runtime)
+    ctx = _ToolCtx()
+    plugin_tools.register_payment_tools(ctx)
+
+    result = json.loads(await ctx.tools["x402_pay"]({"url": "https://arbitrary.example/pay"}))
+
+    assert result["success"] is False
+    assert result["error"] == "host_rejected"
+    buyer.pay.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_mode_non_empty_allowlist_restricts_payment_hosts(monkeypatch) -> None:
+    from hermes_x402.hermes_plugin import tools as plugin_tools
+
+    buyer = _payment_runtime().buyer_tool
+    runtime = _payment_runtime(mode="public", allowlist=("allowed.example",), buyer=buyer)
+    monkeypatch.setattr(plugin_tools, "get_runtime", lambda: runtime)
+    ctx = _ToolCtx()
+    plugin_tools.register_payment_tools(ctx)
+
+    result = json.loads(await ctx.tools["x402_pay"]({"url": "https://other.example/pay"}))
+
+    assert result["success"] is False
+    assert result["error"] == "host_rejected"
+    buyer.pay.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approval_disabled_does_not_touch_trusted_host_store(monkeypatch, tmp_path) -> None:
+    from hermes_x402.buyer import approval as approval_mod
+    from hermes_x402.hermes_plugin import tools as plugin_tools
+
+    store_path = tmp_path / "x402_trusted_hosts.json"
+    monkeypatch.setattr(approval_mod, "_TRUSTED_HOSTS_FILE", store_path)
+    approval_mod._store = None
+    buyer = _payment_runtime().buyer_tool
+    runtime = _payment_runtime(mode="public", allowlist=(), require_approval=False, buyer=buyer)
+    monkeypatch.setattr(plugin_tools, "get_runtime", lambda: runtime)
+
+    async def _dns_ok(url: str):
+        return ("93.184.216.34",)
+
+    monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", _dns_ok)
+    ctx = _ToolCtx()
+    plugin_tools.register_payment_tools(ctx)
+
+    result = json.loads(await ctx.tools["x402_pay"]({"url": "https://newhost.example/pay"}))
+
+    assert result["success"] is True
+    assert not store_path.exists()
+    buyer.pay.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dns_validation_happens_before_buyer_pay_and_pay_exactly_once(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from hermes_x402.hermes_plugin import tools as plugin_tools
+
+    events: list[str] = []
+
+    async def _pay(**kwargs):
+        events.append("pay")
+        return SimpleNamespace(
+            payment_status="resource_succeeded",
+            status=200,
+            payer="0x1111111111111111111111111111111111111111",
+            amount="1000",
+            network="eip155:8453",
+            transaction_id=None,
+            data={"ok": True},
+        )
+
+    buyer = SimpleNamespace(pay=AsyncMock(side_effect=_pay))
+    runtime = _payment_runtime(mode="public", allowlist=(), buyer=buyer)
+    monkeypatch.setattr(plugin_tools, "get_runtime", lambda: runtime)
+
+    async def _dns_ok(url: str):
+        events.append("dns")
+        return ("93.184.216.34",)
+
+    monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", _dns_ok)
+    ctx = _ToolCtx()
+    plugin_tools.register_payment_tools(ctx)
+
+    result = json.loads(await ctx.tools["x402_pay"]({"url": "https://arbitrary.example/pay"}))
+
+    assert result["success"] is True
+    assert events == ["dns", "pay"]
+    buyer.pay.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ips", "url"),
+    [
+        (["10.0.0.1"], "https://private.example/pay"),
+        (["93.184.216.34", "192.168.1.1"], "https://mixed.example/pay"),
+    ],
+)
+async def test_private_and_mixed_dns_destinations_rejected_before_pay(
+    monkeypatch, ips, url
+) -> None:
+    from hermes_x402.dns_validator import DnsValidationError
+    from hermes_x402.hermes_plugin import tools as plugin_tools
+
+    buyer = _payment_runtime().buyer_tool
+    runtime = _payment_runtime(mode="public", allowlist=(), buyer=buyer)
+    monkeypatch.setattr(plugin_tools, "get_runtime", lambda: runtime)
+
+    async def _dns(url_arg: str):
+        raise DnsValidationError(
+            "destination contains private or mixed addresses",
+            error_code="destination_ip_rejected",
+            retry_safe=False,
+        )
+
+    monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", _dns)
+    ctx = _ToolCtx()
+    plugin_tools.register_payment_tools(ctx)
+
+    result = json.loads(await ctx.tools["x402_pay"]({"url": url}))
+
+    assert result["success"] is False
+    assert result["error"] == "destination_ip_rejected"
     buyer.pay.assert_not_awaited()
