@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from contextlib import suppress
 from typing import Any, cast
 
 import httpx
@@ -51,6 +53,9 @@ class X402BuyerService:
     ) -> BuyerResult:
         self.policy.validate_url(url)
         normalized_method = method.upper()
+        if isinstance(body, str):
+            with suppress(ValueError, TypeError):
+                body = json.loads(body)
         request_headers = self._copy_non_payment_headers(headers)
 
         try:

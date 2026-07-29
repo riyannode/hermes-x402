@@ -100,6 +100,13 @@ X402_SERVICE_SEARCH_SCHEMA: dict[str, Any] = {
                 "type": "integer",
                 "description": "Maximum results to return (1-25, default 10).",
             },
+            "marketplace_url": {
+                "type": "string",
+                "description": (
+                    "Optional public marketplace URL for read-only GET discovery. "
+                    "When absent, uses the Circle CLI marketplace search."
+                ),
+            },
         },
         "required": ["query"],
     },
@@ -125,6 +132,7 @@ X402_SERVICE_INSPECT_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },
@@ -151,6 +159,7 @@ X402_SUPPORTS_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },
@@ -178,6 +187,7 @@ X402_FETCH_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },
@@ -209,6 +219,7 @@ X402_PAY_SCHEMA: dict[str, Any] = {
                 "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
             "max_usdc": {
@@ -325,6 +336,7 @@ X402_GATEWAY_DEPOSIT_PREVIEW_SCHEMA: dict[str, Any] = {
                 "description": "USDC amount to preview depositing.",
             },
             "body": {
+                "type": "object",
                 "description": "Request body (for POST/PUT/PATCH).",
             },
         },

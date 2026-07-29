@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ from hermes_x402.discovery.circle_marketplace import (
     _LIMIT_MAX,
     _QUERY_MAX_LENGTH,
     CircleCliMarketplaceProvider,
+    PublicMarketplaceProvider,
 )
 from hermes_x402.discovery.provider import (
     DiscoveredService,
@@ -405,3 +407,151 @@ class TestDiscoveryNoAutoTrust:
 
         store = _get_store()
         assert not store.is_trusted("discovered.example.com")
+
+
+class _FakeMarketplaceResponse:
+    def __init__(self, payload: Any, *, content_type="application/json", redirect=False):
+        self.payload = payload
+        self.headers = {"content-type": content_type}
+        self.is_redirect = redirect
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    async def aiter_bytes(self):
+        yield json.dumps(self.payload).encode()
+
+
+class _FakeMarketplaceClient:
+    calls: list[tuple[str, str]] = []
+    response = _FakeMarketplaceResponse([])
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    def stream(self, method: str, url: str):
+        self.calls.append((method, url))
+        return self.response
+
+
+class TestPublicMarketplaceProvider:
+    async def test_public_empty_discovery_allowlist_gets_json_without_payment_or_trust(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_x402.buyer import approval as approval_mod
+        from hermes_x402.discovery import circle_marketplace as marketplace_mod
+
+        approval_mod._store = None
+        monkeypatch.setattr(approval_mod, "_TRUSTED_HOSTS_FILE", tmp_path / "trusted.json")
+
+        async def dns_ok(url: str):
+            return ("93.184.216.34",)
+
+        monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", dns_ok)
+        _FakeMarketplaceClient.calls = []
+        _FakeMarketplaceClient.response = _FakeMarketplaceResponse(
+            {
+                "data": {
+                    "services": [
+                        {
+                            "title": "Weather",
+                            "resource": "https://service.example/pay",
+                            "summary": "forecast",
+                            "amount": "0.001",
+                            "chains": ["base"],
+                        },
+                        {"name": "skip-no-url"},
+                    ]
+                }
+            }
+        )
+        monkeypatch.setattr(marketplace_mod.httpx, "AsyncClient", _FakeMarketplaceClient)
+
+        services = await PublicMarketplaceProvider(
+            marketplace_url="https://market.example/services",
+            network_policy="public",
+            discovery_host_allowlist=(),
+            allow_http=False,
+        ).search("weather")
+
+        assert _FakeMarketplaceClient.calls == [("GET", "https://market.example/services")]
+        assert len(services) == 1
+        assert services[0].name == "Weather"
+        assert services[0].url == "https://service.example/pay"
+        assert services[0].advertised_price_usdc == "0.001"
+        assert services[0].advertised_networks == ("base",)
+        assert not (tmp_path / "trusted.json").exists()
+
+    async def test_strict_discovery_allowlist_rejects_unlisted_marketplace(self):
+        from hermes_x402.buyer.errors import PaymentPolicyError
+
+        with pytest.raises(PaymentPolicyError, match="No hosts are allowed"):
+            await PublicMarketplaceProvider(
+                marketplace_url="https://market.example/services",
+                network_policy="strict_allowlist",
+                discovery_host_allowlist=(),
+                allow_http=False,
+            ).search("weather")
+
+    async def test_dns_rejection_happens_before_connect(self, monkeypatch):
+        from hermes_x402.discovery import circle_marketplace as marketplace_mod
+        from hermes_x402.dns_validator import DnsValidationError
+
+        async def dns_fail(url: str):
+            raise DnsValidationError(
+                "mixed destination", error_code="destination_ip_rejected", retry_safe=False
+            )
+
+        monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", dns_fail)
+        _FakeMarketplaceClient.calls = []
+        monkeypatch.setattr(marketplace_mod.httpx, "AsyncClient", _FakeMarketplaceClient)
+
+        with pytest.raises(DnsValidationError):
+            await PublicMarketplaceProvider(
+                marketplace_url="https://market.example/services",
+                network_policy="public",
+                discovery_host_allowlist=(),
+                allow_http=False,
+            ).search("weather")
+        assert _FakeMarketplaceClient.calls == []
+
+    async def test_non_json_invalid_json_and_redirect_rejected(self, monkeypatch):
+        from hermes_x402.circle_cli.errors import CircleCliOutputError, CircleCliReadError
+        from hermes_x402.discovery import circle_marketplace as marketplace_mod
+
+        async def dns_ok(url: str):
+            return ("93.184.216.34",)
+
+        monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", dns_ok)
+        monkeypatch.setattr(marketplace_mod.httpx, "AsyncClient", _FakeMarketplaceClient)
+        provider = PublicMarketplaceProvider(
+            marketplace_url="https://market.example/services",
+            network_policy="public",
+            discovery_host_allowlist=(),
+            allow_http=False,
+        )
+
+        _FakeMarketplaceClient.response = _FakeMarketplaceResponse("x", content_type="text/plain")
+        with pytest.raises(CircleCliOutputError, match="not JSON"):
+            await provider.search("weather")
+
+        class BadJsonResponse(_FakeMarketplaceResponse):
+            async def aiter_bytes(self):
+                yield b"not-json"
+
+        _FakeMarketplaceClient.response = BadJsonResponse(None)
+        with pytest.raises(CircleCliOutputError, match="invalid JSON"):
+            await provider.search("weather")
+
+        _FakeMarketplaceClient.response = _FakeMarketplaceResponse([], redirect=True)
+        with pytest.raises(CircleCliReadError, match="redirects"):
+            await provider.search("weather")

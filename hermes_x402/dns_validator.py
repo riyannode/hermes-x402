@@ -28,7 +28,8 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
-from typing import Protocol, runtime_checkable
+import time
+from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,14 @@ logger = logging.getLogger(__name__)
 # Hard cap on the number of A/AAAA records we process to bound work.
 _MAX_RESOLVED_RECORDS: int = 10
 
-# Timeout (seconds) for the full resolution + validation step.
-_RESOLUTION_TIMEOUT: float = 5.0
+# Timeout (seconds) for each DNS resolution attempt.
+_RESOLUTION_ATTEMPT_TIMEOUT: float = 5.0
+
+# Maximum number of attempts for transient DNS failures.
+_MAX_RESOLUTION_ATTEMPTS: int = 3
+
+# Bounded backoff schedule between attempts (seconds).
+_RESOLUTION_BACKOFFS: tuple[float, ...] = (0.25, 0.75)
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +96,8 @@ class DefaultResolver:
                     except ValueError:
                         continue
                     results.append((fam, ip_str))
+            except _socket_mod.gaierror:
+                raise
             except OSError as exc:
                 logger.debug("getaddrinfo failed for %s: %s", host, exc)
             return results
@@ -165,6 +174,25 @@ def is_ip_forbidden(ip_str: str) -> bool:
     return False
 
 
+class DnsValidationError(ValueError):
+    """Structured DNS/destination validation failure for tool error mapping."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        retry_safe: bool,
+        attempts: int = 0,
+        elapsed_ms: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.retry_safe = retry_safe
+        self.attempts = attempts
+        self.elapsed_ms = elapsed_ms
+
+
 # ---------------------------------------------------------------------------
 # Main async entry point
 # ---------------------------------------------------------------------------
@@ -198,7 +226,11 @@ async def resolve_and_validate_destination(
         human-readable, sanitised error string suitable for user display.
     """
     if not url or not isinstance(url, str):
-        raise ValueError("URL is required for DNS validation.")
+        raise DnsValidationError(
+            "URL is required for DNS validation.",
+            error_code="destination_not_allowed",
+            retry_safe=False,
+        )
 
     if resolver is None:
         resolver = DefaultResolver()
@@ -207,47 +239,207 @@ async def resolve_and_validate_destination(
     parsed = urlparse(url)
     hostname = parsed.hostname
     if not hostname:
-        raise ValueError("URL must contain a valid hostname for DNS validation.")
+        raise DnsValidationError(
+            "URL must contain a valid hostname for DNS validation.",
+            error_code="destination_not_allowed",
+            retry_safe=False,
+        )
 
     # --- IDNA normalization ---
     hostname = _normalise_idna(hostname)
 
-    # --- Resolve with timeout ---
-    try:
-        resolved = await asyncio.wait_for(
-            resolver.resolve(hostname, family=0),  # AF_UNSPEC → v4 + v6
-            timeout=_RESOLUTION_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        raise ValueError(
-            f"DNS resolution for {_safe_host(hostname)} timed out after {_RESOLUTION_TIMEOUT}s."
-        ) from None
-    except Exception as exc:
-        # Sanitise the error so we never leak internal resolution details.
-        raise ValueError(f"DNS resolution for {_safe_host(hostname)} failed.") from exc
+    # --- Resolve with bounded retry for transient resolver failures only ---
+    resolved, attempts, elapsed_ms = await _resolve_with_retries(hostname, resolver)
 
     if not resolved:
-        raise ValueError(f"DNS resolution for {_safe_host(hostname)} returned no addresses.")
+        raise DnsValidationError(
+            f"DNS resolution for {_safe_host(hostname)} returned no addresses "
+            f"after {attempts} attempt(s) in {elapsed_ms}ms.",
+            error_code="dns_resolution_failed",
+            retry_safe=True,
+            attempts=attempts,
+            elapsed_ms=elapsed_ms,
+        )
 
-    # --- Bound to max records ---
-    resolved = resolved[:_MAX_RESOLVED_RECORDS]
+    # --- Deduplicate, bound unique records, and validate every unique address ---
+    unique_ips = _dedupe_resolved_ips(resolved)[:_MAX_RESOLVED_RECORDS]
 
-    # --- Validate every resolved address ---
     valid_ips: list[str] = []
-    for _family, ip_str in resolved:
+    for ip_str in unique_ips:
         if is_ip_forbidden(ip_str):
-            raise ValueError(
+            logger.info(
+                "DNS validation rejected hostname=%s attempts=%d elapsed_ms=%d ip=%s "
+                "classification=destination_ip_rejected",
+                hostname,
+                attempts,
+                elapsed_ms,
+                _safe_ip(ip_str),
+            )
+            raise DnsValidationError(
                 f"Destination {_safe_host(hostname)} resolves to a forbidden "
-                f"address: {_safe_ip(ip_str)}."
+                f"address: {_safe_ip(ip_str)}.",
+                error_code="destination_ip_rejected",
+                retry_safe=False,
+                attempts=attempts,
+                elapsed_ms=elapsed_ms,
             )
         valid_ips.append(ip_str)
 
-    logger.debug(
-        "DNS validation passed for %s → %s",
+    logger.info(
+        "DNS validation passed hostname=%s attempts=%d elapsed_ms=%d resolved_ips=%s "
+        "classification=success",
         hostname,
-        ", ".join(valid_ips),
+        attempts,
+        elapsed_ms,
+        valid_ips,
     )
     return tuple(valid_ips)
+
+
+async def _resolve_with_retries(
+    hostname: str,
+    resolver: AsyncResolver,
+) -> tuple[list[tuple[int, str]], int, int]:
+    """Resolve with bounded retries for transient DNS failures only."""
+    started = time.monotonic()
+    final_failure_kind: Literal["timeout", "transient_dns"] | None = None
+    last_exc: BaseException | None = None
+
+    for attempt in range(1, _MAX_RESOLUTION_ATTEMPTS + 1):
+        attempt_started = time.monotonic()
+        try:
+            resolved = await asyncio.wait_for(
+                resolver.resolve(hostname, family=0),  # AF_UNSPEC → v4 + v6
+                timeout=_RESOLUTION_ATTEMPT_TIMEOUT,
+            )
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.info(
+                "DNS resolution attempt hostname=%s attempt=%d elapsed_ms=%d exception_class=None",
+                hostname,
+                attempt,
+                int((time.monotonic() - attempt_started) * 1000),
+            )
+            return resolved, attempt, elapsed_ms
+        except asyncio.TimeoutError as exc:
+            final_failure_kind = "timeout"
+            last_exc = exc
+            logger.warning(
+                "DNS resolution attempt hostname=%s attempt=%d elapsed_ms=%d exception_class=%s",
+                hostname,
+                attempt,
+                int((time.monotonic() - attempt_started) * 1000),
+                type(exc).__name__,
+            )
+        except _socket_mod.gaierror as exc:
+            final_failure_kind = "transient_dns"
+            last_exc = exc
+            logger.warning(
+                "DNS resolution attempt hostname=%s attempt=%d elapsed_ms=%d exception_class=%s",
+                hostname,
+                attempt,
+                int((time.monotonic() - attempt_started) * 1000),
+                type(exc).__name__,
+            )
+            if not _is_temporary_gaierror(exc):
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                logger.info(
+                    "DNS validation failed hostname=%s attempts=%d elapsed_ms=%d "
+                    "classification=dns_resolution_failed",
+                    hostname,
+                    attempt,
+                    elapsed_ms,
+                )
+                raise DnsValidationError(
+                    f"DNS resolution for {_safe_host(hostname)} failed after "
+                    f"{attempt} attempt(s) in {elapsed_ms}ms.",
+                    error_code="dns_resolution_failed",
+                    retry_safe=True,
+                    attempts=attempt,
+                    elapsed_ms=elapsed_ms,
+                ) from exc
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "DNS resolution attempt hostname=%s attempt=%d elapsed_ms=%d exception_class=%s",
+                hostname,
+                attempt,
+                int((time.monotonic() - attempt_started) * 1000),
+                type(exc).__name__,
+            )
+            logger.info(
+                "DNS validation failed hostname=%s attempts=%d elapsed_ms=%d "
+                "classification=dns_resolution_failed",
+                hostname,
+                attempt,
+                elapsed_ms,
+            )
+            raise DnsValidationError(
+                f"DNS resolution for {_safe_host(hostname)} failed after "
+                f"{attempt} attempt(s) in {elapsed_ms}ms.",
+                error_code="dns_resolution_failed",
+                retry_safe=True,
+                attempts=attempt,
+                elapsed_ms=elapsed_ms,
+            ) from exc
+
+        if attempt < _MAX_RESOLUTION_ATTEMPTS:
+            await asyncio.sleep(_RESOLUTION_BACKOFFS[attempt - 1])
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    attempts = _MAX_RESOLUTION_ATTEMPTS
+    if final_failure_kind == "timeout":
+        logger.info(
+            "DNS validation failed hostname=%s attempts=%d elapsed_ms=%d "
+            "classification=dns_resolution_timeout",
+            hostname,
+            attempts,
+            elapsed_ms,
+        )
+        raise DnsValidationError(
+            f"DNS resolution for {_safe_host(hostname)} timed out after "
+            f"{attempts} attempts in {elapsed_ms}ms.",
+            error_code="dns_resolution_timeout",
+            retry_safe=True,
+            attempts=attempts,
+            elapsed_ms=elapsed_ms,
+        ) from last_exc
+
+    logger.info(
+        "DNS validation failed hostname=%s attempts=%d elapsed_ms=%d "
+        "classification=dns_resolution_failed",
+        hostname,
+        attempts,
+        elapsed_ms,
+    )
+    raise DnsValidationError(
+        f"DNS resolution for {_safe_host(hostname)} failed after "
+        f"{attempts} attempts in {elapsed_ms}ms.",
+        error_code="dns_resolution_failed",
+        retry_safe=True,
+        attempts=attempts,
+        elapsed_ms=elapsed_ms,
+    ) from last_exc
+
+
+def _is_temporary_gaierror(exc: _socket_mod.gaierror) -> bool:
+    """Return True only for resolver errors documented as temporary."""
+    return bool(exc.args and exc.args[0] == getattr(_socket_mod, "EAI_AGAIN", object()))
+
+
+def _dedupe_resolved_ips(resolved: list[tuple[int, str]]) -> list[str]:
+    """Deduplicate getaddrinfo output while preserving deterministic order."""
+    unique: list[str] = []
+    seen: set[str] = set()
+    for _family, ip_str in resolved:
+        if ip_str in seen:
+            continue
+        try:
+            ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        seen.add(ip_str)
+        unique.append(ip_str)
+    return unique
 
 
 # ---------------------------------------------------------------------------

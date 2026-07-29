@@ -121,8 +121,6 @@ class X402Config:
                 raise BuyerConfigurationError(
                     "Circle CLI buyer requires circle_cli_wallet_address and circle_cli_network"
                 )
-            if self.max_usdc_per_payment is None:
-                raise BuyerConfigurationError("Circle CLI buyer requires max_usdc_per_payment")
             if self.circle_cli_executable != "circle":
                 raise BuyerConfigurationError(
                     "Circle CLI buyer only permits the official 'circle' executable"

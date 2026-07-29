@@ -39,7 +39,7 @@ all = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.4",
+    "ruff==0.16.0",
     "cryptography>=42.0,<47",
     "python-dotenv>=1.0",
 ]

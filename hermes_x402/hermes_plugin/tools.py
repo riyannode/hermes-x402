@@ -22,6 +22,7 @@ Registered tools (14 total):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -93,6 +94,24 @@ def _service_option_fingerprint(option: Any, x402_version: str | int) -> str:
         "x402_version": x402_version,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _format_dns_validation_error(exc: ValueError) -> str:
+    """Return structured, retry-aware DNS validation failure JSON."""
+    payload: dict[str, Any] = {
+        "success": False,
+        "error": getattr(exc, "error_code", "destination_not_allowed"),
+        "message": str(exc),
+    }
+    if hasattr(exc, "retry_safe"):
+        payload["retry_safe"] = bool(exc.retry_safe)  # type: ignore[attr-defined]
+    attempts = getattr(exc, "attempts", 0)
+    if attempts:
+        payload["attempts"] = attempts
+    elapsed_ms = getattr(exc, "elapsed_ms", 0)
+    if elapsed_ms:
+        payload["elapsed_ms"] = elapsed_ms
+    return format_success_result(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +847,7 @@ def register_discovery_tools(ctx: Any) -> None:
     async def service_search_handler(args: dict, **kwargs: Any) -> str:
         query = args.get("query", "")
         limit = args.get("limit", 10)
+        marketplace_url = args.get("marketplace_url")
 
         err = _validate_query(query)
         if err:
@@ -847,6 +867,63 @@ def register_discovery_tools(ctx: Any) -> None:
 
         runtime = get_runtime()
         runtime.ensure_initialized()
+
+        if marketplace_url is not None:
+            if not isinstance(marketplace_url, str) or not marketplace_url.strip():
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "invalid_input",
+                        "message": "marketplace_url must be a non-empty string.",
+                    }
+                )
+            if runtime.config is None:
+                return format_success_result(
+                    {
+                        "success": False,
+                        "error": "configuration_error",
+                        "message": "x402 configuration is not initialized.",
+                    }
+                )
+            try:
+                from hermes_x402.discovery.circle_marketplace import PublicMarketplaceProvider
+
+                provider = PublicMarketplaceProvider(
+                    marketplace_url=marketplace_url.strip(),
+                    network_policy=runtime.config.network_policy,
+                    discovery_host_allowlist=runtime.config.discovery_host_allowlist,
+                    allow_http=runtime.config.allow_http,
+                )
+                services = await provider.search(query, limit=limit)
+                results = [
+                    {
+                        "name": svc.name,
+                        "description": svc.description or "",
+                        "url": svc.url,
+                        "advertised_price_usdc": svc.advertised_price_usdc or "",
+                        "advertised_networks": list(svc.advertised_networks),
+                    }
+                    for svc in services[:MAX_SEARCH_RESULTS]
+                ]
+                return format_success_result(
+                    {
+                        "success": True,
+                        "provider": "public_marketplace",
+                        "marketplace_url": marketplace_url.strip(),
+                        "query": query,
+                        "count": len(results),
+                        "services": results,
+                        "trust_boundary": (
+                            "Discovery is informational only; x402_pay independently repeats "
+                            "policy, DNS, fresh challenge, manual approval, and exactly-once "
+                            "payment handling."
+                        ),
+                    }
+                )
+            except ValueError as exc:
+                return _format_dns_validation_error(exc)
+            except Exception as exc:
+                return format_error_result(exc)
 
         if runtime.cli_client is None:
             return format_success_result(
@@ -968,9 +1045,7 @@ def register_supports_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         try:
             from hermes_x402.buyer.supports import check_supports
@@ -1087,9 +1162,7 @@ def register_service_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -1203,9 +1276,7 @@ def register_payment_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -1329,6 +1400,9 @@ def register_payment_tools(ctx: Any) -> None:
         url = args.get("url", "")
         method = (args.get("method") or "GET").upper()
         body = args.get("body")
+        if isinstance(body, str):
+            with contextlib.suppress(ValueError, TypeError):
+                body = json.loads(body)
         max_usdc = args.get("max_usdc")
 
         err = _validate_url(url)
@@ -1419,9 +1493,7 @@ def register_payment_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         buyer = runtime.buyer_tool
         if buyer is None:
@@ -2013,9 +2085,7 @@ def register_gateway_tools(ctx: Any) -> None:
 
             await resolve_and_validate_destination(service_url)
         except ValueError as exc:
-            return format_success_result(
-                {"success": False, "error": "destination_rejected", "message": str(exc)}
-            )
+            return _format_dns_validation_error(exc)
 
         # Use the existing x402 challenge parser (check_supports)
         # This handles v2 header, v1 body, GatewayWalletBatched detection,

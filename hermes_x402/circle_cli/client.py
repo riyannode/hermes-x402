@@ -9,12 +9,15 @@ from typing import Any
 from hermes_x402.circle_cli.errors import (
     CircleCliAuthenticationRequiredError,
     CircleCliError,
+    CircleCliExitNonzeroError,
+    CircleCliInvalidJsonOutputError,
     CircleCliOutputError,
-    CircleCliPaymentFailedError,
     CircleCliPaymentOutcomeUnknownError,
     CircleCliPaymentRejectedError,
     CircleCliReadError,
     CircleCliTermsRequiredError,
+    CircleCliTimeoutAfterPaymentLogError,
+    CircleCliTimeoutBeforePaymentLogError,
     CircleCliTimeoutError,
     CircleCliVersionError,
     CircleCliWalletNotFoundError,
@@ -97,8 +100,9 @@ class CircleCliClient:
             raise CircleCliPaymentRejectedError(
                 f"Circle CLI rejected payment before submission (exit code {result.exit_code})"
             )
-        raise CircleCliPaymentFailedError(
-            f"Circle CLI payment failed (exit code {result.exit_code})"
+        raise CircleCliExitNonzeroError(
+            f"Circle CLI exited non-zero before any payment-submitted marker "
+            f"(exit code {result.exit_code})"
         )
 
     async def version(self) -> CircleCliVersion:
@@ -281,7 +285,7 @@ class CircleCliClient:
             "-X",
             method.upper(),
             "--timeout",
-            str(int(self.runner.payment_timeout_seconds)),
+            str(int(self.runner.cli_payment_timeout_seconds)),
         ]
         if max_usdc is not None:
             args.extend(("--max-amount", max_usdc))
@@ -300,15 +304,22 @@ class CircleCliClient:
             data = self._data(result)
             payment = data.get("payment")
             if not isinstance(payment, dict) or "response" not in data:
-                raise CircleCliOutputError("Circle CLI payment success JSON is malformed")
+                raise CircleCliPaymentOutcomeUnknownError(
+                    "Circle CLI exited successfully but payment response JSON is incomplete; "
+                    "do not retry automatically"
+                )
             required = ("amount", "chain", "scheme", "seller")
             if not all(isinstance(payment.get(field), str) for field in required):
-                raise CircleCliOutputError(
-                    "Circle CLI payment JSON is missing required payment fields"
+                raise CircleCliPaymentOutcomeUnknownError(
+                    "Circle CLI exited successfully but payment fields are incomplete; "
+                    "do not retry automatically"
                 )
             receipt = payment.get("receipt")
             if receipt is not None and not isinstance(receipt, str):
-                raise CircleCliOutputError("Circle CLI payment receipt is malformed")
+                raise CircleCliPaymentOutcomeUnknownError(
+                    "Circle CLI exited successfully but payment receipt is malformed; "
+                    "do not retry automatically"
+                )
             transaction = _TX_HASH.search(receipt or "")
             return CircleServicePayment(
                 response=data["response"],
@@ -323,11 +334,24 @@ class CircleCliClient:
             raise
         except CircleCliAuthenticationRequiredError:
             raise
-        except (CircleCliTimeoutError, CircleCliError) as exc:
+        except CircleCliTimeoutAfterPaymentLogError as exc:
             raise CircleCliPaymentOutcomeUnknownError(
-                "Circle CLI payment did not produce a definite pre-submission rejection; "
-                "do not retry automatically"
+                "Circle CLI timed out after creating a payment log; do not retry automatically"
             ) from exc
+        except CircleCliTimeoutBeforePaymentLogError:
+            raise
+        except CircleCliInvalidJsonOutputError as exc:
+            raise CircleCliPaymentOutcomeUnknownError(
+                "Circle CLI services pay returned malformed JSON after the payment "
+                "command ran; payment may have been submitted and the operation "
+                "must not be retried automatically"
+            ) from exc
+        except CircleCliExitNonzeroError:
+            raise
+        except CircleCliTimeoutError:
+            raise
+        except CircleCliError:
+            raise
 
     # ------------------------------------------------------------------
     # Session management (v0.0.6 wallet-scoped commands)
