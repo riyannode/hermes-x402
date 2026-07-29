@@ -162,10 +162,8 @@ def _validate_max_usdc(
     if error:
         return None, error
 
-    if configured is not None and caller > configured:
-        return None, ("Caller cap exceeds configured maximum. The configured cap cannot be raised.")
-
-    return caller_value, None
+    effective = min(configured, caller) if configured is not None else caller
+    return str(effective.normalize()) if effective else "0", None
 
 
 def _validate_url(url: str) -> str | None:

@@ -32,7 +32,9 @@ from hermes_x402.hermes_plugin.formatters import (
     format_wallet_status,
 )
 from hermes_x402.hermes_plugin.slash_command import (
+    _build_managed_keys,
     _preview_store,
+    _validate_configure_args,
     handle_x402_command,
 )
 
@@ -491,3 +493,34 @@ class TestHumanReadable:
         result = format_configure(managed, cli_info)
         assert "/usr/bin/circle" not in result
         assert "Circle CLI: Available" in result
+
+
+class TestConfigureDefaultLocalPolicy:
+    def test_configure_preview_omitted_max_usdc_defaults_to_5(self):
+        params, error = _validate_configure_args(
+            [
+                "buyer",
+                "cli",
+                VALID_WALLET,
+                "ARC-TESTNET",
+            ]
+        )
+        assert error is None
+        assert params is not None
+        assert params["max_usdc"] == "5"
+        assert _build_managed_keys(params)["X402_MAX_USDC_PER_PAYMENT"] == "5"
+
+    def test_configure_preview_explicit_max_usdc_still_supported(self):
+        params, error = _validate_configure_args(
+            [
+                "buyer",
+                "cli",
+                VALID_WALLET,
+                "ARC-TESTNET",
+                "0.10",
+            ]
+        )
+        assert error is None
+        assert params is not None
+        assert params["max_usdc"] == "0.10"
+        assert _build_managed_keys(params)["X402_MAX_USDC_PER_PAYMENT"] == "0.10"

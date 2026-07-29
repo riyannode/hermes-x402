@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import suppress
+from decimal import Decimal
 from typing import Any, cast
 
 import httpx
@@ -86,8 +87,16 @@ class X402BuyerService:
                         self.policy.validate_amount(accepted["amount"], max_usdc)
                     # The official CLI performs its own protected request. The first
                     # common request above is unpaid and exists solely for policy and
-                    # challenge validation; there is no Python paid retry.
-                    effective_cap = max_usdc or self.policy.max_usdc
+                    # challenge validation; there is no Python paid retry. Compute a
+                    # local effective cap as min(configured local cap, caller cap).
+                    # If both are absent, the backend still pins --max-amount to the
+                    # fresh challenge amount; Circle CLI is never invoked unlimited.
+                    normalized_caps = [
+                        self.policy.normalize_max_usdc(cap)
+                        for cap in (self.policy.max_usdc, max_usdc)
+                        if cap is not None
+                    ]
+                    effective_cap = min(normalized_caps, key=Decimal) if normalized_caps else None
                     managed_backend = cast(ManagedPaymentBackend, self.backend)
                     managed = await managed_backend.pay_and_fetch(
                         url=url,
@@ -95,11 +104,7 @@ class X402BuyerService:
                         body=body,
                         headers=request_headers,
                         payment_required=payment_required,
-                        max_usdc=(
-                            self.policy.normalize_max_usdc(effective_cap)
-                            if effective_cap is not None
-                            else None
-                        ),
+                        max_usdc=effective_cap,
                     )
                     return BuyerResult(
                         status=managed.status,

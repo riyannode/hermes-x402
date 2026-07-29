@@ -13,7 +13,7 @@ Supported syntax:
   /x402 networks [active|buyer|gateway|all]
   /x402 supports <https-url>
   /x402 configure
-  /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>
+  /x402 configure preview buyer cli <wallet> ARC-TESTNET [max_usdc=5]
   /x402 configure apply <preview_id>
 """
 
@@ -320,18 +320,18 @@ def _validate_configure_args(
 ) -> tuple[dict[str, str] | None, str | None]:
     """Validate configure preview arguments.
 
-    Expected: buyer cli <wallet> ARC-TESTNET <max_usdc>
+    Expected: buyer cli <wallet> ARC-TESTNET [max_usdc]
     Returns (validated_params, error_message).
-    Rejects extra arguments.
+    Rejects extra arguments. Missing max_usdc defaults to the local policy cap of 5 USDC.
     """
-    if len(parts) != 5:
-        return None, ("Usage: /x402 configure preview buyer cli <wallet> ARC-TESTNET <max_usdc>")
+    if len(parts) not in {4, 5}:
+        return None, ("Usage: /x402 configure preview buyer cli <wallet> ARC-TESTNET [max_usdc=5]")
 
     role = parts[0].lower()
     backend = parts[1].lower()
     wallet = parts[2]
     network = parts[3].upper()
-    max_usdc_str = parts[4]
+    max_usdc_str = parts[4] if len(parts) == 5 else "5"
 
     # Validate role
     if role != "buyer":
