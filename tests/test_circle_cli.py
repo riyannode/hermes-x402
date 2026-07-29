@@ -11,6 +11,7 @@ import json
 import stat
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -1229,3 +1230,172 @@ class TestChainIdentityComparison:
         await backend._ensure_ready()
         assert backend._canonical_caip2 == "eip155:5042002"
         assert backend._x402_network == "eip155:5042002"
+
+
+class TestLocalPaymentPolicyCap:
+    @staticmethod
+    def _challenge(atomic_amount: str) -> dict[str, Any]:
+        return {
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:8453",
+                    "amount": atomic_amount,
+                    "asset": "0x3",
+                    "payTo": SELLER,
+                }
+            ],
+        }
+
+    @staticmethod
+    def _payment_result(amount_usdc: str) -> CircleCliResult:
+        return result(
+            ("services", "pay"),
+            {
+                "response": {"premium": True},
+                "payment": {
+                    "amount": f"{amount_usdc} USDC",
+                    "chain": "eip155:8453",
+                    "scheme": "exact",
+                    "seller": SELLER,
+                    "receipt": "payment-receipt",
+                },
+            },
+        )
+
+    @staticmethod
+    def _assert_cli_max(runner: FakeRunner, expected: str) -> None:
+        pay_args = next(call for call in runner.calls if call[:2] == ("services", "pay"))
+        assert "--max-amount" in pay_args
+        assert pay_args[pay_args.index("--max-amount") + 1] == expected
+
+    @pytest.mark.asyncio
+    async def test_configured_5_caller_0015_payment_0015_allowed(self):
+        runner = FakeRunner(pay_result=self._payment_result("0.015"))
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        await backend.pay_and_fetch(
+            url="https://allowed.example/premium",
+            method="GET",
+            body=None,
+            headers={},
+            payment_required=self._challenge("15000"),
+            max_usdc="0.015",
+        )
+        self._assert_cli_max(runner, "0.015")
+
+    @pytest.mark.asyncio
+    async def test_configured_5_caller_0003_payment_0015_rejected_before_cli(self):
+        runner = FakeRunner(pay_result=self._payment_result("0.015"))
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        service = X402BuyerService(backend=backend, policy=PaymentPolicy(max_usdc="5"))
+        challenge = self._challenge("15000")
+
+        import httpx
+
+        class Stub:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return None
+
+            async def request(self, **kwargs):
+                import base64
+
+                return httpx.Response(
+                    402,
+                    headers={
+                        "Payment-Required": base64.b64encode(
+                            json.dumps(challenge).encode()
+                        ).decode()
+                    },
+                )
+
+        with (
+            patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=Stub()),
+            pytest.raises(PaymentPolicyError, match="exceeds"),
+        ):
+            await service.pay("https://allowed.example/premium", max_usdc="0.003")
+        assert [call[:2] for call in runner.calls].count(("services", "pay")) == 0
+
+    @pytest.mark.asyncio
+    async def test_configured_5_caller_10_payment_5_allowed_uses_effective_cap(self):
+        runner = FakeRunner(pay_result=self._payment_result("5"))
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        service = X402BuyerService(backend=backend, policy=PaymentPolicy(max_usdc="5"))
+        challenge = self._challenge("5000000")
+
+        import httpx
+
+        class Stub:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return None
+
+            async def request(self, **kwargs):
+                import base64
+
+                return httpx.Response(
+                    402,
+                    headers={
+                        "Payment-Required": base64.b64encode(
+                            json.dumps(challenge).encode()
+                        ).decode()
+                    },
+                )
+
+        with patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=Stub()):
+            await service.pay("https://allowed.example/premium", max_usdc="10")
+        self._assert_cli_max(runner, "5")
+
+    @pytest.mark.asyncio
+    async def test_configured_5_caller_10_payment_5000001_rejected_before_cli(self):
+        runner = FakeRunner(pay_result=self._payment_result("5.000001"))
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        service = X402BuyerService(backend=backend, policy=PaymentPolicy(max_usdc="5"))
+        challenge = self._challenge("5000001")
+
+        import httpx
+
+        class Stub:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return None
+
+            async def request(self, **kwargs):
+                import base64
+
+                return httpx.Response(
+                    402,
+                    headers={
+                        "Payment-Required": base64.b64encode(
+                            json.dumps(challenge).encode()
+                        ).decode()
+                    },
+                )
+
+        with (
+            patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=Stub()),
+            pytest.raises(PaymentPolicyError, match="exceeds"),
+        ):
+            await service.pay("https://allowed.example/premium", max_usdc="10")
+        assert [call[:2] for call in runner.calls].count(("services", "pay")) == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_challenge_amount_is_used_as_cli_limit_when_env_unset(self):
+        runner = FakeRunner(pay_result=self._payment_result("0.015"))
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        await backend.pay_and_fetch(
+            url="https://allowed.example/premium",
+            method="GET",
+            body=None,
+            headers={},
+            payment_required=self._challenge("15000"),
+            max_usdc=None,
+        )
+        self._assert_cli_max(runner, "0.015")
