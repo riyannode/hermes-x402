@@ -71,7 +71,7 @@ class X402Config:
     circle_cli_cwd: str | None = None
     circle_cli_wallet_address: str = ""
     circle_cli_network: str = ""
-    max_usdc_per_payment: str | None = None
+    max_usdc_per_payment: str | None = "5"
     host_allowlist: list[str] = field(default_factory=list)
     # PR #4 extensions
     network_policy: Literal["strict_allowlist", "public"] = "public"
@@ -212,7 +212,7 @@ class X402Config:
             circle_cli_cwd=os.environ.get("CIRCLE_CLI_CWD") or None,
             circle_cli_wallet_address=os.environ.get("CIRCLE_AGENT_WALLET_ADDRESS", ""),
             circle_cli_network=os.environ.get("CIRCLE_AGENT_WALLET_NETWORK", ""),
-            max_usdc_per_payment=os.environ.get("X402_MAX_USDC_PER_PAYMENT") or None,
+            max_usdc_per_payment=os.environ.get("X402_MAX_USDC_PER_PAYMENT") or "5",
             host_allowlist=[item.strip() for item in host_raw.split(",") if item.strip()],
             # PR #4
             network_policy=network_policy_raw,  # type: ignore[arg-type]

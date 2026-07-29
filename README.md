@@ -101,8 +101,8 @@ export CIRCLE_API_KEY="your-api-key"
 # Or CLI credentials (for cli backend)
 export CIRCLE_AGENT_WALLET_ADDRESS="0xYourAgentWallet..."
 export CIRCLE_AGENT_WALLET_NETWORK="ARC-TESTNET"
-# Optional stricter local override; Circle CLI still receives the fresh challenge amount as --max-amount when omitted.
-export X402_MAX_USDC_PER_PAYMENT="0.10"
+# Local per-payment cap; defaults to 5 USDC when omitted.
+export X402_MAX_USDC_PER_PAYMENT="5"
 
 # Network preference
 export X402_NETWORK_PREFERENCE="base,polygon,ethereum"
@@ -196,7 +196,7 @@ These dispatch to the corresponding `x402_*` tools via `ctx.dispatch_tool` — n
 Shows current configuration state: Circle CLI availability, configured/unconfigured state, missing managed variables.
 
 ```
-/x402 configure preview buyer cli 0xYourWallet... ARC-TESTNET 0.10
+/x402 configure preview buyer cli 0xYourWallet... ARC-TESTNET 5
 ```
 
 Validates arguments, creates a preview with an opaque `preview_id`, and shows proposed managed keys without writing anything. The preview is bound to the exact wallet, network, max USDC, config fingerprint, and current file state. Previews expire after 10 minutes and are process-local (not restart-safe).
@@ -294,7 +294,7 @@ All configuration is via environment variables. No config files required.
 | `X402_REQUIRE_GATEWAY_BATCHING` | `true` | Require Circle Gateway batching scheme |
 | `X402_REQUIRE_APPROVAL_FOR_NEW_HOST` | `false` | Require user approval before paying new hosts |
 | `X402_DAILY_BUDGET_USDC` | *(none)* | Daily USDC spending cap |
-| `X402_MAX_USDC_PER_PAYMENT` | *(none)* | Optional stricter local max USDC per single CLI payment |
+| `X402_MAX_USDC_PER_PAYMENT` | `5` | Local max USDC per single CLI payment |
 | `X402_ALLOW_CHAT_OTP` | `false` | Allow OTP through chat (not secure/private — OTP passes through conversation history) |
 
 ### Circle Credentials
@@ -335,7 +335,7 @@ export X402_ALLOW_HTTP=false
 
 With this setup, a user-supplied public HTTPS `x402_pay` URL does not need `trust_host()`, `x402_trusted_hosts.json`, `X402_HOST_ALLOWLIST`, or `X402_DISCOVERY_HOST_ALLOWLIST`. Each payment still goes through the native Hermes approval for the payment-capable `x402_pay` tool, then obtains a fresh 402 challenge. DNS and SSRF validation remain active, and ambiguous outcomes stay non-retryable.
 
-For the Circle CLI backend, `X402_MAX_USDC_PER_PAYMENT` is optional. When neither the configured cap nor caller `max_usdc` is supplied, the validated fresh challenge amount is still passed to Circle CLI as `--max-amount`; the CLI is never invoked with an unlimited or omitted effective payment limit.
+For the Circle CLI backend, `X402_MAX_USDC_PER_PAYMENT` defaults to `5` USDC. When a caller supplies `max_usdc`, it can only lower this configured cap. If both are omitted in a custom programmatic configuration, the validated fresh challenge amount is still passed to Circle CLI as `--max-amount`; the CLI is never invoked with an unlimited or omitted effective payment limit.
 
 Public marketplace discovery (`x402_service_search` with `marketplace_url`) is informational only. It does not trust, persist, or automatically pay discovered endpoints; a later `x402_pay` independently repeats policy checks, DNS validation, fresh challenge acquisition, native manual approval, and exactly-once payment handling.
 

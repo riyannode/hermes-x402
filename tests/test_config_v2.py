@@ -37,6 +37,10 @@ class TestConfigDefaults:
         config = X402Config()
         assert config.daily_budget_usdc is None
 
+    def test_default_max_usdc_per_payment(self):
+        config = X402Config()
+        assert config.max_usdc_per_payment == "5"
+
     def test_default_allow_http(self):
         config = X402Config()
         assert config.allow_http is False
@@ -265,11 +269,13 @@ class TestLegacyConfig:
         monkeypatch.delenv("X402_ALLOW_HTTP", raising=False)
         monkeypatch.delenv("X402_DISCOVERY_HOST_ALLOWLIST", raising=False)
         monkeypatch.delenv("X402_HOST_ALLOWLIST", raising=False)
+        monkeypatch.delenv("X402_MAX_USDC_PER_PAYMENT", raising=False)
         config = X402Config.from_env()
         assert config.role is None
         # PR #4 fields have sensible defaults
         assert config.network_policy == "public"
         assert config.allow_http is False
+        assert config.max_usdc_per_payment == "5"
 
 
 # ---------------------------------------------------------------------------
