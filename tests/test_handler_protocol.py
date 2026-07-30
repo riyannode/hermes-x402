@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import json
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -338,6 +339,124 @@ class TestArgumentPreservation:
         parsed = json.loads(result)
         assert parsed.get("success") is False
         assert "url" in parsed.get("message", "").lower() or "url" in parsed.get("error", "")
+
+    def test_pay_schema_exposes_only_optional_idempotency_key_not_generic_headers(
+        self, fake_ctx: FakeCtx
+    ):
+        tool = next(t for t in fake_ctx.tools if t["name"] == "x402_pay")
+        parameters = tool["schema"]["parameters"]
+        properties = parameters["properties"]
+
+        assert properties["idempotency_key"]["anyOf"] == [
+            {"type": "string"},
+            {"type": "null"},
+        ]
+        assert "idempotency_key" not in parameters["required"]
+        assert "headers" not in properties
+        assert not {
+            "authorization",
+            "payment_signature",
+            "x_payment",
+            "cookies",
+            "api_key",
+        } & {name.lower() for name in properties}
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "   ",
+            " abcdefgh",
+            "abcdefgh ",
+            " abcdefgh ",
+            "short",
+            "bad\rkey",
+            "bad\nkey",
+            "bad\x00key",
+            "bad\x7fkey",
+            "unicode-🔑",
+            "x" * 201,
+            123,
+            [],
+            {},
+        ],
+    )
+    def test_pay_rejects_invalid_idempotency_keys_before_payment(
+        self, fake_ctx: FakeCtx, value: Any
+    ):
+        tool = next(t for t in fake_ctx.tools if t["name"] == "x402_pay")
+        parsed = json.loads(
+            _run_async(
+                tool["handler"]({"url": "https://example.com", "idempotency_key": value}, **{})
+            )
+        )
+
+        assert parsed == {
+            "success": False,
+            "error": "invalid_input",
+            "message": parsed["message"],
+        }
+        assert "idempotency_key" in parsed["message"]
+
+    @pytest.mark.asyncio
+    async def test_pay_maps_valid_key_and_preserves_seller_data(
+        self, fake_ctx: FakeCtx, monkeypatch
+    ):
+        key = "flow evidence 001"
+        seller_data = {
+            "idempotency_key": key,
+            "nested": {"echo": key},
+            "ordinary": "unchanged",
+        }
+        buyer = MagicMock()
+        buyer.pay = AsyncMock(
+            return_value=MagicMock(
+                payment_status="resource_succeeded",
+                status=200,
+                payer="",
+                amount="1",
+                network="eip155:5042002",
+                transaction_id=None,
+                data=seller_data,
+            )
+        )
+        config = MagicMock(
+            network_policy="public",
+            host_allowlist=[],
+            allow_http=False,
+            max_usdc_per_payment=None,
+            require_approval_for_new_host=False,
+        )
+        runtime = MagicMock(is_available=True, config=config, buyer_tool=buyer)
+        monkeypatch.setattr("hermes_x402.hermes_plugin.tools.get_runtime", lambda: runtime)
+
+        async def dns_ok(_: str) -> None:
+            return None
+
+        monkeypatch.setattr("hermes_x402.dns_validator.resolve_and_validate_destination", dns_ok)
+        tool = next(t for t in fake_ctx.tools if t["name"] == "x402_pay")
+        parsed = json.loads(
+            await tool["handler"](
+                {
+                    "url": "https://example.com/resource",
+                    "method": "POST",
+                    "body": {"same": "request"},
+                    "idempotency_key": key,
+                },
+                **{},
+            )
+        )
+
+        assert parsed["idempotency_key_applied"] is True
+        assert "idempotency_key" not in parsed
+        assert parsed["data"] == seller_data
+        buyer.pay.assert_awaited_once_with(
+            url="https://example.com/resource",
+            method="POST",
+            body={"same": "request"},
+            max_usdc=None,
+            headers={"Idempotency-Key": key},
+        )
 
     def test_login_start_preserves_email(self, fake_ctx: FakeCtx):
         """x402_login_start must preserve email arg."""

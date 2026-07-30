@@ -74,6 +74,9 @@ from hermes_x402.hermes_plugin.schemas import (
 
 logger = logging.getLogger(__name__)
 
+MIN_IDEMPOTENCY_KEY_LENGTH = 8
+MAX_IDEMPOTENCY_KEY_LENGTH = 200
+
 
 # ---------------------------------------------------------------------------
 # Fingerprint helper
@@ -203,6 +206,28 @@ def _validate_body_size(body: Any) -> str | None:
     raw = json.dumps(body, ensure_ascii=False, default=str)
     if len(raw) > MAX_BODY_SIZE:
         return f"Body exceeds maximum size of {MAX_BODY_SIZE} bytes."
+    return None
+
+
+def _validate_idempotency_key(value: Any) -> str | None:
+    """Validate Flowvidence-compatible explicit request identity."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "idempotency_key must be a string or null."
+    if "\r" in value or "\n" in value:
+        return "idempotency_key must not contain CR or LF characters."
+    if value.startswith(" ") or value.endswith(" "):
+        return "idempotency_key must not contain leading or trailing spaces."
+    if not value.strip():
+        return "idempotency_key must not be empty or whitespace-only."
+    if any(ord(char) < 0x20 or ord(char) > 0x7E for char in value):
+        return "idempotency_key must contain printable ASCII characters only."
+    if not MIN_IDEMPOTENCY_KEY_LENGTH <= len(value) <= MAX_IDEMPOTENCY_KEY_LENGTH:
+        return (
+            "idempotency_key length must be between "
+            f"{MIN_IDEMPOTENCY_KEY_LENGTH} and {MAX_IDEMPOTENCY_KEY_LENGTH} characters."
+        )
     return None
 
 
@@ -1402,6 +1427,12 @@ def register_payment_tools(ctx: Any) -> None:
             with contextlib.suppress(ValueError, TypeError):
                 body = json.loads(body)
         max_usdc = args.get("max_usdc")
+        idempotency_key = args.get("idempotency_key")
+        idempotency_error = _validate_idempotency_key(idempotency_key)
+        if idempotency_error:
+            return format_success_result(
+                {"success": False, "error": "invalid_input", "message": idempotency_error}
+            )
 
         err = _validate_url(url)
         if err:
@@ -1504,7 +1535,15 @@ def register_payment_tools(ctx: Any) -> None:
             )
 
         try:
-            result = await buyer.pay(url=url, method=method, body=body, max_usdc=validated_cap)
+            pay_kwargs: dict[str, Any] = {
+                "url": url,
+                "method": method,
+                "body": body,
+                "max_usdc": validated_cap,
+            }
+            if idempotency_key is not None:
+                pay_kwargs["headers"] = {"Idempotency-Key": idempotency_key}
+            result = await buyer.pay(**pay_kwargs)
 
             output: dict[str, Any] = {
                 "success": True,
@@ -1516,6 +1555,8 @@ def register_payment_tools(ctx: Any) -> None:
             }
             if result.transaction_id:
                 output["transaction_id"] = result.transaction_id
+            if idempotency_key is not None:
+                output["idempotency_key_applied"] = True
             if result.data is not None:
                 data = result.data
                 if isinstance(data, str) and len(data) > MAX_OUTPUT_SIZE:
@@ -1549,8 +1590,10 @@ def register_payment_tools(ctx: Any) -> None:
             "Cannot change configured wallet, network, or backend. "
             "Capped by local configuration. x402_pay must obtain a fresh "
             "402 challenge from the server — never reuse a stale one. "
-            "Never retry when retry_safe is false or the outcome is "
-            "ambiguous. Authentication-required errors must be resolved "
+            "Reuse an idempotency key only for the same logical method, URL, "
+            "and body. Do not change the key during an uncertain retry; it does "
+            "not make an unsafe retry safe. Never retry when retry_safe is false "
+            "or the outcome is ambiguous. Authentication-required errors must be resolved "
             "before retrying. Insufficient Gateway balance must be "
             "reported as an actionable readiness failure, not handled by "
             "inventing a deposit flow."

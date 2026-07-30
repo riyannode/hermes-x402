@@ -31,6 +31,7 @@ from hermes_x402 import (
     X402Config,
     X402HermesAgent,
 )
+from hermes_x402.buyer.errors import PaymentSubmissionUnknownError
 from hermes_x402.circle_cli.errors import (
     CircleCliExecutableNotFoundError,
     CircleCliExitNonzeroError,
@@ -545,6 +546,8 @@ class TestCircleCliClientAndBackend:
         )
 
         # Reuse the established project stub rather than perform any network request.
+        initial_requests = []
+
         class Stub:
             async def __aenter__(self):
                 return self
@@ -553,16 +556,23 @@ class TestCircleCliClientAndBackend:
                 return None
 
             async def request(self, **kwargs):
+                initial_requests.append(kwargs)
                 return initial
 
         with patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=Stub()):
             paid = await service.pay(
-                "https://allowed.example/premium", headers={"Payment-Signature": "caller"}
+                "https://allowed.example/premium",
+                headers={
+                    "Payment-Signature": "caller",
+                    "Idempotency-Key": "flowvidence-example-001",
+                },
             )
         assert paid.payment_status == "resource_succeeded"
+        assert initial_requests[0]["headers"] == {"Idempotency-Key": "flowvidence-example-001"}
         assert [call[:2] for call in runner.calls].count(("services", "pay")) == 1
         pay_args = next(call for call in runner.calls if call[:2] == ("services", "pay"))
         assert "Payment-Signature: caller" not in pay_args
+        assert pay_args[pay_args.index("-H") + 1] == "Idempotency-Key: flowvidence-example-001"
         assert pay_args[pay_args.index("--max-amount") + 1] == "0.01"
 
     @pytest.mark.asyncio
@@ -817,6 +827,49 @@ class TestCircleCliClientAndBackend:
         assert mapped["retry_safe"] is False
         assert "may have been submitted" in mapped["message"]
         assert "must not be retried automatically" in mapped["message"]
+        assert [call[:2] for call in runner.calls].count(("services", "pay")) == 1
+
+    @pytest.mark.asyncio
+    async def test_changed_idempotency_key_cannot_bypass_ambiguous_payment_guard(self):
+        runner = FakeRunner(pay_result=CircleCliInvalidJsonOutputError("bad json"))
+        backend = CircleCliBuyerBackend(ADDRESS, "BASE", CircleCliClient(runner))
+        challenge = {
+            "x402Version": 2,
+            "resource": {"url": "/premium"},
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:8453",
+                    "amount": "10000",
+                    "asset": "0x3",
+                    "payTo": SELLER,
+                }
+            ],
+        }
+        request = {
+            "url": "https://allowed.example/premium",
+            "method": "POST",
+            "body": {"same": "request"},
+            "payment_required": challenge,
+            "max_usdc": "0.01",
+        }
+
+        with pytest.raises(PaymentSubmissionUnknownError):
+            await backend.pay_and_fetch(
+                **request,
+                headers={"Idempotency-Key": "flowvidence-K1"},
+            )
+
+        retained_fingerprints = set(backend._active_fingerprints)
+        assert len(retained_fingerprints) == 1
+
+        with pytest.raises(PaymentSubmissionUnknownError, match="equivalent"):
+            await backend.pay_and_fetch(
+                **request,
+                headers={"Idempotency-Key": "flowvidence-K2"},
+            )
+
+        assert backend._active_fingerprints == retained_fingerprints
         assert [call[:2] for call in runner.calls].count(("services", "pay")) == 1
 
     @pytest.mark.asyncio

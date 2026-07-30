@@ -159,7 +159,19 @@ Inspect a service URL without paying. Enforces URL scheme validation, host polic
 Fetch a resource URL without paying. When HTTP 402 occurs, reports that payment is required but does not pay. Useful for inspecting free endpoints or understanding the payment challenge before committing.
 
 ### `x402_pay`
-Pay for an x402 resource. **This tool may transfer USDC.** Accepts an optional `max_usdc` caller cap that can reduce but never raise the configured cap. Returns the fetched resource data after successful payment. Ambiguous outcomes return `retry_safe=false` and must not be retried automatically. Must obtain a fresh 402 challenge from the server — never reuse a stale one.
+Pay for an x402 resource. **This tool may transfer USDC.** Accepts an optional `max_usdc` caller cap that can reduce but never raise the configured cap. It also accepts an optional explicit `idempotency_key`, which is sent as `Idempotency-Key` on both the initial challenge request and the paid follow-up request:
+
+```python
+x402_pay(
+    url="https://example.test/v1/resource",
+    method="POST",
+    body={...},
+    max_usdc="0.001",
+    idempotency_key="flowvidence-example-001",
+)
+```
+
+Keys must contain 8–200 printable ASCII characters with no leading or trailing spaces. They are never truncated or rewritten. Treat an idempotency key as an opaque request identifier, not as a secret or credential. `x402_pay` returns seller response data unchanged. Reuse the same key only when replaying the same logical method, URL, and body. Do not change it during an uncertain retry. Seller support for idempotency is not guaranteed, and a key does not make an otherwise unsafe retry safe. Returns the fetched resource data after successful payment. Ambiguous outcomes return `retry_safe=false` and must not be retried automatically. Must obtain a fresh 402 challenge from the server — never reuse a stale one.
 
 ### `x402_gateway_balance`
 Report Circle Gateway balance for the active wallet and configured network. Distinguishes Gateway balance from on-chain wallet USDC balance. Read-only.
