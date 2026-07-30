@@ -145,6 +145,9 @@ class CircleCliBuyerBackend:
         method: str,
         body: dict[str, Any] | None,
     ) -> str:
+        # This fingerprint represents economic payment equivalence, not seller-side
+        # request identity. Idempotency-Key is intentionally excluded so changing a
+        # key cannot bypass an active or ambiguous-payment guard.
         accepts = payment_required["accepts"]
         first = accepts[0]
         material = {
