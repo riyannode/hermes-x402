@@ -366,6 +366,9 @@ class TestArgumentPreservation:
         [
             "",
             "   ",
+            " abcdefgh",
+            "abcdefgh ",
+            " abcdefgh ",
             "short",
             "bad\rkey",
             "bad\nkey",
@@ -399,7 +402,7 @@ class TestArgumentPreservation:
     async def test_pay_maps_valid_key_to_only_idempotency_header(
         self, fake_ctx: FakeCtx, monkeypatch
     ):
-        key = "flowvidence-example-001"
+        key = "flow evidence 001"
         buyer = MagicMock()
         buyer.pay = AsyncMock(
             return_value=MagicMock(

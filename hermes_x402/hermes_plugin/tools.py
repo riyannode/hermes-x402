@@ -217,6 +217,8 @@ def _validate_idempotency_key(value: Any) -> str | None:
         return "idempotency_key must be a string or null."
     if "\r" in value or "\n" in value:
         return "idempotency_key must not contain CR or LF characters."
+    if value.startswith(" ") or value.endswith(" "):
+        return "idempotency_key must not contain leading or trailing spaces."
     if not value.strip():
         return "idempotency_key must not be empty or whitespace-only."
     if any(ord(char) < 0x20 or ord(char) > 0x7E for char in value):

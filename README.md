@@ -171,7 +171,7 @@ x402_pay(
 )
 ```
 
-Keys must contain 8–200 printable ASCII characters. They are never truncated or rewritten. Reuse the same key only when replaying the same logical method, URL, and body. Do not change it during an uncertain retry. Seller support for idempotency is not guaranteed, and a key does not make an otherwise unsafe retry safe. Returns the fetched resource data after successful payment. Ambiguous outcomes return `retry_safe=false` and must not be retried automatically. Must obtain a fresh 402 challenge from the server — never reuse a stale one.
+Keys must contain 8–200 printable ASCII characters with no leading or trailing spaces. They are never truncated or rewritten. Reuse the same key only when replaying the same logical method, URL, and body. Do not change it during an uncertain retry. Seller support for idempotency is not guaranteed, and a key does not make an otherwise unsafe retry safe. Returns the fetched resource data after successful payment. Ambiguous outcomes return `retry_safe=false` and must not be retried automatically. Must obtain a fresh 402 challenge from the server — never reuse a stale one.
 
 ### `x402_gateway_balance`
 Report Circle Gateway balance for the active wallet and configured network. Distinguishes Gateway balance from on-chain wallet USDC balance. Read-only.
