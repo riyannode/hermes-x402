@@ -399,10 +399,15 @@ class TestArgumentPreservation:
         assert "idempotency_key" in parsed["message"]
 
     @pytest.mark.asyncio
-    async def test_pay_maps_valid_key_to_only_idempotency_header(
+    async def test_pay_maps_valid_key_and_preserves_seller_data(
         self, fake_ctx: FakeCtx, monkeypatch
     ):
         key = "flow evidence 001"
+        seller_data = {
+            "idempotency_key": key,
+            "nested": {"echo": key},
+            "ordinary": "unchanged",
+        }
         buyer = MagicMock()
         buyer.pay = AsyncMock(
             return_value=MagicMock(
@@ -412,7 +417,7 @@ class TestArgumentPreservation:
                 amount="1",
                 network="eip155:5042002",
                 transaction_id=None,
-                data={"ok": True},
+                data=seller_data,
             )
         )
         config = MagicMock(
@@ -443,7 +448,8 @@ class TestArgumentPreservation:
         )
 
         assert parsed["idempotency_key_applied"] is True
-        assert key not in json.dumps(parsed)
+        assert "idempotency_key" not in parsed
+        assert parsed["data"] == seller_data
         buyer.pay.assert_awaited_once_with(
             url="https://example.com/resource",
             method="POST",
