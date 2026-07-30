@@ -363,7 +363,20 @@ class TestArgumentPreservation:
 
     @pytest.mark.parametrize(
         "value",
-        ["", "   ", "short", "bad\rkey", "bad\nkey", "x" * 201, 123, [], {}],
+        [
+            "",
+            "   ",
+            "short",
+            "bad\rkey",
+            "bad\nkey",
+            "bad\x00key",
+            "bad\x7fkey",
+            "unicode-🔑",
+            "x" * 201,
+            123,
+            [],
+            {},
+        ],
     )
     def test_pay_rejects_invalid_idempotency_keys_before_payment(
         self, fake_ctx: FakeCtx, value: Any

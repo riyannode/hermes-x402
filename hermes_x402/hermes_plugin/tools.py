@@ -219,6 +219,8 @@ def _validate_idempotency_key(value: Any) -> str | None:
         return "idempotency_key must not contain CR or LF characters."
     if not value.strip():
         return "idempotency_key must not be empty or whitespace-only."
+    if any(ord(char) < 0x20 or ord(char) > 0x7E for char in value):
+        return "idempotency_key must contain printable ASCII characters only."
     if not MIN_IDEMPOTENCY_KEY_LENGTH <= len(value) <= MAX_IDEMPOTENCY_KEY_LENGTH:
         return (
             "idempotency_key length must be between "

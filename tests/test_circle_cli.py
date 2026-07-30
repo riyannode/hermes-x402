@@ -545,6 +545,8 @@ class TestCircleCliClientAndBackend:
         )
 
         # Reuse the established project stub rather than perform any network request.
+        initial_requests = []
+
         class Stub:
             async def __aenter__(self):
                 return self
@@ -553,16 +555,23 @@ class TestCircleCliClientAndBackend:
                 return None
 
             async def request(self, **kwargs):
+                initial_requests.append(kwargs)
                 return initial
 
         with patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=Stub()):
             paid = await service.pay(
-                "https://allowed.example/premium", headers={"Payment-Signature": "caller"}
+                "https://allowed.example/premium",
+                headers={
+                    "Payment-Signature": "caller",
+                    "Idempotency-Key": "flowvidence-example-001",
+                },
             )
         assert paid.payment_status == "resource_succeeded"
+        assert initial_requests[0]["headers"] == {"Idempotency-Key": "flowvidence-example-001"}
         assert [call[:2] for call in runner.calls].count(("services", "pay")) == 1
         pay_args = next(call for call in runner.calls if call[:2] == ("services", "pay"))
         assert "Payment-Signature: caller" not in pay_args
+        assert pay_args[pay_args.index("-H") + 1] == "Idempotency-Key: flowvidence-example-001"
         assert pay_args[pay_args.index("--max-amount") + 1] == "0.01"
 
     @pytest.mark.asyncio
