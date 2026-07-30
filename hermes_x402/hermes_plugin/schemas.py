@@ -202,8 +202,11 @@ X402_PAY_SCHEMA: dict[str, Any] = {
         "Cannot change configured wallet, network, or backend. "
         "Capped by local configuration. Caller cap may reduce but "
         "never raise the configured cap. Protected payment headers "
-        "cannot be supplied. Ambiguous outcomes return retry_safe=false "
-        "and must not be retried automatically. "
+        "cannot be supplied. An optional idempotency key may be reused only "
+        "for the same logical method, URL, and body. Keep the same key during "
+        "an uncertain retry; changing it can create a different request. The key "
+        "does not make an otherwise unsafe retry safe. Ambiguous outcomes return "
+        "retry_safe=false and must not be retried automatically. "
         "Daily budget configuration is accepted but not enforced in this release."
     ),
     "parameters": {
@@ -227,6 +230,13 @@ X402_PAY_SCHEMA: dict[str, Any] = {
                 "description": (
                     "Maximum USDC to spend (caller cap). "
                     "Can only reduce the configured cap, never raise it."
+                ),
+            },
+            "idempotency_key": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "description": (
+                    "Optional HTTP Idempotency-Key. Reuse only for the same logical "
+                    "method, URL, and body; do not change it during an uncertain retry."
                 ),
             },
         },

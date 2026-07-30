@@ -256,6 +256,33 @@ class TestBuyerService:
         assert result.payment_status == "resource_succeeded"
 
     @pytest.mark.asyncio
+    async def test_idempotency_key_is_preserved_on_initial_and_paid_requests(self):
+        backend = FakeBackend()
+        key = "flowvidence-example-001"
+        client = StubAsyncClient(
+            [
+                httpx.Response(402, headers={"Payment-Required": encoded_challenge()}),
+                httpx.Response(200, json={"paid": True}),
+            ]
+        )
+        with patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=client):
+            await self.service(backend).pay(
+                "https://api.example.com", headers={"Idempotency-Key": key}
+            )
+
+        assert [request.headers["Idempotency-Key"] for request in client.requests] == [key, key]
+        assert client.requests[1].headers["Payment-Signature"] == "generated-proof"
+
+    @pytest.mark.asyncio
+    async def test_absent_idempotency_key_does_not_add_header(self):
+        backend = FakeBackend()
+        client = StubAsyncClient([httpx.Response(200, json={"ok": True})])
+        with patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=client):
+            await self.service(backend).pay("https://api.example.com")
+
+        assert "idempotency-key" not in {name.lower() for name in client.requests[0].headers}
+
+    @pytest.mark.asyncio
     async def test_host_and_amount_are_rejected_before_backend(self):
         backend = FakeBackend()
         with pytest.raises(PaymentPolicyError):
