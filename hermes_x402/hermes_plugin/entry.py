@@ -170,6 +170,7 @@ def _register_slash_command(ctx: Any) -> None:
     ctx.register_command(
         "x402",
         command_handler,
+        description="x402 wallet, balances, payment help",
         # Keep the command parameterless in Telegram's native menu. The handler
         # still accepts trailing free-form arguments after the command name.
         args_hint="",

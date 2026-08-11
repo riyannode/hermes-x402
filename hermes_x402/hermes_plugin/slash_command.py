@@ -187,9 +187,20 @@ HELP_TEXT = """\
   /x402 configure preview ... — Preview config
   /x402 configure apply <id> — Apply config
 
-**Financial operations** (agent tools, not slash commands):
-Payments, deposits, and login completion are requested in chat and
-executed through protected agent tools with approval."""
+**How to pay**
+1. Run `/x402 supports <url>` to check the service first.
+2. In normal chat, say: `Pay <url> with a maximum of <amount> USDC`.
+   Include the HTTP method and request body when the service needs them.
+3. Hermes obtains a fresh challenge and shows a native approval before any
+   USDC moves. If the outcome is ambiguous, it stops and does not retry.
+
+**Gateway funding**
+In normal chat, ask: `Preview a Gateway deposit of <amount> USDC for <url>`.
+Review the preview, then explicitly approve the separate execution.
+
+Financial actions use protected agent tools in chat (not `/x402 pay` or
+`/x402 deposit`) so native Hermes approval is always required for payments,
+deposits, and login completion."""
 
 
 def handle_x402_command(raw_args: str, ctx: Any) -> str:

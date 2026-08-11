@@ -499,6 +499,14 @@ class TestHumanReadable:
         assert "one /x402 command per message" in result
         ctx.dispatch_tool.assert_not_called()
 
+    def test_help_explains_approved_chat_payment_flow(self):
+        result = handle_x402_command("help", _ctx("{}"))
+        assert "**How to pay**" in result
+        assert "/x402 supports <url>" in result
+        assert "Pay <url> with a maximum of <amount> USDC" in result
+        assert "native approval" in result
+        assert "/x402 pay" in result
+
     def test_configure_hides_path(self):
         managed = {
             "X402_ROLE": "buyer",
