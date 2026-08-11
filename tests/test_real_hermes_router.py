@@ -227,11 +227,12 @@ class TestRealHermesX402Router:
         assert "Unknown command `/x402`" not in result
 
 
-def test_x402_command_args_hint_declares_argument_form(
+def test_x402_command_is_parameterless_for_telegram_menu(
     real_hermes_x402_command_registry: Any,
 ) -> None:
     entry = real_hermes_x402_command_registry._plugin_commands["x402"]
-    assert (
-        entry["args_hint"]
-        == "[help|status|wallet|balance|gateway|networks|supports|configure] [args]"
-    )
+    assert entry["args_hint"] == ""
+
+    from hermes_cli.commands import telegram_bot_commands
+
+    assert "x402" in {name for name, _description in telegram_bot_commands()}

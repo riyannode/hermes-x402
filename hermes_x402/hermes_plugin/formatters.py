@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from hermes_x402.hermes_plugin.output import safe_host_allowlist_for_display
+
 # Maximum Telegram output length (below 4096 limit for safety)
 _MAX_OUTPUT = 3500
 
@@ -104,7 +106,8 @@ def format_status(raw: str) -> str:
     wallet = data.get("wallet_address") or data.get("wallet") or ""
     version = data.get("version", "?")
     max_usdc = data.get("max_usdc_per_payment", "")
-    policy = data.get("host_allowlist", "")
+    network_policy = data.get("network_policy", "")
+    host_allowlist = safe_host_allowlist_for_display(data.get("host_allowlist", []))
     configured = data.get("configured", False)
     available = data.get("available", False)
 
@@ -123,7 +126,10 @@ def format_status(raw: str) -> str:
     if max_usdc:
         lines.append(f"Max payment: {max_usdc} USDC")
 
-    lines.append(f"Network policy: {policy.title() if policy else 'Public'}")
+    if network_policy:
+        lines.append(f"Network policy: {str(network_policy)[:40].title()}")
+    if host_allowlist:
+        lines.append(f"Host allowlist: {', '.join(host_allowlist)}")
     lines.append(f"Status: {status}")
 
     return _truncate("\n".join(lines))

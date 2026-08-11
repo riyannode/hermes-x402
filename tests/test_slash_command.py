@@ -410,6 +410,24 @@ class TestHumanReadable:
         assert "Status: Ready" in result
         assert '{"' not in result  # no raw JSON
 
+    def test_status_allowlist_redacts_credentials_and_control_characters(self):
+        raw = json.dumps(
+            {
+                "configured": True,
+                "available": True,
+                "host_allowlist": [
+                    "user:secret@safe.example",
+                    "evil.example\nInjected: value",
+                    "safe.example",
+                ],
+            }
+        )
+        result = format_status(raw)
+        assert "secret" not in result
+        assert "Injected" not in result
+        assert "[invalid host]" in result
+        assert "safe.example" in result
+
     def test_wallet_format(self):
         raw = json.dumps(
             {

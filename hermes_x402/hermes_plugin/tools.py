@@ -44,7 +44,7 @@ from hermes_x402.circle_cli.errors import (
     CircleCliPaymentOutcomeUnknownError,
 )
 from hermes_x402.hermes_plugin.errors import format_error_result, format_success_result
-from hermes_x402.hermes_plugin.output import safe_wallet_address
+from hermes_x402.hermes_plugin.output import safe_host_allowlist_for_display, safe_wallet_address
 from hermes_x402.hermes_plugin.runtime import get_runtime
 from hermes_x402.hermes_plugin.schemas import (
     ALLOWED_HTTP_METHODS,
@@ -435,7 +435,8 @@ def register_status_tools(ctx: Any) -> None:
             "max_usdc_per_payment": (
                 runtime.config.max_usdc_per_payment if runtime.config else None
             ),
-            "host_allowlist": host_allowlist,
+            "host_allowlist": safe_host_allowlist_for_display(host_allowlist),
+            "network_policy": runtime.config.network_policy if runtime.config else None,
         }
 
         if runtime.init_error:
