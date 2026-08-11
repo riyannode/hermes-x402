@@ -232,7 +232,9 @@ def test_x402_command_is_parameterless_for_telegram_menu(
 ) -> None:
     entry = real_hermes_x402_command_registry._plugin_commands["x402"]
     assert entry["args_hint"] == ""
+    assert entry["description"] == "x402 wallet, balances, payment help"
 
     from hermes_cli.commands import telegram_bot_commands
 
-    assert "x402" in {name for name, _description in telegram_bot_commands()}
+    commands = dict(telegram_bot_commands())
+    assert commands["x402"] == "x402 wallet, balances, payment help"
