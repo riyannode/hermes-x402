@@ -73,7 +73,8 @@ class X402Runtime:
 
         policy = PaymentPolicy(
             max_usdc=self._config.max_usdc_per_payment,
-            host_allowlist=tuple(self._config.host_allowlist),
+            host_allowlist=self._config.effective_host_allowlist,
+            allow_http=self._config.allow_http,
         )
         self._buyer_tool = X402BuyerTool(backend=backend, policy=policy)
 

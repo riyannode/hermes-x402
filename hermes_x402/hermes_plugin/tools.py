@@ -304,16 +304,8 @@ def _validate_allowed_url(
         else:
             # Empty allowlist in strict mode = nothing allowed
             return "No hosts are allowed (empty allowlist in strict_allowlist mode)."
-    elif mode == "public" and host_allowlist:
-        # In public mode, private/reserved IPs are already blocked above.
-        # An allowlist may further restrict destinations.
-        allowed = any(
-            hostname == item.lower() or hostname.endswith(f".{item.lower()}")
-            for item in host_allowlist
-        )
-        if not allowed:
-            return f"Host not in allowlist: {hostname}"
-
+    # Public mode intentionally ignores host_allowlist for authorization.
+    # Scheme, userinfo, literal-IP, and DNS destination checks remain enforced.
     return None
 
 
@@ -415,8 +407,10 @@ def register_status_tools(ctx: Any) -> None:
         safe_wallet = safe_wallet_address(wallet) if wallet else ""
 
         host_allowlist: list[str] = []
+        host_allowlist_active = False
         if runtime.config:
             host_allowlist = runtime.config.host_allowlist
+            host_allowlist_active = runtime.config.network_policy == "strict_allowlist"
 
         role = runtime.role
         is_configured = role is not None and runtime.is_configured
@@ -435,7 +429,10 @@ def register_status_tools(ctx: Any) -> None:
             "max_usdc_per_payment": (
                 runtime.config.max_usdc_per_payment if runtime.config else None
             ),
-            "host_allowlist": safe_host_allowlist_for_display(host_allowlist),
+            "host_allowlist": (
+                safe_host_allowlist_for_display(host_allowlist) if host_allowlist_active else []
+            ),
+            "host_allowlist_active": host_allowlist_active,
             "network_policy": runtime.config.network_policy if runtime.config else None,
         }
 
@@ -1499,8 +1496,13 @@ def register_payment_tools(ctx: Any) -> None:
                 }
             )
 
-        # New-host approval check — fail closed on any error
-        if runtime.config and runtime.config.require_approval_for_new_host:
+        # Backward-compatible trusted-host gate applies only to strict mode.
+        # Native Hermes approval still gates every x402_pay in every mode.
+        if (
+            runtime.config
+            and runtime.config.network_policy == "strict_allowlist"
+            and runtime.config.require_approval_for_new_host
+        ):
             try:
                 from hermes_x402.buyer.approval import check_approval_required
 

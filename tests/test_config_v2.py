@@ -67,6 +67,50 @@ class TestNetworkPolicyFromEnv:
         config = X402Config.from_env()
         assert config.network_policy == "strict_allowlist"
 
+    def test_public_effective_allowlist_is_empty(self):
+        config = X402Config(network_policy="public", host_allowlist=["stale.example"])
+        assert config.effective_host_allowlist == ()
+
+    def test_strict_effective_allowlist_preserves_hosts(self):
+        config = X402Config(network_policy="strict_allowlist", host_allowlist=["allowed.example"])
+        assert config.effective_host_allowlist == ("allowed.example",)
+
+    def test_runtime_public_policy_has_no_active_host_restriction(self, monkeypatch):
+        from unittest.mock import Mock
+
+        from hermes_x402.hermes_plugin.runtime import X402Runtime
+
+        runtime = X402Runtime()
+        runtime._config = X402Config(
+            role="buyer",
+            network_policy="public",
+            host_allowlist=["stale.example"],
+            allow_http=False,
+        )
+        monkeypatch.setattr(runtime, "_create_backend", Mock(return_value=Mock()))
+        runtime._build_buyer()
+
+        assert runtime.buyer_tool is not None
+        assert runtime.buyer_tool.service.policy.host_allowlist == ()
+        assert runtime.buyer_tool.service.policy.allow_http is False
+
+    def test_runtime_strict_policy_preserves_configured_hosts(self, monkeypatch):
+        from unittest.mock import Mock
+
+        from hermes_x402.hermes_plugin.runtime import X402Runtime
+
+        runtime = X402Runtime()
+        runtime._config = X402Config(
+            role="buyer",
+            network_policy="strict_allowlist",
+            host_allowlist=["allowed.example"],
+        )
+        monkeypatch.setattr(runtime, "_create_backend", Mock(return_value=Mock()))
+        runtime._build_buyer()
+
+        assert runtime.buyer_tool is not None
+        assert runtime.buyer_tool.service.policy.host_allowlist == ("allowed.example",)
+
 
 # ---------------------------------------------------------------------------
 # from_env: X402_DISCOVERY_PROVIDERS

@@ -229,6 +229,13 @@ class X402Config:
         config.validate()
         return config
 
+    @property
+    def effective_host_allowlist(self) -> tuple[str, ...]:
+        """Return hosts that actively authorize destinations for this policy mode."""
+        if self.network_policy == "strict_allowlist":
+            return tuple(self.host_allowlist)
+        return ()
+
     def get_chain_config(self) -> dict:
         if self.chain not in CHAINS:
             raise ValueError(f"Unknown chain: {self.chain}. Supported: {list(CHAINS.keys())}")

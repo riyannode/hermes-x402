@@ -14,14 +14,17 @@ class TestPublicMode:
         policy = NetworkPolicy(mode="public", host_allowlist=(), allow_http=False)
         assert policy.is_url_allowed("https://api.example.com/data")
 
-    def test_public_mode_with_allowlist_rejects_non_matching(self):
-        NetworkPolicy(mode="public", host_allowlist=("only.com",), allow_http=False)
+    def test_public_mode_ignores_stale_allowlist(self):
         result = validate_url_strict("https://other.com/data", ("only.com",), "public", False)
-        assert result is not None
+        assert result is None
 
     def test_public_mode_with_allowlist_accepts_matching(self):
         policy = NetworkPolicy(mode="public", host_allowlist=("example.com",), allow_http=False)
         assert policy.is_url_allowed("https://example.com/data")
+
+    def test_flowvidence_not_rejected_by_stale_allowlist(self):
+        policy = NetworkPolicy(mode="public", host_allowlist=("old-seller.example",))
+        assert policy.is_url_allowed("https://flowvidence.my.id/api/case")
 
 
 # ---------------------------------------------------------------------------
