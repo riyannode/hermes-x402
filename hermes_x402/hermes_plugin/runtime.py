@@ -7,6 +7,8 @@ during the same Hermes process.
 from __future__ import annotations
 
 import logging
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 from hermes_x402.buyer import X402BuyerTool
@@ -18,7 +20,14 @@ from hermes_x402.config import X402Config
 
 logger = logging.getLogger(__name__)
 
-_VERSION = "0.2.0"
+
+def _package_version() -> str:
+    """Return the installed distribution version, with a source fallback."""
+    try:
+        return package_version("hermes-x402")
+    except PackageNotFoundError:
+        # Source checkouts may not have package metadata installed.
+        return "0+unknown"
 
 
 class X402Runtime:
@@ -161,7 +170,7 @@ class X402Runtime:
 
     @property
     def version(self) -> str:
-        return _VERSION
+        return _package_version()
 
 
 # Module-level singleton — process-local, not thread-safe by design.
