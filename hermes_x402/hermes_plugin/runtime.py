@@ -7,7 +7,8 @@ during the same Hermes process.
 from __future__ import annotations
 
 import logging
-from importlib.metadata import PackageNotFoundError, version as package_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 from hermes_x402.buyer import X402BuyerTool
@@ -18,6 +19,7 @@ from hermes_x402.circle_cli.runner import CircleCliRunner
 from hermes_x402.config import X402Config
 
 logger = logging.getLogger(__name__)
+
 
 def _package_version() -> str:
     """Return the installed distribution version, with a source fallback."""
