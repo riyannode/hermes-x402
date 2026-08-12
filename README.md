@@ -328,13 +328,18 @@ All configuration is via environment variables. No config files required.
 hermes-x402 enforces a network policy on every outbound URL request (supports, inspect, fetch, pay).
 
 ### `public` Mode (Default)
-Any public HTTPS destination may be inspected or paid. The following are **always blocked**:
+`X402_NETWORK_POLICY=public` means that any otherwise-valid **public HTTPS** destination may be inspected or paid. Permanent host registration is not required. In this mode, `X402_HOST_ALLOWLIST` is ignored for destination authorization, including stale non-empty values.
+
+The following protections remain active:
 - Private/reserved IP addresses (`10.*`, `172.16-31.*`, `192.168.*`)
 - Loopback addresses (`localhost`, `127.0.0.1`, `::1`)
 - Link-local addresses (`169.254.*`, `fe80::*`)
 - Metadata endpoints (`metadata.google.internal`, `169.254.169.254`)
+- DNS names resolving to private, reserved, loopback, link-local, or metadata addresses
 - URLs with embedded credentials (userinfo)
 - HTTP URLs (unless `X402_ALLOW_HTTP=true`)
+- Redirects are not blindly followed
+- Request and response size/time bounds remain enforced
 
 Direct public payment without permanent host registration:
 
@@ -345,14 +350,55 @@ export X402_REQUIRE_APPROVAL_FOR_NEW_HOST=false
 export X402_ALLOW_HTTP=false
 ```
 
-With this setup, a user-supplied public HTTPS `x402_pay` URL does not need `trust_host()`, `x402_trusted_hosts.json`, `X402_HOST_ALLOWLIST`, or `X402_DISCOVERY_HOST_ALLOWLIST`. Each payment still goes through the native Hermes approval for the payment-capable `x402_pay` tool, then obtains a fresh 402 challenge. DNS and SSRF validation remain active, and ambiguous outcomes stay non-retryable.
+With this setup, a user-supplied public HTTPS `x402_pay` URL does not need `trust_host()`, `x402_trusted_hosts.json`, `X402_HOST_ALLOWLIST`, or `X402_DISCOVERY_HOST_ALLOWLIST`. `X402_REQUIRE_APPROVAL_FOR_NEW_HOST` is not needed to authorize arbitrary public-mode hosts; it may still be relevant to strict/trusted-host workflows.
 
 For the Circle CLI backend, `X402_MAX_USDC_PER_PAYMENT` defaults to `5` USDC. When a caller supplies `max_usdc`, it can only lower this configured cap. If both are omitted in a custom programmatic configuration, the validated fresh challenge amount is still passed to Circle CLI as `--max-amount`; the CLI is never invoked with an unlimited or omitted effective payment limit.
 
 Public marketplace discovery (`x402_service_search` with `marketplace_url`) is informational only. It does not trust, persist, or automatically pay discovered endpoints; a later `x402_pay` independently repeats policy checks, DNS validation, fresh challenge acquisition, native manual approval, and exactly-once payment handling.
 
 ### `strict_allowlist` Mode (Opt-in)
-Only hosts listed in `X402_HOST_ALLOWLIST` are permitted. An empty allowlist means **nothing** is allowed.
+Set `X402_NETWORK_POLICY=strict_allowlist` to enforce the configured `X402_HOST_ALLOWLIST`. An empty allowlist means **nothing** is allowed. This is the operator opt-in egress-lockdown mode. All SSRF, DNS, scheme, userinfo, redirect, and request/response-bound protections apply in both modes.
+
+### Payment approval model
+
+Every `x402_pay` remains a protected financial Hermes tool call. Public mode is **not** autonomous unrestricted spending. The native Hermes approval hook is required for every `x402_pay` execution:
+
+- each call must have a unique `tool_call_id`; missing identity blocks execution fail-closed;
+- the operator sees a sanitized URL, method, and payment-cap information;
+- `X402_MAX_USDC_PER_PAYMENT` remains enforced, and caller `max_usdc` can only lower that configured cap;
+- approval does not bypass challenge validation: payment uses a fresh HTTP `402` challenge;
+- ambiguous payment outcomes return `retry_safe=false` and are not automatically retried.
+
+Conceptually:
+
+```
+public HTTPS destination
+→ SSRF/DNS safety
+→ fresh 402 challenge
+→ amount/network checks
+→ native Hermes approval
+→ payment caps
+→ payment execution
+```
+
+### Telegram `/x402` command visibility
+
+The plugin automatically registers `/x402` through the Hermes plugin API; manual Hermes plugin registration is normally unnecessary. Slash-command registration and Telegram's command picker are separate: `/x402` can work when typed even when it is not shown in the picker.
+
+Current Hermes Agent behavior follows Telegram's Bot API limit of 100 commands, uses a default menu cap of 60, clamps configured values to `1..100`, automatically calls `set_my_commands()`, and collects core/gateway plus plugin/skill commands. To prioritize `/x402` in the picker, configure:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      command_menu:
+        max_commands: 60
+        priority_mode: prepend
+        priority:
+          - x402
+```
+
+After changing the menu configuration, restart/reload the Hermes gateway so it refreshes Telegram's command menu.
 
 ### DNS Validation
 - Hostnames are validated against the policy **before** DNS resolution.
