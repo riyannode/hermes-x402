@@ -472,7 +472,7 @@ async def test_strict_allowlist_empty_rejects_same_direct_public_pay(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_public_mode_non_empty_allowlist_restricts_payment_hosts(monkeypatch) -> None:
+async def test_public_mode_non_empty_allowlist_does_not_restrict_payment_hosts(monkeypatch) -> None:
     from hermes_x402.hermes_plugin import tools as plugin_tools
 
     buyer = _payment_runtime().buyer_tool
@@ -483,9 +483,8 @@ async def test_public_mode_non_empty_allowlist_restricts_payment_hosts(monkeypat
 
     result = json.loads(await ctx.tools["x402_pay"]({"url": "https://other.example/pay"}))
 
-    assert result["success"] is False
-    assert result["error"] == "host_rejected"
-    buyer.pay.assert_not_awaited()
+    assert result["success"] is True
+    buyer.pay.assert_awaited_once()
 
 
 @pytest.mark.asyncio

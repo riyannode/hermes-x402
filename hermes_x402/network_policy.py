@@ -116,16 +116,8 @@ def validate_url_strict(
             # Empty allowlist in strict mode = nothing allowed
             return "No hosts are allowed (empty allowlist in strict_allowlist mode)."
 
-    elif mode == "public" and host_allowlist:
-        # In public mode, private/reserved IPs are already blocked above.
-        # An allowlist may optionally further restrict destinations.
-        allowed = any(
-            hostname == item.lower() or hostname.endswith(f".{item.lower()}")
-            for item in host_allowlist
-        )
-        if not allowed:
-            return f"Host not in public-mode allowlist: {hostname}"
-
+    # Public mode intentionally ignores host_allowlist for authorization.
+    # Scheme, userinfo, literal-IP, and DNS destination checks remain enforced.
     return None
 
 

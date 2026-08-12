@@ -278,11 +278,11 @@ class TestRuntimeHostPolicy:
         policy = NetworkPolicy(mode="public", host_allowlist=())
         assert policy.is_url_allowed("https://example.com/data")
 
-    def test_public_with_allowlist_restricts(self):
-        """public + configured allowlist → restrict to that list."""
+    def test_public_with_allowlist_ignores_stale_hosts(self):
+        """public + configured allowlist → allow any otherwise-safe public host."""
         policy = NetworkPolicy(mode="public", host_allowlist=("example.com",))
         assert policy.is_url_allowed("https://example.com/data")
-        assert not policy.is_url_allowed("https://other.com/data")
+        assert policy.is_url_allowed("https://other.com/data")
 
 
 # ════════════════════════════════════════════════════════════════════════════
