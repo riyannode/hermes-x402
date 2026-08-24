@@ -13,7 +13,7 @@ Supported syntax:
   /x402 networks [active|buyer|gateway|all]
   /x402 supports <https-url>
   /x402 configure
-  /x402 configure preview buyer cli <wallet> ARC-TESTNET [max_usdc=5]
+  /x402 configure preview buyer cli <wallet> ARC-TESTNET
   /x402 configure apply <preview_id>
 """
 
@@ -25,7 +25,6 @@ import os
 import re
 import threading
 import time
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -301,6 +300,7 @@ def _handle_configure_show() -> str:
     cli_info = _check_cli_available()
     env_path = _resolve_hermes_home() / ".env"
     managed = _read_managed_keys(env_path)
+    managed["X402_MAX_USDC_PER_PAYMENT"] = os.environ.get("X402_MAX_USDC_PER_PAYMENT", "") or "5"
     return format_configure(managed, cli_info)
 
 
@@ -309,18 +309,17 @@ def _validate_configure_args(
 ) -> tuple[dict[str, str] | None, str | None]:
     """Validate configure preview arguments.
 
-    Expected: buyer cli <wallet> ARC-TESTNET [max_usdc]
+    Expected: buyer cli <wallet> ARC-TESTNET
     Returns (validated_params, error_message).
-    Rejects extra arguments. Missing max_usdc defaults to the local policy cap of 5 USDC.
+    Rejects extra arguments because configure apply does not manage payment policy.
     """
-    if len(parts) not in {4, 5}:
-        return None, ("Usage: /x402 configure preview buyer cli <wallet> ARC-TESTNET [max_usdc=5]")
+    if len(parts) != 4:
+        return None, "Usage: /x402 configure preview buyer cli <wallet> ARC-TESTNET"
 
     role = parts[0].lower()
     backend = parts[1].lower()
     wallet = parts[2]
     network = parts[3].upper()
-    max_usdc_str = parts[4] if len(parts) == 5 else "5"
 
     # Validate role
     if role != "buyer":
@@ -344,21 +343,11 @@ def _validate_configure_args(
     except (ValueError, KeyError, Exception):
         return None, f"Invalid network: {network!r}. Not found in network registry."
 
-    # Validate max_usdc
-    try:
-        max_usdc = Decimal(max_usdc_str)
-    except (InvalidOperation, ValueError):
-        return None, f"Invalid max_usdc: {max_usdc_str!r}. Must be a valid Decimal."
-
-    if not max_usdc.is_finite() or max_usdc <= 0:
-        return None, f"Invalid max_usdc: {max_usdc_str!r}. Must be positive and finite."
-
     return {
         "role": role,
         "backend": backend,
         "wallet": wallet,
         "network": network,
-        "max_usdc": str(max_usdc),
     }, None
 
 
@@ -403,7 +392,6 @@ def _handle_configure_preview(parts: list[str]) -> str:
         "",
         f"Wallet: {_mask_wallet(params['wallet'])}",
         f"Network: {params['network']}",
-        f"Max payment: {params['max_usdc']} USDC",
         "",
         f"Preview ID: `{preview_id}`",
         f"Expires in: {_PREVIEW_TTL_SECONDS}s",

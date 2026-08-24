@@ -471,7 +471,7 @@ def format_configure(managed: dict[str, str], cli_info: dict[str, Any]) -> str:
         lines.append(f"Wallet: {_mask(wallet) if wallet else 'Not set'}")
         lines.append(f"Network: {_network_display(network)}")
         if max_usdc:
-            lines.append(f"Max payment: {max_usdc} USDC")
+            lines.append(f"Max payment: {max_usdc} USDC (runtime policy)")
     else:
         missing = []
         if not role:
