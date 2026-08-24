@@ -12,8 +12,9 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _clear_runtime_x402_env(monkeypatch):
-    """Keep local operator env from changing deterministic unit tests."""
+def _clear_runtime_x402_env(monkeypatch, tmp_path):
+    """Keep local operator env and persisted config out of unit tests."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     for name in (
         "X402_ALLOW_CHAT_OTP",
         "X402_ALLOW_HTTP",

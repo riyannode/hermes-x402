@@ -534,7 +534,12 @@ class TestConfigureDefaultLocalPolicy:
         assert error is None
         assert params is not None
         assert params["max_usdc"] == "5"
-        assert _build_managed_keys(params)["X402_MAX_USDC_PER_PAYMENT"] == "5"
+        assert set(_build_managed_keys(params)) == {
+            "X402_ROLE",
+            "X402_BUYER_BACKEND",
+            "CIRCLE_AGENT_WALLET_ADDRESS",
+            "CIRCLE_AGENT_WALLET_NETWORK",
+        }
 
     def test_configure_preview_explicit_max_usdc_still_supported(self):
         params, error = _validate_configure_args(
@@ -549,4 +554,4 @@ class TestConfigureDefaultLocalPolicy:
         assert error is None
         assert params is not None
         assert params["max_usdc"] == "0.10"
-        assert _build_managed_keys(params)["X402_MAX_USDC_PER_PAYMENT"] == "0.10"
+        assert "X402_MAX_USDC_PER_PAYMENT" not in _build_managed_keys(params)

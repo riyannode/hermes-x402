@@ -451,9 +451,9 @@ def format_configure(managed: dict[str, str], cli_info: dict[str, Any]) -> str:
     backend = managed.get("X402_BUYER_BACKEND", "")
     wallet = managed.get("CIRCLE_AGENT_WALLET_ADDRESS", "")
     network = managed.get("CIRCLE_AGENT_WALLET_NETWORK", "")
-    max_usdc = managed.get("X402_MAX_USDC_PER_PAYMENT", "")
+    max_usdc = managed.get("X402_MAX_USDC_PER_PAYMENT", "5")
 
-    is_configured = bool(role and backend and wallet and network and max_usdc)
+    is_configured = bool(role and backend and wallet and network)
 
     lines = ["**x402 Configuration**", ""]
 
@@ -482,8 +482,6 @@ def format_configure(managed: dict[str, str], cli_info: dict[str, Any]) -> str:
             missing.append("wallet")
         if not network:
             missing.append("network")
-        if not max_usdc:
-            missing.append("max payment")
         if missing:
             lines.append(f"Missing: {', '.join(missing)}")
 

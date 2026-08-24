@@ -29,6 +29,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from hermes_x402.config import CLI_BUYER_SELECTION_KEYS, read_persisted_buyer_selection
 from hermes_x402.hermes_plugin.formatters import (
     format_configure,
     format_gateway_balance,
@@ -43,19 +44,8 @@ from hermes_x402.hermes_plugin.output import safe_wallet_address
 # Wallet address pattern: 0x + 40 hex chars
 _WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
-# Managed keys written by configure apply (exactly 10, no CIRCLE_CLI_EXECUTABLE)
-_MANAGED_KEYS_ORDER = [
-    "X402_ROLE",
-    "X402_BUYER_BACKEND",
-    "CIRCLE_AGENT_WALLET_ADDRESS",
-    "CIRCLE_AGENT_WALLET_NETWORK",
-    "X402_MAX_USDC_PER_PAYMENT",
-    "X402_NETWORK_POLICY",
-    "X402_HOST_ALLOWLIST",
-    "X402_REQUIRE_GATEWAY_BATCHING",
-    "X402_ALLOW_HTTP",
-    "X402_ALLOW_CHAT_OTP",
-]
+# Only buyer selection is persisted by configure apply.
+_MANAGED_KEYS_ORDER = CLI_BUYER_SELECTION_KEYS
 
 # Preview TTL: 10 minutes
 _PREVIEW_TTL_SECONDS = 600
@@ -104,19 +94,7 @@ def _resolve_hermes_home() -> Path:
 
 def _read_managed_keys(env_path: Path) -> dict[str, str]:
     """Read current managed key values from .env."""
-    if not env_path.exists():
-        return {}
-    result: dict[str, str] = {}
-    for line in env_path.read_text().splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if "=" in stripped:
-            key, _, value = stripped.partition("=")
-            key = key.strip()
-            if key in _MANAGED_KEYS_ORDER:
-                result[key] = value.strip()
-    return result
+    return read_persisted_buyer_selection(env_path)
 
 
 def _check_cli_available() -> dict[str, Any]:
@@ -385,18 +363,12 @@ def _validate_configure_args(
 
 
 def _build_managed_keys(params: dict[str, str]) -> dict[str, str]:
-    """Build the exact 10 managed keys from validated params."""
+    """Build the four persisted buyer-selection keys from validated params."""
     return {
         "X402_ROLE": params["role"],
         "X402_BUYER_BACKEND": params["backend"],
         "CIRCLE_AGENT_WALLET_ADDRESS": params["wallet"],
         "CIRCLE_AGENT_WALLET_NETWORK": params["network"],
-        "X402_MAX_USDC_PER_PAYMENT": params["max_usdc"],
-        "X402_NETWORK_POLICY": "public",
-        "X402_HOST_ALLOWLIST": "",
-        "X402_REQUIRE_GATEWAY_BATCHING": "true",
-        "X402_ALLOW_HTTP": "false",
-        "X402_ALLOW_CHAT_OTP": "false",
     }
 
 
