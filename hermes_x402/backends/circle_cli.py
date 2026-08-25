@@ -106,7 +106,7 @@ class CircleCliBuyerBackend:
                     normalized[key] = normalized[key].lower()
             return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
-        materials = {material(item) for item in accepts}
+        materials = {material(item) for item in matching}
         if len(materials) != 1:
             raise InvalidPaymentChallengeError(
                 "Circle CLI cannot pin an exact accept; multiple materially different "
@@ -144,21 +144,22 @@ class CircleCliBuyerBackend:
         payment_required: dict[str, Any],
         method: str,
         body: dict[str, Any] | None,
+        selected_accept: dict[str, Any],
     ) -> str:
         # This fingerprint represents economic payment equivalence, not seller-side
         # request identity. Idempotency-Key is intentionally excluded so changing a
         # key cannot bypass an active or ambiguous-payment guard.
-        accepts = payment_required["accepts"]
-        first = accepts[0]
+        selected_material = dict(selected_accept)
+        for key in ("scheme", "network", "asset", "payTo"):
+            if isinstance(selected_material.get(key), str):
+                selected_material[key] = selected_material[key].lower()
         material = {
             "wallet": self.wallet_address_value.lower(),
             "network": self.network.lower(),
             "url": url,
             "method": method,
             "body": body,
-            "amount": first["amount"],
-            "asset": first["asset"].lower(),
-            "pay_to": first["payTo"].lower(),
+            "selected_accept": selected_material,
             "resource": payment_required.get("resource"),
         }
         return hashlib.sha256(
@@ -210,7 +211,11 @@ class CircleCliBuyerBackend:
         await self._ensure_ready()
         selected = self._select_safe_accept(payment_required)
         fingerprint = self._fingerprint(
-            url=url, payment_required=payment_required, method=method, body=body
+            url=url,
+            payment_required=payment_required,
+            method=method,
+            body=body,
+            selected_accept=selected,
         )
         if fingerprint in self._active_fingerprints:
             raise PaymentSubmissionUnknownError(
