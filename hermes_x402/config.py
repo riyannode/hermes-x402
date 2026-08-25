@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Literal
 
 from hermes_x402.buyer.errors import BuyerConfigurationError, UnsupportedBuyerBackendError
@@ -40,6 +41,40 @@ ARC_MAINNET: dict = {
     "is_testnet": False,
 }
 CHAINS: dict[str, dict] = {"arcTestnet": ARC_TESTNET, "arcMainnet": ARC_MAINNET}
+
+CLI_BUYER_SELECTION_KEYS = (
+    "X402_ROLE",
+    "X402_BUYER_BACKEND",
+    "CIRCLE_AGENT_WALLET_ADDRESS",
+    "CIRCLE_AGENT_WALLET_NETWORK",
+)
+
+
+def _resolve_hermes_home() -> Path:
+    home = os.environ.get("HERMES_HOME", "")
+    if home:
+        return Path(home).resolve()
+    return Path.home().resolve() / ".hermes"
+
+
+def read_persisted_buyer_selection(env_path: Path | None = None) -> dict[str, str]:
+    """Read only the four persisted CLI buyer-selection keys."""
+    path = env_path or (_resolve_hermes_home() / ".env")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return {}
+
+    values: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if key in CLI_BUYER_SELECTION_KEYS:
+            values[key] = value.strip()
+    return values
 
 
 @dataclass
@@ -157,9 +192,16 @@ class X402Config:
 
     @classmethod
     def from_env(cls) -> X402Config:
+        persisted_buyer = read_persisted_buyer_selection()
+
+        def buyer_value(name: str, default: str = "") -> str:
+            if name in os.environ:
+                return os.environ[name]
+            return persisted_buyer.get(name, default)
+
         host_raw = os.environ.get("X402_HOST_ALLOWLIST", "")
-        role = os.environ.get("X402_ROLE") or None
-        backend = os.environ.get("X402_BUYER_BACKEND") or None
+        role = buyer_value("X402_ROLE") or None
+        backend = buyer_value("X402_BUYER_BACKEND") or None
 
         # PR #4 env vars
         network_policy_raw = os.environ.get("X402_NETWORK_POLICY", "public").strip().lower()
@@ -210,8 +252,8 @@ class X402Config:
             blockchain=os.environ.get("CIRCLE_DCW_BLOCKCHAIN", "ARC-TESTNET"),
             circle_cli_executable=os.environ.get("CIRCLE_CLI_EXECUTABLE", "circle"),
             circle_cli_cwd=os.environ.get("CIRCLE_CLI_CWD") or None,
-            circle_cli_wallet_address=os.environ.get("CIRCLE_AGENT_WALLET_ADDRESS", ""),
-            circle_cli_network=os.environ.get("CIRCLE_AGENT_WALLET_NETWORK", ""),
+            circle_cli_wallet_address=buyer_value("CIRCLE_AGENT_WALLET_ADDRESS"),
+            circle_cli_network=buyer_value("CIRCLE_AGENT_WALLET_NETWORK"),
             max_usdc_per_payment=os.environ.get("X402_MAX_USDC_PER_PAYMENT") or "5",
             host_allowlist=[item.strip() for item in host_raw.split(",") if item.strip()],
             # PR #4

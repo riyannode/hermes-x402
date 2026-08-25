@@ -1,0 +1,222 @@
+"""Regression tests for four-key CLI buyer persistence across restarts."""
+
+from __future__ import annotations
+
+import re
+
+import pytest
+
+from hermes_x402.config import X402Config
+from hermes_x402.hermes_plugin.runtime import X402Runtime
+from hermes_x402.hermes_plugin.slash_command import (
+    _handle_configure_apply,
+    _handle_configure_preview,
+    _handle_configure_show,
+    _preview_store,
+)
+
+VALID_WALLET = "0xabababababababababababababababababababab"
+PERSISTED_KEYS = {
+    "X402_ROLE",
+    "X402_BUYER_BACKEND",
+    "CIRCLE_AGENT_WALLET_ADDRESS",
+    "CIRCLE_AGENT_WALLET_NETWORK",
+}
+OPTIONAL_KEYS = {
+    "X402_MAX_USDC_PER_PAYMENT",
+    "X402_NETWORK_POLICY",
+    "X402_HOST_ALLOWLIST",
+    "X402_REQUIRE_GATEWAY_BATCHING",
+    "X402_ALLOW_HTTP",
+    "X402_ALLOW_CHAT_OTP",
+}
+
+
+@pytest.fixture(autouse=True)
+def _clear_previews():
+    _preview_store.clear()
+    yield
+    _preview_store.clear()
+
+
+def _write_buyer_env(tmp_path, **overrides):
+    values = {
+        "X402_ROLE": "buyer",
+        "X402_BUYER_BACKEND": "cli",
+        "CIRCLE_AGENT_WALLET_ADDRESS": VALID_WALLET,
+        "CIRCLE_AGENT_WALLET_NETWORK": "ARC-TESTNET",
+    }
+    values.update(overrides)
+    (tmp_path / ".env").write_text(
+        "\n".join(f"{key}={value}" for key, value in values.items()) + "\n"
+    )
+
+
+def _configure_apply(tmp_path):
+    import os
+
+    os.environ["HERMES_HOME"] = str(tmp_path)
+    args = ["buyer", "cli", VALID_WALLET, "ARC-TESTNET"]
+    preview = _handle_configure_preview(args)
+    preview_id = re.search(r"Preview ID: `([^`]+)`", preview)
+    assert preview_id is not None, preview
+    result = _handle_configure_apply([preview_id.group(1)])
+    assert "Configuration Applied" in result
+
+
+def test_persisted_four_keys_load_into_fresh_config(tmp_path, monkeypatch):
+    _write_buyer_env(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    config = X402Config.from_env()
+
+    assert config.role == "buyer"
+    assert config.buyer_backend == "cli"
+    assert config.circle_cli_wallet_address == VALID_WALLET
+    assert config.circle_cli_network == "ARC-TESTNET"
+
+
+def test_explicit_process_environment_wins_for_all_four_keys(tmp_path, monkeypatch):
+    _write_buyer_env(
+        tmp_path,
+        X402_ROLE="seller",
+        X402_BUYER_BACKEND="dcw",
+        CIRCLE_AGENT_WALLET_ADDRESS="0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        CIRCLE_AGENT_WALLET_NETWORK="arcTestnet",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("X402_ROLE", "buyer")
+    monkeypatch.setenv("X402_BUYER_BACKEND", "cli")
+    monkeypatch.setenv("CIRCLE_AGENT_WALLET_ADDRESS", VALID_WALLET)
+    monkeypatch.setenv("CIRCLE_AGENT_WALLET_NETWORK", "ARC-TESTNET")
+
+    config = X402Config.from_env()
+
+    assert config.role == "buyer"
+    assert config.buyer_backend == "cli"
+    assert config.circle_cli_wallet_address == VALID_WALLET
+    assert config.circle_cli_network == "ARC-TESTNET"
+
+
+def test_other_config_values_keep_existing_defaults(tmp_path, monkeypatch):
+    _write_buyer_env(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    config = X402Config.from_env()
+
+    assert config.max_usdc_per_payment == "5"
+    assert config.network_policy == "public"
+    assert config.host_allowlist == []
+    assert config.require_gateway_batching is True
+    assert config.allow_http is False
+    assert config.allow_chat_otp is False
+    assert config.require_approval_for_new_host is False
+
+
+def test_configure_apply_persists_only_four_buyer_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    _configure_apply(tmp_path)
+
+    written_keys = {
+        line.split("=", 1)[0]
+        for line in (tmp_path / ".env").read_text().splitlines()
+        if line and not line.startswith("#") and "=" in line
+    }
+    assert written_keys == PERSISTED_KEYS
+    assert not written_keys & OPTIONAL_KEYS
+
+
+def test_configure_preview_does_not_display_payment_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    preview = _handle_configure_preview(["buyer", "cli", VALID_WALLET, "ARC-TESTNET"])
+
+    assert "Max payment" not in preview
+
+
+def test_configure_apply_preserves_unrelated_env_content(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text("# keep this\nPROVIDER_SETTING=unchanged\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    _configure_apply(tmp_path)
+
+    content = env_path.read_text()
+    assert "# keep this" in content
+    assert "PROVIDER_SETTING=unchanged" in content
+
+
+def test_configure_apply_does_not_delete_historical_optional_keys(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text("X402_NETWORK_POLICY=strict_allowlist\nX402_ALLOW_HTTP=false\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    _configure_apply(tmp_path)
+
+    content = env_path.read_text()
+    assert "X402_NETWORK_POLICY=strict_allowlist" in content
+    assert "X402_ALLOW_HTTP=false" in content
+
+
+def test_fresh_runtime_reloads_persisted_cli_buyer(tmp_path, monkeypatch):
+    _write_buyer_env(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    runtime = X402Runtime()
+    runtime.ensure_initialized()
+
+    assert runtime.role == "buyer"
+    assert runtime.backend_name == "cli"
+    assert runtime.network == "ARC-TESTNET"
+    assert runtime.wallet_address == VALID_WALLET
+    assert runtime.is_configured is True
+    assert runtime.is_available is True
+
+
+def test_configure_apply_writes_no_auth_or_payment_secrets(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    _configure_apply(tmp_path)
+
+    content = (tmp_path / ".env").read_text()
+    for secret_name in (
+        "CIRCLE_ENTITY_SECRET",
+        "CIRCLE_API_KEY",
+        "OTP",
+        "PAYMENT-SIGNATURE",
+        "PRIVATE_KEY",
+        "SEED_PHRASE",
+        "SESSION_TOKEN",
+    ):
+        assert secret_name not in content
+
+
+def test_configure_status_uses_explicit_runtime_max(tmp_path, monkeypatch):
+    _write_buyer_env(tmp_path, X402_MAX_USDC_PER_PAYMENT="1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("X402_MAX_USDC_PER_PAYMENT", "2")
+
+    result = _handle_configure_show()
+
+    assert "Configured: Yes" in result
+    assert "Max payment: 2 USDC (runtime policy)" in result
+
+
+def test_configure_status_uses_default_max_without_persisting_it(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "X402_ROLE=buyer\n"
+        "X402_BUYER_BACKEND=cli\n"
+        f"CIRCLE_AGENT_WALLET_ADDRESS={VALID_WALLET}\n"
+        "CIRCLE_AGENT_WALLET_NETWORK=ARC-TESTNET\n"
+        "X402_MAX_USDC_PER_PAYMENT=1\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("X402_MAX_USDC_PER_PAYMENT", raising=False)
+
+    result = _handle_configure_show()
+
+    assert "Configured: Yes" in result
+    assert "Max payment: 5 USDC (runtime policy)" in result
+    assert "Missing:" not in result
