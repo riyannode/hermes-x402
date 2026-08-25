@@ -693,7 +693,7 @@ class TestCircleCliClientAndBackend:
                 },
                 {
                     "scheme": "exact",
-                    "network": "eip155:10",
+                    "network": "eip155:8453",
                     "amount": "999999",
                     "asset": "0x4",
                     "payTo": SELLER,
@@ -1135,6 +1135,223 @@ class TestChainIdentityComparison:
 
         runner.run_json = lambda args, **kw: _run_json(runner, args, **kw)
         return runner
+
+    @staticmethod
+    def _arc_accept(amount: str = "5000") -> dict[str, Any]:
+        return {
+            "scheme": "exact",
+            "network": "eip155:5042002",
+            "amount": amount,
+            "asset": "0x3600000000000000000000000000000000000000",
+            "payTo": SELLER,
+            "extra": {
+                "name": "GatewayWalletBatched",
+                "version": "1",
+                "verifyingContract": "0x7777777777777777777777777777777777777777",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_multi_network_challenge_selects_only_configured_arc_accept(self):
+        """Different networks are non-candidates when Arc is configured."""
+        runner = self._arc_testnet_runner()
+        runner.pay_result = result(
+            ("services", "pay"),
+            {
+                "response": {"ok": True},
+                "payment": {
+                    "amount": "0.005 USDC",
+                    "chain": "eip155:5042002",
+                    "scheme": "exact",
+                    "seller": SELLER,
+                },
+            },
+        )
+        backend = CircleCliBuyerBackend(ADDRESS, "ARC-TESTNET", CircleCliClient(runner))
+        unrelated_networks = [
+            "eip155:11155111",
+            "eip155:84532",
+            "eip155:43113",
+            "eip155:421614",
+            "eip155:14601",
+            "eip155:4801",
+            "eip155:1328",
+            "eip155:998",
+            "eip155:11155420",
+            "eip155:80002",
+            "eip155:1301",
+        ]
+        accepts = [
+            {
+                "scheme": "exact",
+                "network": network,
+                "amount": str(index + 1),
+                "asset": f"0x{index + 1:x}",
+                "payTo": f"0x{index + 2:040x}",
+            }
+            for index, network in enumerate(unrelated_networks)
+        ]
+        accepts.insert(8, self._arc_accept())
+        challenge = {"x402Version": 2, "accepts": accepts}
+        payment_calls = []
+        original_run_json = runner.run_json
+
+        async def record_payment_call(args, **kwargs):
+            args = tuple(args)
+            if args[:2] == ("services", "pay"):
+                payment_calls.append(args)
+            return await original_run_json(args, **kwargs)
+
+        runner.run_json = record_payment_call
+
+        paid = await backend.pay_and_fetch(
+            url="https://allowed.example/premium",
+            method="GET",
+            body=None,
+            headers={},
+            payment_required=challenge,
+            max_usdc="0.005",
+        )
+
+        assert paid.payment_status == "resource_succeeded"
+        assert len(payment_calls) == 1
+        assert payment_calls[0][payment_calls[0].index("--chain") + 1] == "ARC-TESTNET"
+        assert payment_calls[0][payment_calls[0].index("--max-amount") + 1] == "0.005"
+
+    @pytest.mark.asyncio
+    async def test_arc_accept_later_controls_fingerprint(self):
+        """Fingerprint economics come from the selected Arc accept, not accepts[0]."""
+        runner = self._arc_testnet_runner()
+        backend = CircleCliBuyerBackend(ADDRESS, "ARC-TESTNET", CircleCliClient(runner))
+        arc = self._arc_accept()
+        base = {
+            "scheme": "exact",
+            "network": "eip155:84532",
+            "amount": "1000",
+            "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            "payTo": "0x8888888888888888888888888888888888888888",
+        }
+        url = "https://allowed.example/premium"
+        arc_only = {"x402Version": 2, "accepts": [arc]}
+        multi_network = {"x402Version": 2, "accepts": [base, arc]}
+        await backend._ensure_ready()
+        selected = backend._select_safe_accept(arc_only)
+        fingerprint = backend._fingerprint(
+            url=url,
+            payment_required=arc_only,
+            method="GET",
+            body=None,
+            selected_accept=selected,
+        )
+        backend._active_fingerprints.add(fingerprint)
+
+        with pytest.raises(PaymentSubmissionUnknownError, match="in progress"):
+            await backend.pay_and_fetch(
+                url=url,
+                method="GET",
+                body=None,
+                headers={},
+                payment_required=multi_network,
+                max_usdc="0.005",
+            )
+        assert [call[:2] for call in runner.calls].count(("services", "pay")) == 0
+
+    @pytest.mark.asyncio
+    async def test_multi_network_without_configured_arc_accept_fails_closed(self):
+        """A multi-network challenge without the configured Arc accept is rejected."""
+        runner = self._arc_testnet_runner()
+        backend = CircleCliBuyerBackend(ADDRESS, "ARC-TESTNET", CircleCliClient(runner))
+        challenge = {
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:84532",
+                    "amount": "1000",
+                    "asset": "0x3",
+                    "payTo": SELLER,
+                },
+                {
+                    "scheme": "exact",
+                    "network": "eip155:11155111",
+                    "amount": "2000",
+                    "asset": "0x4",
+                    "payTo": SELLER,
+                },
+            ],
+        }
+
+        from hermes_x402.buyer.errors import InvalidPaymentChallengeError
+
+        with pytest.raises(InvalidPaymentChallengeError, match="no accept matching"):
+            await backend.pay_and_fetch(
+                url="https://allowed.example/premium",
+                method="GET",
+                body=None,
+                headers={},
+                payment_required=challenge,
+                max_usdc="0.005",
+            )
+        assert [call[:2] for call in runner.calls].count(("services", "pay")) == 0
+
+    @pytest.mark.asyncio
+    async def test_two_materially_different_arc_accepts_fail_closed(self):
+        """Different payment options on the configured Arc network remain unsafe."""
+        runner = self._arc_testnet_runner()
+        backend = CircleCliBuyerBackend(ADDRESS, "ARC-TESTNET", CircleCliClient(runner))
+        challenge = {
+            "x402Version": 2,
+            "accepts": [self._arc_accept(), self._arc_accept(amount="6000")],
+        }
+
+        from hermes_x402.buyer.errors import InvalidPaymentChallengeError
+
+        with pytest.raises(InvalidPaymentChallengeError, match="cannot pin an exact accept"):
+            await backend.pay_and_fetch(
+                url="https://allowed.example/premium",
+                method="GET",
+                body=None,
+                headers={},
+                payment_required=challenge,
+                max_usdc="0.006",
+            )
+        assert [call[:2] for call in runner.calls].count(("services", "pay")) == 0
+
+    @pytest.mark.asyncio
+    async def test_arc_selected_amount_rejects_caller_cap_below_price(self):
+        """A caller cap below the selected Arc price rejects before CLI payment."""
+        runner = self._arc_testnet_runner()
+        backend = CircleCliBuyerBackend(ADDRESS, "ARC-TESTNET", CircleCliClient(runner))
+        service = X402BuyerService(backend=backend, policy=PaymentPolicy(max_usdc="0.005"))
+        challenge = {"x402Version": 2, "accepts": [self._arc_accept()]}
+
+        import base64
+
+        import httpx
+
+        class Stub:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return None
+
+            async def request(self, **kwargs):
+                return httpx.Response(
+                    402,
+                    headers={
+                        "Payment-Required": base64.b64encode(
+                            json.dumps(challenge).encode()
+                        ).decode()
+                    },
+                )
+
+        with (
+            patch("hermes_x402.buyer.service.httpx.AsyncClient", return_value=Stub()),
+            pytest.raises(PaymentPolicyError, match="exceeds"),
+        ):
+            await service.pay("https://allowed.example/premium", max_usdc="0.004")
+        assert [call[:2] for call in runner.calls].count(("services", "pay")) == 0
 
     @pytest.mark.asyncio
     async def test_arc_testnet_configured_reported_caip2_accepted(self):
